@@ -5,7 +5,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/splatwalk-gpu
+  IMAGE_NAME: ${{ github.repository_owner }}/splatwalk-gpu
 
 jobs:
   build:
@@ -23,6 +23,12 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           df -h
+
+      - name: Lowercase image name
+        id: lower
+        run: echo "image_name=${IMAGE_NAME,,}" >> $GITHUB_OUTPUT
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -42,7 +48,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ steps.lower.outputs.image_name }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -64,7 +70,7 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           echo "## Docker Image Published" >> $GITHUB_STEP_SUMMARY
-          echo "Image: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "Image: \`${{ env.REGISTRY }}/${{ steps.lower.outputs.image_name }}:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### For private repos, add these secrets:" >> $GITHUB_STEP_SUMMARY
           echo "- \`GHCR_USERNAME\`: Your GitHub username" >> $GITHUB_STEP_SUMMARY
