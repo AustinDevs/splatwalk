@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <%- include('partials/head') %>
+</head>
+<body>
+  <div class="home-page">
+    <header class="hero">
+      <h1>SplatWalk</h1>
+      <p class="hero-subtitle">Transform Zillow listings into walkable VR experiences</p>
+    </header>
+
+    <main class="container">
+      <section class="submit-section">
+        <form id="submit-form" class="submit-form">
+          <input
+            type="url"
+            id="zillow-url"
+            name="zillowUrl"
+            placeholder="Paste a Zillow listing URL..."
+            class="input url-input"
+            required
+          >
+          <button type="submit" class="btn btn-primary" id="submit-btn">
+            Create VR Tour
+          </button>
+        </form>
+        <p id="error-message" class="error-message" style="display: none;"></p>
+      </section>
+
+      <section class="jobs-section">
+        <div class="section-header">
+          <h2>Recent Listings</h2>
+          <button onclick="location.reload()" class="btn btn-secondary">Refresh</button>
+        </div>
+
+        <% if (jobs.length === 0) { %>
+          <div class="empty-state">
+            <p>No listings yet. Paste a Zillow URL above to get started!</p>
+          </div>
+        <% } else { %>
+          <div class="jobs-grid">
+            <% jobs.forEach(function(job) { %>
+              <a href="<%= job.status === 'completed' ? '/view/' + job.id : '/jobs/' + job.id %>" class="job-card <%= job.status %>">
+                <div class="job-card-header">
+                  <span class="status-badge <%= job.status %>">
+                    <%= statusLabels[job.status] || job.status %>
+                  </span>
+                  <span class="job-date">
+                    <%= new Date(job.createdAt).toLocaleDateString() %>
+                  </span>
+                </div>
+                <div class="job-card-body">
+                  <h3 class="job-address">
+                    <%= job.metadata?.address || 'Loading listing...' %>
+                  </h3>
+                  <% if (job.metadata?.price) { %>
+                    <p class="job-price"><%= job.metadata.price %></p>
+                  <% } %>
+                  <% if (job.metadata) { %>
+                    <p class="job-details">
+                      <% if (job.metadata.beds) { %><%= job.metadata.beds %> bd<% } %>
+                      <% if (job.metadata.baths) { %> | <%= job.metadata.baths %> ba<% } %>
+                      <% if (job.metadata.sqft) { %> | <%= job.metadata.sqft.toLocaleString() %> sqft<% } %>
+                    </p>
+                  <% } %>
+                  <% if (job.status !== 'completed' && job.status !== 'failed') { %>
+                    <div class="progress-bar">
+                      <div class="progress-fill" style="width: <%= job.progress %>%"></div>
+                    </div>
+                  <% } %>
+                  <% if (job.status === 'completed') { %>
+                    <% const successCount = job.results.filter(r => r.status === 'success').length; %>
+                    <p class="job-results"><%= successCount %> pipeline<%= successCount > 1 ? 's' : '' %> ready</p>
+                  <% } %>
+                  <% if (job.status === 'failed' && job.error) { %>
+                    <p class="job-error"><%= job.error %></p>
+                  <% } %>
+                </div>
+              </a>
+            <% }); %>
+          </div>
+        <% } %>
+      </section>
+    </main>
+  </div>
+
+  <script src="/js/home.js"></script>
+</body>
+</html>

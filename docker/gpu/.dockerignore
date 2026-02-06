@@ -1,0 +1,15 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+*.md
+README*
+
+# Development
+*.log
+*.tmp
+
+# Test data
+test/
+tests/

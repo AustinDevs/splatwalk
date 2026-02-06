@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <%- include('partials/head', { title: job.metadata?.address || 'Processing' }) %>
+</head>
+<body>
+  <div class="status-page">
+    <header class="status-header">
+      <a href="/" class="back-link">&larr; Back</a>
+      <h1><%= job.metadata?.address || 'Processing Listing' %></h1>
+      <% if (job.metadata?.price) { %>
+        <p class="listing-price"><%= job.metadata.price %></p>
+      <% } %>
+    </header>
+
+    <main class="status-content">
+      <% if (job.status === 'failed') { %>
+        <div class="failed-container">
+          <div class="failed-icon">!</div>
+          <h2>Processing Failed</h2>
+          <p class="error-message"><%= job.error %></p>
+          <a href="/" class="btn btn-primary">Try Again</a>
+        </div>
+      <% } else if (job.status === 'completed') { %>
+        <div class="complete-container">
+          <div class="complete-icon">&#10003;</div>
+          <h2>Your VR Tour is Ready!</h2>
+          <p><%= job.results.filter(r => r.status === 'success').length %> pipelines completed successfully</p>
+          <a href="/view/<%= job.id %>" class="btn btn-primary btn-large">Enter VR Experience</a>
+        </div>
+      <% } else { %>
+        <div class="progress-container">
+          <div class="current-status">
+            <div class="spinner"></div>
+            <h2 id="status-label"><%= statusLabels[job.status] %></h2>
+            <p id="status-description"></p>
+          </div>
+          <div class="progress-bar-large">
+            <div class="progress-fill" id="progress-fill" style="width: <%= job.progress %>%"></div>
+          </div>
+          <p class="progress-percent"><span id="progress-value"><%= Math.round(job.progress) %></span>% complete</p>
+        </div>
+      <% } %>
+
+      <div class="timeline" id="timeline">
+        <% const statusOrder = ['pending', 'scraping', 'uploading', 'provisioning', 'processing_viewcrafter', 'processing_instantsplat', 'processing_combined', 'converting', 'completed']; %>
+        <% const currentIndex = statusOrder.indexOf(job.status); %>
+        <% statusOrder.forEach(function(status, index) { %>
+          <% const isPast = index < currentIndex; %>
+          <% const isCurrent = index === currentIndex && job.status !== 'completed' && job.status !== 'failed'; %>
+          <% const isCompleteStatus = status === 'completed' && job.status === 'completed'; %>
+          <div class="timeline-item <%= isPast || isCompleteStatus ? 'complete' : '' %> <%= isCurrent ? 'current' : '' %>" data-status="<%= status %>">
+            <div class="timeline-marker">
+              <%= isPast || isCompleteStatus ? '✓' : (index + 1) %>
+            </div>
+            <div class="timeline-content">
+              <span class="timeline-label"><%= statusLabels[status] %></span>
+            </div>
+          </div>
+        <% }); %>
+      </div>
+
+      <% if (job.results.length > 0) { %>
+        <div class="results-section">
+          <h3>Pipeline Results</h3>
+          <div class="results-grid">
+            <% job.results.forEach(function(result) { %>
+              <div class="result-card <%= result.status %>">
+                <h4><%= result.pipeline %></h4>
+                <p class="result-status"><%= result.status === 'success' ? 'Completed' : 'Failed' %></p>
+                <% if (result.processingTimeMs) { %>
+                  <p class="result-time"><%= Math.round(result.processingTimeMs / 1000) %>s</p>
+                <% } %>
+                <% if (result.error) { %>
+                  <p class="result-error"><%= result.error %></p>
+                <% } %>
+              </div>
+            <% }); %>
+          </div>
+        </div>
+      <% } %>
+    </main>
+  </div>
+
+  <script>
+    window.JOB_ID = '<%= job.id %>';
+    window.JOB_STATUS = '<%= job.status %>';
+  </script>
+  <script src="/js/job-status.js"></script>
+</body>
+</html>

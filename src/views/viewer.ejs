@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <%- include('partials/head', { title: job.metadata?.address || 'VR Tour' }) %>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <div class="viewer-page" id="viewer-container">
+    <header class="viewer-header" id="viewer-header">
+      <a href="/" class="back-link">&larr; Back</a>
+      <div class="header-info">
+        <h1><%= job.metadata?.address || 'VR Tour' %></h1>
+        <% if (job.metadata?.price) { %>
+          <span class="price"><%= job.metadata.price %></span>
+        <% } %>
+      </div>
+    </header>
+
+    <div class="viewer-canvas" id="viewer-canvas"></div>
+
+    <div class="viewer-controls" id="viewer-controls">
+      <div class="pipeline-switcher" id="pipeline-switcher">
+        <% results.forEach(function(result, index) { %>
+          <button
+            class="pipeline-btn <%= index === 0 ? 'active' : '' %>"
+            data-url="<%= result.splatUrl %>"
+            data-pipeline="<%= result.pipeline %>"
+          >
+            <%= result.pipeline %>
+          </button>
+        <% }); %>
+      </div>
+      <div class="control-buttons">
+        <button class="control-btn" id="fullscreen-btn">Fullscreen</button>
+        <button class="control-btn vr-btn" id="vr-btn" style="display: none;">Enter VR</button>
+      </div>
+    </div>
+
+    <div class="viewer-help" id="viewer-help">
+      <h3>Controls</h3>
+      <ul>
+        <li><strong>Desktop:</strong> WASD to move, mouse to look</li>
+        <li><strong>Mobile:</strong> Touch joystick to move, swipe to look</li>
+        <li><strong>VR:</strong> Use controllers or gaze to navigate</li>
+      </ul>
+    </div>
+
+    <div class="joystick-zone" id="joystick-zone"></div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.umd.min.js"></script>
+  <script src="https://unpkg.com/nipplejs@0.10.2/dist/nipplejs.min.js"></script>
+  <script>
+    window.INITIAL_SPLAT_URL = '<%= results[0].splatUrl %>';
+  </script>
+  <script src="/js/viewer.js"></script>
+</body>
+</html>
