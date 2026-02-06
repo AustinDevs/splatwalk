@@ -1,87 +1,49 @@
 # Multi-stage build for SplatWalk GPU processing
-# Stage 1: Builder - Install dependencies and download models
-FROM nvidia/cuda:12.1.0-devel-ubuntu22.04 AS builder
+# Stage 1: Builder - Use PyTorch base image (includes CUDA + PyTorch pre-installed)
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y \
-    python3.10 \
-    python3-pip \
-    python3.10-venv \
     git \
     wget \
     curl \
     ffmpeg \
     libgl1-mesa-glx \
     libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 WORKDIR /opt
 
-# Clone repositories
-RUN git clone https://github.com/Drexubery/ViewCrafter.git && \
-    git clone https://github.com/NVlabs/InstantSplat.git && \
-    git clone https://github.com/naver/dust3r.git && \
-    git clone https://github.com/naver/mast3r.git
+# Clone repositories (shallow clone to save space)
+RUN git clone --depth 1 https://github.com/Drexubery/ViewCrafter.git && \
+    git clone --depth 1 https://github.com/NVlabs/InstantSplat.git && \
+    git clone --depth 1 https://github.com/naver/dust3r.git && \
+    git clone --depth 1 https://github.com/naver/mast3r.git
 
-# Create virtual environment
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    numpy scipy pillow tqdm einops timm transformers \
+    boto3 awscli plyfile
 
-# Install base dependencies
-RUN pip install --upgrade pip && \
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 && \
-    pip install numpy scipy pillow tqdm einops timm transformers && \
-    pip install boto3 awscli
-
-# Install ViewCrafter dependencies
+# Install project dependencies (ignore errors for optional deps)
 WORKDIR /opt/ViewCrafter
-RUN pip install -r requirements.txt || true
+RUN pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
 
-# Install DUSt3R/MASt3R dependencies
 WORKDIR /opt/dust3r
-RUN pip install -r requirements.txt || true
+RUN pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
 
 WORKDIR /opt/mast3r
-RUN pip install -r requirements.txt || true
+RUN pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
 
-# Install InstantSplat dependencies
 WORKDIR /opt/InstantSplat
-RUN pip install -r requirements.txt || true
+RUN pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
 
 # Install 3DGS converter
-RUN pip install plyfile && \
-    pip install git+https://github.com/francescofugazzi/3dgsconverter.git || \
-    pip install 3dgsconverter || true
-
-# Download model weights
-RUN mkdir -p /opt/weights && \
-    echo "Model weights will be downloaded at runtime if needed"
-
-# Stage 2: Runtime
-FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
-ENV PATH="/opt/venv/bin:$PATH"
-
-RUN apt-get update && apt-get install -y \
-    python3.10 \
-    ffmpeg \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    curl \
-    jq \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy virtual environment and code from builder
-COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /opt/ViewCrafter /opt/ViewCrafter
-COPY --from=builder /opt/InstantSplat /opt/InstantSplat
-COPY --from=builder /opt/dust3r /opt/dust3r
-COPY --from=builder /opt/mast3r /opt/mast3r
-COPY --from=builder /opt/weights /opt/weights
+RUN pip install --no-cache-dir git+https://github.com/francescofugazzi/3dgsconverter.git 2>/dev/null || \
+    pip install --no-cache-dir 3dgsconverter 2>/dev/null || true
 
 # Copy pipeline scripts
 COPY run_pipeline.sh /opt/run_pipeline.sh
