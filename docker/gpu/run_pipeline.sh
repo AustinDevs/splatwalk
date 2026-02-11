@@ -113,17 +113,37 @@ run_instantsplat() {
 
     cd /opt/InstantSplat
 
-    # run_infer.py handles the full pipeline: DUSt3R pose estimation + Gaussian Splatting
-    # n_views should match or be less than the number of input images
+    # Determine number of views (cap at 12 for memory)
     local n_views=$IMAGE_COUNT
     if [ "$n_views" -gt 12 ]; then
-        n_views=12  # Cap at 12 for memory efficiency
+        n_views=12
     fi
 
-    python run_infer.py \
-        "$INPUT_DIR" \
-        "$OUTPUT_DIR/instantsplat" \
+    # Set up directory structure expected by InstantSplat
+    # InstantSplat expects: <source_path>/images/*.jpg
+    local scene_dir="$OUTPUT_DIR/scene"
+    mkdir -p "$scene_dir/images"
+    cp "$INPUT_DIR"/*.jpg "$scene_dir/images/" 2>/dev/null || \
+    cp "$INPUT_DIR"/*.png "$scene_dir/images/" 2>/dev/null || \
+    cp "$INPUT_DIR"/* "$scene_dir/images/"
+
+    echo "Prepared $(ls -1 "$scene_dir/images" | wc -l) images"
+
+    # Step 1: Initialize pose estimation with DUSt3R
+    # This creates sparse_0/ directory with camera poses and confidence maps
+    echo "Step 1/2: Running pose estimation with DUSt3R..."
+    python init_test_pose.py \
+        --source_path "$scene_dir" \
+        --model_path "$OUTPUT_DIR/instantsplat" \
         --n_views "$n_views" \
+        --focal_avg \
+        || return 1
+
+    # Step 2: Train Gaussian Splatting
+    echo "Step 2/2: Training Gaussian Splatting..."
+    python train.py \
+        --source_path "$scene_dir" \
+        --model_path "$OUTPUT_DIR/instantsplat" \
         --iterations 3000 \
         || return 1
 
