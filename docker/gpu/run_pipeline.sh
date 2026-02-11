@@ -12,6 +12,9 @@ set -e
 # SPACES_REGION - DO Spaces region
 # SPACES_ENDPOINT - DO Spaces endpoint
 # SLACK_WEBHOOK_URL - (optional) Slack incoming webhook for progress notifications
+# MAX_N_VIEWS - (optional) Max views for MASt3R, default 24 (use 16 for 20GB GPUs)
+# VIEWCRAFTER_BATCH_SIZE - (optional) Frames per ViewCrafter run, default 10 (use 5 for 20GB GPUs)
+# TRAIN_ITERATIONS - (optional) Stage 2 training iterations, default 7000
 
 echo "=========================================="
 echo "SplatWalk GPU Pipeline"
@@ -195,10 +198,11 @@ PREPROCESS_SCRIPT
 
     cd /opt/InstantSplat
 
-    # Determine number of views (cap at 24 for memory — MASt3R OOMs above this on H100 80GB)
+    # Cap views for MASt3R memory (configurable via MAX_N_VIEWS)
+    local max_views=${MAX_N_VIEWS:-24}
     local n_views=$num_images
-    if [ "$n_views" -gt 24 ]; then
-        n_views=24
+    if [ "$n_views" -gt "$max_views" ]; then
+        n_views=$max_views
     fi
 
     # Step 1: Initialize geometry with init_geo.py (creates point cloud and camera poses)
@@ -300,15 +304,17 @@ PREPROCESS_SCRIPT
 
     cd /opt/InstantSplat
 
-    # Cap at 24 views for MASt3R memory
+    # Cap views for MASt3R memory (24 for H100 80GB, 16 for RTX 4000 20GB)
+    local max_views=${MAX_N_VIEWS:-24}
     local n_views=$num_images
-    if [ "$n_views" -gt 24 ]; then
-        n_views=24
+    if [ "$n_views" -gt "$max_views" ]; then
+        n_views=$max_views
     fi
+    local train_iters=${TRAIN_ITERATIONS:-7000}
 
     # Stage 1: Geometry init
     notify_slack "Stage 1: Geometry init (MASt3R, $n_views views)..."
-    echo "Stage 1/5: Running geometry initialization with MASt3R..."
+    echo "Stage 1/5: Running geometry initialization with MASt3R ($n_views views)..."
     python init_geo.py \
         --source_path "$scene_dir" \
         --model_path "$OUTPUT_DIR/instantsplat" \
@@ -322,13 +328,13 @@ PREPROCESS_SCRIPT
         }
     notify_slack "Stage 1 complete: point cloud generated"
 
-    # Stage 2: Train aerial splat (7000 iterations per DroneSplat recommendation)
-    notify_slack "Stage 2: Training aerial splat (7000 iterations)..."
-    echo "Stage 2/5: Training Gaussian Splatting (7000 iterations)..."
+    # Stage 2: Train aerial splat
+    notify_slack "Stage 2: Training aerial splat ($train_iters iterations)..."
+    echo "Stage 2/5: Training Gaussian Splatting ($train_iters iterations)..."
     python train.py \
         --source_path "$scene_dir" \
         --model_path "$OUTPUT_DIR/instantsplat" \
-        --iterations 7000 \
+        --iterations "$train_iters" \
         --n_views "$n_views" \
         --pp_optimizer \
         --optim_pose \
@@ -363,11 +369,10 @@ PREPROCESS_SCRIPT
         --scene_path "$scene_dir" \
         --output_dir "$OUTPUT_DIR/enhanced" \
         --viewcrafter_ckpt "/opt/ViewCrafter/checkpoints/ViewCrafter_25_512" \
+        --batch_size "${VIEWCRAFTER_BATCH_SIZE:-10}" \
         || {
-            # ViewCrafter may OOM — fall back to Stage 3 output
-            echo "WARNING: ViewCrafter failed, using Stage 3 output as fallback"
-            notify_slack "Stage 4 failed (ViewCrafter OOM?), using Stage 3 output as fallback" "error"
-            cp -r "$OUTPUT_DIR/descent/final" "$OUTPUT_DIR/enhanced"
+            notify_slack "Failed at Stage 4: ViewCrafter enhancement" "error"
+            return 1
         }
     notify_slack "Stage 4 complete: ground views enhanced"
 

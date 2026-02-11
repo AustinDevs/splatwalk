@@ -21,12 +21,47 @@ jobs:
     steps:
       - name: Free up disk space
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h
+          echo "=== Before cleanup ==="
+          df -h /
+
+          # Remove large pre-installed toolchains
+          sudo rm -rf /usr/share/dotnet              # ~6GB
+          sudo rm -rf /usr/local/lib/android          # ~10GB
+          sudo rm -rf /opt/ghc                        # ~2GB
+          sudo rm -rf /opt/hostedtoolcache            # ~8GB (CodeQL, Python, etc.)
+          sudo rm -rf /usr/local/share/boost          # ~1.5GB
+          sudo rm -rf /usr/share/swift                # ~1.5GB
+          sudo rm -rf /opt/microsoft                  # ~1GB
+          sudo rm -rf /opt/az                         # ~0.5GB
+          sudo rm -rf /usr/local/lib/heroku
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/share/edge_driver
+          sudo rm -rf /usr/local/share/gecko_driver
+          sudo rm -rf /usr/local/share/chromedriver-linux64
+          sudo rm -rf /usr/local/share/vcpkg
+          sudo rm -rf /usr/share/miniconda
+          sudo rm -rf /usr/share/kotlinc
+          sudo rm -rf /usr/share/gradle*
+          sudo rm -rf /usr/share/sbt
+          sudo rm -rf /usr/share/rust
+          sudo rm -rf /usr/local/julia*
+          sudo rm -rf /usr/local/graalvm
+          sudo rm -rf /usr/local/aws-*
+          sudo rm -rf /usr/local/sqlpackage
+          sudo rm -rf /imagegeneration
+
+          # Uninstall bulky packages
+          sudo apt-get remove -y '^dotnet-.*' '^llvm-.*' 'php.*' azure-cli google-cloud-cli \
+            microsoft-edge-stable google-chrome-stable firefox powershell mono-devel 2>/dev/null || true
+          sudo apt-get autoremove -y 2>/dev/null || true
+          sudo apt-get clean
+
+          # Nuke all existing Docker data
+          sudo docker system prune --all --force --volumes
+
+          echo "=== After cleanup ==="
+          df -h /
 
       - name: Lowercase image name
         id: lower
@@ -70,7 +105,6 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.lower.outputs.image_name }}:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.lower.outputs.image_name }}:buildcache,mode=max
 
-      # For private repos: output the image name for reference
       - name: Output image info
         if: github.event_name != 'pull_request'
         run: |

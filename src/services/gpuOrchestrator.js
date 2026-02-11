@@ -26,6 +26,11 @@ const DO_SPACES_ENDPOINT = process.env.DO_SPACES_ENDPOINT || 'https://nyc3.digit
 
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
 
+// Pipeline tuning (lower values for smaller GPUs like RTX 4000 Ada 20GB)
+const MAX_N_VIEWS = process.env.MAX_N_VIEWS || '';
+const VIEWCRAFTER_BATCH_SIZE = process.env.VIEWCRAFTER_BATCH_SIZE || '';
+const TRAIN_ITERATIONS = process.env.TRAIN_ITERATIONS || '';
+
 const DO_API_BASE = 'https://api.digitalocean.com/v2';
 
 class GPUOrchestrator {
@@ -280,6 +285,9 @@ class GPUOrchestrator {
         `-e SPACES_REGION=${DO_SPACES_REGION}`,
         `-e SPACES_ENDPOINT=${DO_SPACES_ENDPOINT}`,
         SLACK_WEBHOOK_URL ? `-e SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}` : '',
+        MAX_N_VIEWS ? `-e MAX_N_VIEWS=${MAX_N_VIEWS}` : '',
+        VIEWCRAFTER_BATCH_SIZE ? `-e VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE}` : '',
+        TRAIN_ITERATIONS ? `-e TRAIN_ITERATIONS=${TRAIN_ITERATIONS}` : '',
         GHCR_TOKEN ? `-e GITHUB_TOKEN=${GHCR_TOKEN}` : '',
         GPU_DOCKER_IMAGE,
       ].join(' ');
@@ -423,6 +431,9 @@ docker run --rm --gpus all \\
   -e SPACES_REGION=${DO_SPACES_REGION} \\
   -e SPACES_ENDPOINT=${DO_SPACES_ENDPOINT} \\
   -e SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL} \\
+  ${MAX_N_VIEWS ? `-e MAX_N_VIEWS=${MAX_N_VIEWS}` : ''} \\
+  ${VIEWCRAFTER_BATCH_SIZE ? `-e VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE}` : ''} \\
+  ${TRAIN_ITERATIONS ? `-e TRAIN_ITERATIONS=${TRAIN_ITERATIONS}` : ''} \\
   ${GHCR_TOKEN ? `-e GITHUB_TOKEN=${GHCR_TOKEN}` : ''} \\
   ${GPU_DOCKER_IMAGE}
 

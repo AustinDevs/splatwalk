@@ -86,7 +86,7 @@ def render_low_altitude_views(model_path, scene_path, output_dir, num_views=24):
         print(f"  Copied {min(num_views, len(scene_images))} scene images as fallback")
 
 
-def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, num_output_frames=30):
+def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
     """
     Run ViewCrafter on pairs of rendered views to generate enhanced frames.
 
@@ -126,7 +126,7 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, num_output_frames=3
             "--input_dir", pair_input,
             "--output_dir", pair_output,
             "--ckpt_path", viewcrafter_ckpt,
-            "--num_views", str(min(10, num_output_frames // max(1, len(input_images) // 2))),
+            "--num_views", str(batch_size),
             "--save_video",
         ]
 
@@ -201,6 +201,10 @@ def main():
     parser.add_argument(
         "--retrain_iterations", type=int, default=3000, help="Final retrain iterations"
     )
+    parser.add_argument(
+        "--batch_size", type=int, default=10,
+        help="Frames per ViewCrafter pair (lower = less VRAM; use 5 for 20GB GPUs)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -215,25 +219,16 @@ def main():
 
     if rendered_count < 2:
         print("ERROR: Not enough rendered views for ViewCrafter")
-        # Copy input model as-is
-        shutil.copytree(args.model_path, args.output_dir, dirs_exist_ok=True)
-        return
+        sys.exit(1)
 
     # Step 2: Run ViewCrafter enhancement
     print("\nRunning ViewCrafter diffusion enhancement...")
     enhanced_dir = os.path.join(args.output_dir, "enhanced_frames")
-    try:
-        enhanced_count = run_viewcrafter(renders_dir, enhanced_dir, args.viewcrafter_ckpt)
-    except Exception as e:
-        print(f"ViewCrafter failed: {e}")
-        print("Falling back to Stage 3 model without enhancement")
-        shutil.copytree(args.model_path, args.output_dir, dirs_exist_ok=True)
-        return
+    enhanced_count = run_viewcrafter(renders_dir, enhanced_dir, args.viewcrafter_ckpt, args.batch_size)
 
     if enhanced_count == 0:
-        print("No enhanced frames produced, using Stage 3 model as-is")
-        shutil.copytree(args.model_path, args.output_dir, dirs_exist_ok=True)
-        return
+        print("ERROR: ViewCrafter produced no enhanced frames")
+        sys.exit(1)
 
     # Step 3: Add enhanced frames to training set
     print(f"\nAdding {enhanced_count} enhanced frames to training set...")
