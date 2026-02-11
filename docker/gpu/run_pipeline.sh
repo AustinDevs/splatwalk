@@ -121,48 +121,39 @@ run_instantsplat() {
     local num_images=$(ls -1 "$scene_dir/images" | wc -l)
     echo "Prepared $num_images images"
 
-    # Try the PyPI instantsplat package first (more robust)
-    echo "Trying instantsplat PyPI package..."
-    if python -m instantsplat.train \
-        -s "$scene_dir" \
-        -d "$OUTPUT_DIR/instantsplat" \
-        -i 3000 \
-        --init \
-        2>&1; then
-        echo "InstantSplat (PyPI) pipeline completed"
-        return 0
-    fi
-
-    echo "PyPI package failed, trying NVlabs version..."
     cd /opt/InstantSplat
 
-    # Determine number of views
+    # Determine number of views (cap at 12 for memory)
     local n_views=$num_images
-    if [ "$n_views" -gt 6 ]; then
-        n_views=6
+    if [ "$n_views" -gt 12 ]; then
+        n_views=12
     fi
 
-    # Step 1: Initialize pose estimation
-    echo "Step 1/2: Running pose estimation with MASt3R..."
-    python init_test_pose.py \
+    # Step 1: Initialize geometry with init_geo.py (creates point cloud and camera poses)
+    # This is the correct script for inference - init_test_pose.py is for evaluation with GT
+    echo "Step 1/2: Running geometry initialization with MASt3R..."
+    python init_geo.py \
         --source_path "$scene_dir" \
         --model_path "$OUTPUT_DIR/instantsplat" \
         --n_views "$n_views" \
-        --niter 500 \
         --focal_avg \
-        --min_conf_thr 1.5 \
+        --co_vis_dsp \
+        --conf_aware_ranking \
         2>&1 || {
-            echo "init_test_pose.py failed"
+            echo "init_geo.py failed"
             ls -la "$scene_dir/sparse_"*/0/ 2>/dev/null || echo "No sparse output"
             return 1
         }
 
-    # Step 2: Train Gaussian Splatting
+    # Step 2: Train Gaussian Splatting with pose optimization
     echo "Step 2/2: Training Gaussian Splatting..."
     python train.py \
         --source_path "$scene_dir" \
         --model_path "$OUTPUT_DIR/instantsplat" \
         --iterations 3000 \
+        --n_views "$n_views" \
+        --pp_optimizer \
+        --optim_pose \
         || return 1
 
     echo "InstantSplat pipeline completed"
