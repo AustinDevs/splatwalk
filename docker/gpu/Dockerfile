@@ -52,6 +52,15 @@ RUN mkdir -p /opt/InstantSplat/submodules/dust3r/checkpoints && \
     wget -q -O /opt/InstantSplat/submodules/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth \
     "https://download.europe.naverlabs.com/ComputerVision/DUSt3R/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
 
+# Download MASt3R model weights (required for init_test_pose.py)
+# Create both possible checkpoint locations for compatibility
+RUN mkdir -p /opt/InstantSplat/submodules/mast3r/checkpoints && \
+    mkdir -p /opt/InstantSplat/mast3r/checkpoints && \
+    wget -q -O /opt/InstantSplat/submodules/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth \
+    "https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth" && \
+    ln -sf /opt/InstantSplat/submodules/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth \
+    /opt/InstantSplat/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth
+
 # Install additional dependencies
 RUN pip install --no-cache-dir roma opencv-python transformers
 
