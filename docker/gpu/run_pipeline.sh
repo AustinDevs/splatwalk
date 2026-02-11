@@ -114,12 +114,46 @@ run_instantsplat() {
     # Set up directory structure
     local scene_dir="$OUTPUT_DIR/scene"
     mkdir -p "$scene_dir/images"
-    cp "$INPUT_DIR"/*.jpg "$scene_dir/images/" 2>/dev/null || \
-    cp "$INPUT_DIR"/*.png "$scene_dir/images/" 2>/dev/null || \
-    cp "$INPUT_DIR"/* "$scene_dir/images/"
+
+    # Preprocess images: resize all to consistent dimensions (512x512)
+    # InstantSplat requires all images to have the same dimensions
+    echo "Preprocessing images to consistent 512x512 size..."
+    python3 << 'PREPROCESS_SCRIPT'
+import os
+import sys
+from PIL import Image
+from pathlib import Path
+
+input_dir = os.environ.get('INPUT_DIR', '/data/input')
+output_dir = '/data/output/scene/images'
+target_size = (512, 512)
+
+os.makedirs(output_dir, exist_ok=True)
+
+for img_file in sorted(Path(input_dir).glob('*')):
+    if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+        try:
+            img = Image.open(img_file).convert('RGB')
+            # Resize with center crop to maintain aspect ratio quality
+            # First resize so smaller dimension is target, then center crop
+            w, h = img.size
+            scale = max(target_size[0] / w, target_size[1] / h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            # Center crop to target size
+            left = (new_w - target_size[0]) // 2
+            top = (new_h - target_size[1]) // 2
+            img = img.crop((left, top, left + target_size[0], top + target_size[1]))
+            # Save as JPG
+            out_path = os.path.join(output_dir, img_file.stem + '.jpg')
+            img.save(out_path, 'JPEG', quality=95)
+            print(f"  Processed: {img_file.name} -> {target_size[0]}x{target_size[1]}")
+        except Exception as e:
+            print(f"  Error processing {img_file.name}: {e}", file=sys.stderr)
+PREPROCESS_SCRIPT
 
     local num_images=$(ls -1 "$scene_dir/images" | wc -l)
-    echo "Prepared $num_images images"
+    echo "Prepared $num_images images (all 512x512)"
 
     cd /opt/InstantSplat
 
