@@ -178,10 +178,10 @@ PREPROCESS_SCRIPT
 
     cd /opt/InstantSplat
 
-    # Determine number of views (cap at 64 for memory)
+    # Determine number of views (cap at 24 for memory — MASt3R OOMs above this on H100 80GB)
     local n_views=$num_images
-    if [ "$n_views" -gt 64 ]; then
-        n_views=64
+    if [ "$n_views" -gt 24 ]; then
+        n_views=24
     fi
 
     # Step 1: Initialize geometry with init_geo.py (creates point cloud and camera poses)

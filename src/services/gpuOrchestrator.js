@@ -254,6 +254,7 @@ class GPUOrchestrator {
         `-e SPACES_BUCKET=${DO_SPACES_BUCKET}`,
         `-e SPACES_REGION=${DO_SPACES_REGION}`,
         `-e SPACES_ENDPOINT=${DO_SPACES_ENDPOINT}`,
+        GHCR_TOKEN ? `-e GITHUB_TOKEN=${GHCR_TOKEN}` : '',
         GPU_DOCKER_IMAGE,
       ].join(' ');
 

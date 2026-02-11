@@ -67,11 +67,14 @@ RUN pip install --no-cache-dir roma opencv-python transformers
 # Install instantsplat PyPI package as alternative
 RUN pip install --no-cache-dir instantsplat || true
 
-# Copy pipeline scripts
-COPY run_pipeline.sh /opt/run_pipeline.sh
+# Copy conversion script (rarely changes, fine to bake in)
 COPY convert_to_ksplat.py /opt/convert_to_ksplat.py
-RUN chmod +x /opt/run_pipeline.sh
+
+# Pipeline script is fetched at runtime from GitHub so we don't
+# have to rebuild this heavy image for script-only changes.
+COPY entrypoint.sh /opt/entrypoint.sh
+RUN chmod +x /opt/entrypoint.sh
 
 WORKDIR /data
 
-ENTRYPOINT ["/opt/run_pipeline.sh"]
+ENTRYPOINT ["/opt/entrypoint.sh"]
