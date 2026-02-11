@@ -73,7 +73,7 @@ class GPUOrchestrator {
           Key: key,
           Body: fileContent,
           ContentType: 'image/jpeg',
-          ACL: 'private',
+          ACL: 'public-read',  // GPU droplet needs to download without auth
         })
       );
 
