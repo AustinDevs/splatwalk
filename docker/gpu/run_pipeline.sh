@@ -4,13 +4,14 @@ set -e
 # Environment variables expected:
 # INPUT_DIR - Directory containing input images
 # OUTPUT_DIR - Directory for output files
-# PIPELINE_MODE - viewcrafter, instantsplat, or combined
+# PIPELINE_MODE - viewcrafter, instantsplat, combined, or walkable
 # JOB_ID - Job identifier
 # SPACES_KEY - DO Spaces access key
 # SPACES_SECRET - DO Spaces secret key
 # SPACES_BUCKET - DO Spaces bucket name
 # SPACES_REGION - DO Spaces region
 # SPACES_ENDPOINT - DO Spaces endpoint
+# SLACK_WEBHOOK_URL - (optional) Slack incoming webhook for progress notifications
 
 echo "=========================================="
 echo "SplatWalk GPU Pipeline"
@@ -20,6 +21,22 @@ echo "Job ID: $JOB_ID"
 echo "Input: $INPUT_DIR"
 echo "Output: $OUTPUT_DIR"
 echo "=========================================="
+
+# --- Slack notification helper ---
+notify_slack() {
+    local message="$1"
+    local status="${2:-info}"  # info, success, error
+
+    if [ -z "$SLACK_WEBHOOK_URL" ]; then return; fi
+
+    local emoji="🔄"
+    [ "$status" = "success" ] && emoji="✅"
+    [ "$status" = "error" ] && emoji="❌"
+
+    local payload="{\"text\":\"${emoji} *[${JOB_ID:0:8}] ${PIPELINE_MODE}* — ${message}\"}"
+    curl -s -X POST -H 'Content-type: application/json' \
+        --data "$payload" "$SLACK_WEBHOOK_URL" > /dev/null 2>&1 &
+}
 
 # Validate required environment variables
 if [ -z "$INPUT_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$PIPELINE_MODE" ] || [ -z "$JOB_ID" ]; then
@@ -231,6 +248,145 @@ run_combined() {
     return 0
 }
 
+run_walkable() {
+    echo "Running Walkable Splat pipeline (Stages 1-5)..."
+    notify_slack "Starting walkable pipeline with $(ls -1 "$INPUT_DIR"/*.jpg "$INPUT_DIR"/*.jpeg "$INPUT_DIR"/*.png 2>/dev/null | wc -l | tr -d ' ') images"
+
+    # === STAGES 1-2: Aerial splat (reuses InstantSplat flow) ===
+    local scene_dir="$OUTPUT_DIR/scene"
+    mkdir -p "$scene_dir/images"
+
+    # If video input, extract frames
+    if [ "$HAS_VIDEO" -eq 1 ]; then
+        echo "Extracting frames from video: $VIDEO_FILE"
+        local frames_dir="$INPUT_DIR/frames"
+        mkdir -p "$frames_dir"
+        ffmpeg -i "$VIDEO_FILE" -qscale:v 1 -vf "fps=1" "$frames_dir/frame-%04d.jpg" 2>&1
+        export INPUT_DIR="$frames_dir"
+    fi
+
+    # Preprocess images to 512x512
+    echo "Preprocessing images to consistent 512x512 size..."
+    python3 << 'PREPROCESS_SCRIPT'
+import os, sys
+from PIL import Image
+from pathlib import Path
+
+input_dir = os.environ.get('INPUT_DIR', '/data/input')
+output_dir = '/data/output/scene/images'
+target_size = (512, 512)
+os.makedirs(output_dir, exist_ok=True)
+
+for img_file in sorted(Path(input_dir).glob('*')):
+    if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+        try:
+            img = Image.open(img_file).convert('RGB')
+            w, h = img.size
+            scale = max(target_size[0] / w, target_size[1] / h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            left = (new_w - target_size[0]) // 2
+            top = (new_h - target_size[1]) // 2
+            img = img.crop((left, top, left + target_size[0], top + target_size[1]))
+            out_path = os.path.join(output_dir, img_file.stem + '.jpg')
+            img.save(out_path, 'JPEG', quality=95)
+            print(f"  Processed: {img_file.name} -> {target_size[0]}x{target_size[1]}")
+        except Exception as e:
+            print(f"  Error processing {img_file.name}: {e}", file=sys.stderr)
+PREPROCESS_SCRIPT
+
+    local num_images=$(ls -1 "$scene_dir/images" | wc -l)
+    echo "Prepared $num_images images (all 512x512)"
+
+    cd /opt/InstantSplat
+
+    # Cap at 24 views for MASt3R memory
+    local n_views=$num_images
+    if [ "$n_views" -gt 24 ]; then
+        n_views=24
+    fi
+
+    # Stage 1: Geometry init
+    notify_slack "Stage 1: Geometry init (MASt3R, $n_views views)..."
+    echo "Stage 1/5: Running geometry initialization with MASt3R..."
+    python init_geo.py \
+        --source_path "$scene_dir" \
+        --model_path "$OUTPUT_DIR/instantsplat" \
+        --n_views "$n_views" \
+        --focal_avg \
+        --co_vis_dsp \
+        --conf_aware_ranking \
+        2>&1 || {
+            notify_slack "Failed at Stage 1: init_geo.py" "error"
+            return 1
+        }
+    notify_slack "Stage 1 complete: point cloud generated"
+
+    # Stage 2: Train aerial splat (7000 iterations per DroneSplat recommendation)
+    notify_slack "Stage 2: Training aerial splat (7000 iterations)..."
+    echo "Stage 2/5: Training Gaussian Splatting (7000 iterations)..."
+    python train.py \
+        --source_path "$scene_dir" \
+        --model_path "$OUTPUT_DIR/instantsplat" \
+        --iterations 7000 \
+        --n_views "$n_views" \
+        --pp_optimizer \
+        --optim_pose \
+        || {
+            notify_slack "Failed at Stage 2: train.py" "error"
+            return 1
+        }
+    notify_slack "Stage 2 complete: aerial splat trained"
+
+    # Stage 3: Iterative Virtual Descent
+    notify_slack "Stage 3: Virtual descent (5 altitude levels)..."
+    echo "Stage 3/5: Iterative virtual descent..."
+    python /opt/render_descent.py \
+        --model_path "$OUTPUT_DIR/instantsplat" \
+        --scene_path "$scene_dir" \
+        --output_dir "$OUTPUT_DIR/descent" \
+        --altitudes "0.75,0.5,0.25,0.1,0.025" \
+        --retrain_iterations 2000 \
+        --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
+        --job_id "${JOB_ID:-}" \
+        || {
+            notify_slack "Failed at Stage 3: render_descent.py" "error"
+            return 1
+        }
+    notify_slack "Stage 3 complete: descended to ground level"
+
+    # Stage 4: Diffusion Enhancement (ViewCrafter)
+    notify_slack "Stage 4: Diffusion enhancement (ViewCrafter)..."
+    echo "Stage 4/5: ViewCrafter diffusion enhancement..."
+    python /opt/enhance_with_viewcrafter.py \
+        --model_path "$OUTPUT_DIR/descent/final" \
+        --scene_path "$scene_dir" \
+        --output_dir "$OUTPUT_DIR/enhanced" \
+        --viewcrafter_ckpt "/opt/ViewCrafter/checkpoints/ViewCrafter_25_512" \
+        || {
+            # ViewCrafter may OOM — fall back to Stage 3 output
+            echo "WARNING: ViewCrafter failed, using Stage 3 output as fallback"
+            notify_slack "Stage 4 failed (ViewCrafter OOM?), using Stage 3 output as fallback" "error"
+            cp -r "$OUTPUT_DIR/descent/final" "$OUTPUT_DIR/enhanced"
+        }
+    notify_slack "Stage 4 complete: ground views enhanced"
+
+    # Stage 5: Quality Gating
+    echo "Stage 5/5: Quality gate confidence scoring..."
+    python /opt/quality_gate.py \
+        --model_path "$OUTPUT_DIR/enhanced" \
+        --real_images "$scene_dir/images" \
+        --output_dir "$OUTPUT_DIR/walkable" \
+        || {
+            notify_slack "Failed at Stage 5: quality_gate.py" "error"
+            return 1
+        }
+    notify_slack "Stage 5 complete: confidence scores computed"
+
+    echo "Walkable Splat pipeline completed"
+    return 0
+}
+
 convert_and_upload() {
     local ply_path="$1"
     local pipeline_name="$2"
@@ -315,11 +471,46 @@ case "$PIPELINE_MODE" in
             exit 1
         fi
         ;;
+    "walkable")
+        if run_walkable; then
+            notify_slack "Uploading KSPLAT to Spaces..."
+            # Quality gate outputs the final model; find the PLY
+            local_ply="$OUTPUT_DIR/walkable/point_cloud/point_cloud.ply"
+            if [ ! -f "$local_ply" ]; then
+                local_ply=$(find "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/enhanced" "$OUTPUT_DIR/descent/final" -name "*.ply" -type f 2>/dev/null | head -1)
+            fi
+            if convert_and_upload "$local_ply" "walkable"; then
+                # Append confidence metadata to manifest if available
+                if [ -f "$OUTPUT_DIR/walkable/confidence.json" ]; then
+                    python3 -c "
+import json
+with open('$OUTPUT_DIR/manifest.json') as f: m = json.load(f)
+with open('$OUTPUT_DIR/walkable/confidence.json') as f: c = json.load(f)
+m['confidence'] = c
+with open('$OUTPUT_DIR/manifest.json', 'w') as f: json.dump(m, f, indent=2)
+"
+                    upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/walkable/manifest.json" "application/json"
+                fi
+                notify_slack "Pipeline complete! Splat URL: $SPACES_ENDPOINT/$SPACES_BUCKET/jobs/$JOB_ID/output/walkable/scene.ksplat" "success"
+            else
+                create_manifest "failed" "" "" "Walkable pipeline conversion/upload failed"
+                upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/walkable/manifest.json" "application/json"
+                notify_slack "Pipeline failed at upload/conversion stage" "error"
+                exit 1
+            fi
+        else
+            create_manifest "failed" "" "" "Walkable pipeline processing failed"
+            upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/walkable/manifest.json" "application/json"
+            notify_slack "Pipeline failed" "error"
+            exit 1
+        fi
+        ;;
     *)
         echo "Error: Unknown pipeline mode: $PIPELINE_MODE"
         exit 1
         ;;
 esac
 
+notify_slack "Droplet self-destructing"
 echo "Pipeline $PIPELINE_MODE completed successfully!"
 exit 0

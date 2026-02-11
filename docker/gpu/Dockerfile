@@ -67,8 +67,23 @@ RUN pip install --no-cache-dir roma opencv-python transformers
 # Install instantsplat PyPI package as alternative
 RUN pip install --no-cache-dir instantsplat || true
 
+# ViewCrafter for Stage 4 diffusion enhancement
+RUN git clone https://github.com/Drexubery/ViewCrafter.git /opt/ViewCrafter
+WORKDIR /opt/ViewCrafter
+RUN pip install --no-cache-dir -r requirements.txt || true
+RUN pip install --no-cache-dir pytorch3d || \
+    pip install --no-cache-dir "git+https://github.com/facebookresearch/pytorch3d.git" || true
+RUN mkdir -p checkpoints && \
+    python -c "from huggingface_hub import snapshot_download; \
+    snapshot_download('Drexubery/ViewCrafter_25_512', local_dir='checkpoints/ViewCrafter_25_512')" || true
+
 # Copy conversion script (rarely changes, fine to bake in)
 COPY convert_to_ksplat.py /opt/convert_to_ksplat.py
+
+# Pipeline Python scripts for walkable pipeline (Stages 3-5)
+COPY render_descent.py /opt/render_descent.py
+COPY enhance_with_viewcrafter.py /opt/enhance_with_viewcrafter.py
+COPY quality_gate.py /opt/quality_gate.py
 
 # Pipeline script is fetched at runtime from GitHub so we don't
 # have to rebuild this heavy image for script-only changes.

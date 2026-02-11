@@ -49,3 +49,6 @@ test-results/
 *.ply
 *.ksplat
 *.splat
+
+# Image datasets (upload to Spaces instead)
+odm_data_*/

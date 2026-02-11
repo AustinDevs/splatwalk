@@ -24,6 +24,8 @@ const DO_SPACES_BUCKET = process.env.DO_SPACES_BUCKET || 'splatwalk';
 const DO_SPACES_REGION = process.env.DO_SPACES_REGION || 'nyc3';
 const DO_SPACES_ENDPOINT = process.env.DO_SPACES_ENDPOINT || 'https://nyc3.digitaloceanspaces.com';
 
+const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
+
 const DO_API_BASE = 'https://api.digitalocean.com/v2';
 
 class GPUOrchestrator {
@@ -102,8 +104,12 @@ class GPUOrchestrator {
     return uploadedUrls;
   }
 
-  async createDroplet(jobId) {
-    const cloudInit = this.generateCloudInit(jobId);
+  getDatasetUrl(datasetName) {
+    return `${DO_SPACES_ENDPOINT}/${DO_SPACES_BUCKET}/datasets/${datasetName}.zip`;
+  }
+
+  async createDroplet(jobId, cloudInitOverride) {
+    const cloudInit = cloudInitOverride || this.generateCloudInit(jobId);
 
     const response = await this.doRequest('POST', '/droplets', {
       name: `splatwalk-gpu-${jobId.slice(0, 8)}`,
@@ -127,6 +133,25 @@ class GPUOrchestrator {
       id: dropletId,
       ip: '',
       status: 'new',
+    };
+  }
+
+  async launchJob(jobId, pipeline, { datasetName, imageUrls } = {}) {
+    const datasetUrl = datasetName ? this.getDatasetUrl(datasetName) : null;
+    const cloudInit = this.generateAutonomousCloudInit(jobId, pipeline, { datasetUrl, imageUrls });
+    const droplet = await this.createDroplet(jobId, cloudInit);
+
+    // Clear the local timeout — autonomous droplet self-destructs
+    const timeout = this.activeDroplets.get(droplet.id);
+    if (timeout) {
+      clearTimeout(timeout);
+      this.activeDroplets.delete(droplet.id);
+    }
+
+    return {
+      jobId,
+      dropletId: droplet.id,
+      manifestUrl: `${DO_SPACES_ENDPOINT}/${DO_SPACES_BUCKET}/jobs/${jobId}/output/${pipeline}/manifest.json`,
     };
   }
 
@@ -254,6 +279,7 @@ class GPUOrchestrator {
         `-e SPACES_BUCKET=${DO_SPACES_BUCKET}`,
         `-e SPACES_REGION=${DO_SPACES_REGION}`,
         `-e SPACES_ENDPOINT=${DO_SPACES_ENDPOINT}`,
+        SLACK_WEBHOOK_URL ? `-e SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}` : '',
         GHCR_TOKEN ? `-e GITHUB_TOKEN=${GHCR_TOKEN}` : '',
         GPU_DOCKER_IMAGE,
       ].join(' ');
@@ -323,6 +349,89 @@ runcmd:
 ${dockerLogin}
   - docker pull ${GPU_DOCKER_IMAGE}
   - echo "Ready for job ${jobId}"
+`;
+  }
+
+  generateAutonomousCloudInit(jobId, pipeline, { datasetUrl, imageUrls }) {
+    // Build the input download block: prefer dataset zip, fall back to individual URLs
+    let downloadBlock;
+    if (datasetUrl) {
+      downloadBlock = `
+# --- Download dataset zip from Spaces ---
+mkdir -p /workspace/${jobId}/input
+echo "Downloading dataset: ${datasetUrl}"
+curl -fSL -o /workspace/${jobId}/dataset.zip "${datasetUrl}"
+apt-get install -y unzip || true
+unzip -q -o /workspace/${jobId}/dataset.zip -d /workspace/${jobId}/input
+rm /workspace/${jobId}/dataset.zip
+echo "Extracted $(ls -1 /workspace/${jobId}/input | wc -l) files"
+`;
+    } else if (imageUrls?.length) {
+      const urlList = imageUrls.join(' ');
+      downloadBlock = `
+# --- Download input files individually from Spaces ---
+mkdir -p /workspace/${jobId}/input
+for url in ${urlList}; do
+  filename=$(basename "$url")
+  echo "Downloading $filename..."
+  curl -s -o "/workspace/${jobId}/input/$filename" "$url"
+done
+echo "Downloaded ${imageUrls.length} files"
+`;
+    } else {
+      throw new Error('launchJob requires either datasetName or imageUrls');
+    }
+
+    return `#!/bin/bash
+set -euo pipefail
+exec > /var/log/splatwalk-job.log 2>&1
+
+echo "=== SplatWalk Autonomous Job Runner ==="
+echo "Job: ${jobId}"
+echo "Pipeline: ${pipeline}"
+
+# --- Wait for GPU/docker readiness ---
+for i in $(seq 1 30); do
+  nvidia-smi && break
+  echo "Waiting for GPU driver... (attempt $i)"
+  sleep 10
+done
+
+# --- Docker login + pull ---
+${GHCR_USERNAME && GHCR_TOKEN ? `echo "${GHCR_TOKEN}" | docker login ghcr.io -u ${GHCR_USERNAME} --password-stdin` : 'echo "No GHCR credentials, skipping login"'}
+docker pull ${GPU_DOCKER_IMAGE}
+${downloadBlock}
+# --- Safety timeout: self-destruct after 5 hours no matter what ---
+(
+  sleep 18000
+  echo "Safety timeout reached, self-destructing..."
+  DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
+  curl -s -X DELETE -H "Authorization: Bearer ${DO_API_TOKEN}" \\
+    "https://api.digitalocean.com/v2/droplets/$DROPLET_ID"
+) &
+
+# --- Run the pipeline ---
+docker run --rm --gpus all \\
+  -v /workspace/${jobId}:/data \\
+  -e INPUT_DIR=/data/input \\
+  -e OUTPUT_DIR=/data/output \\
+  -e PIPELINE_MODE=${pipeline} \\
+  -e JOB_ID=${jobId} \\
+  -e SPACES_KEY=${DO_SPACES_KEY} \\
+  -e SPACES_SECRET=${DO_SPACES_SECRET} \\
+  -e SPACES_BUCKET=${DO_SPACES_BUCKET} \\
+  -e SPACES_REGION=${DO_SPACES_REGION} \\
+  -e SPACES_ENDPOINT=${DO_SPACES_ENDPOINT} \\
+  -e SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL} \\
+  ${GHCR_TOKEN ? `-e GITHUB_TOKEN=${GHCR_TOKEN}` : ''} \\
+  ${GPU_DOCKER_IMAGE}
+
+# --- Self-destruct ---
+echo "Pipeline finished, self-destructing droplet..."
+DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
+curl -s -X DELETE \\
+  -H "Authorization: Bearer ${DO_API_TOKEN}" \\
+  "https://api.digitalocean.com/v2/droplets/$DROPLET_ID"
 `;
   }
 }
