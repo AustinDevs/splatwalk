@@ -113,10 +113,10 @@ run_instantsplat() {
 
     cd /opt/InstantSplat
 
-    # Determine number of views (cap at 12 for memory)
+    # Determine number of views (cap at 6 for stability - larger values can cause silent failures)
     local n_views=$IMAGE_COUNT
-    if [ "$n_views" -gt 12 ]; then
-        n_views=12
+    if [ "$n_views" -gt 6 ]; then
+        n_views=6
     fi
 
     # Set up directory structure expected by InstantSplat
@@ -141,8 +141,14 @@ run_instantsplat() {
         --min_conf_thr 1.5 \
         2>&1 || {
             echo "init_test_pose.py failed, checking output..."
+            echo "Scene dir contents:"
             ls -la "$scene_dir/" || true
+            echo "Sparse dir contents:"
             ls -la "$scene_dir/sparse_"* 2>/dev/null || echo "No sparse directories created"
+            echo "Sparse_*/0 contents:"
+            ls -la "$scene_dir/sparse_"*/0/ 2>/dev/null || echo "No 0 subdirectory"
+            echo "All .npy files:"
+            find "$scene_dir" -name "*.npy" -ls 2>/dev/null || echo "No .npy files found"
             return 1
         }
 
