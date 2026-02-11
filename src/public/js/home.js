@@ -1,6 +1,6 @@
 document.addEventListener('DOMContentLoaded', function() {
   const form = document.getElementById('submit-form');
-  const urlInput = document.getElementById('zillow-url');
+  const urlInput = document.getElementById('listing-url');
   const submitBtn = document.getElementById('submit-btn');
   const errorMessage = document.getElementById('error-message');
 
@@ -10,12 +10,12 @@ document.addEventListener('DOMContentLoaded', function() {
     const url = urlInput.value.trim();
 
     if (!url) {
-      showError('Please enter a Zillow URL');
+      showError('Please enter a Realtor.com URL');
       return;
     }
 
-    if (!url.includes('zillow.com')) {
-      showError('Please enter a valid Zillow URL');
+    if (!url.includes('realtor.com')) {
+      showError('Please enter a valid Realtor.com URL');
       return;
     }
 
@@ -27,7 +27,7 @@ document.addEventListener('DOMContentLoaded', function() {
       const response = await fetch('/api/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ zillowUrl: url }),
+        body: JSON.stringify({ listingUrl: url }),
       });
 
       const data = await response.json();

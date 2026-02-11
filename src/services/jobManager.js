@@ -15,7 +15,7 @@ class JobManager {
   rowToJob(row) {
     return {
       id: row.id,
-      zillowUrl: row.zillow_url,
+      listingUrl: row.listing_url,
       status: row.status,
       progress: row.progress,
       metadata: row.metadata ? JSON.parse(row.metadata) : null,
@@ -61,15 +61,15 @@ class JobManager {
     return true;
   }
 
-  createJob(zillowUrl, clientIp) {
+  createJob(listingUrl, clientIp) {
     const db = getDb();
     const now = new Date().toISOString();
     const id = uuidv4();
 
     db.prepare(`
-      INSERT INTO jobs (id, zillow_url, status, progress, results, client_ip, created_at, updated_at)
+      INSERT INTO jobs (id, listing_url, status, progress, results, client_ip, created_at, updated_at)
       VALUES (?, ?, 'pending', 0, '[]', ?, ?, ?)
-    `).run(id, zillowUrl, clientIp, now, now);
+    `).run(id, listingUrl, clientIp, now, now);
 
     const job = this.getJob(id);
     this.processQueue();

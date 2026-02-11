@@ -1,5 +1,5 @@
 import { jobManager } from './jobManager.js';
-import { scrapeZillowListing } from './scraper.js';
+import { scrapeRealtorListing } from './scraper.js';
 import { gpuOrchestrator } from './gpuOrchestrator.js';
 
 const PIPELINES = ['viewcrafter', 'instantsplat', 'combined'];
@@ -16,7 +16,7 @@ export async function processJob(jobId) {
     const job = jobManager.getJob(jobId);
     if (!job) throw new Error('Job not found');
 
-    const scrapeResult = await scrapeZillowListing(job.zillowUrl);
+    const scrapeResult = await scrapeRealtorListing(job.listingUrl);
 
     await jobManager.updateJobStatus(jobId, 'scraping', 15, {
       metadata: scrapeResult.metadata,

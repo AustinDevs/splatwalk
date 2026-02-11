@@ -18,7 +18,7 @@ export async function initDb() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY,
-      zillow_url TEXT NOT NULL,
+      listing_url TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending',
       progress REAL NOT NULL DEFAULT 0,
       metadata TEXT,

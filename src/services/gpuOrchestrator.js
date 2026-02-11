@@ -93,7 +93,6 @@ class GPUOrchestrator {
       image: GPU_DROPLET_IMAGE,
       ssh_keys: [DO_SSH_KEY_ID],
       user_data: cloudInit,
-      tags: ['splatwalk', `job-${jobId}`],
     });
 
     const dropletId = response.droplet.id.toString();
@@ -166,14 +165,52 @@ class GPUOrchestrator {
     const privateKeyPath = DO_SSH_PRIVATE_KEY_PATH.replace('~', process.env.HOME || '');
 
     try {
-      await ssh.connect({
-        host: droplet.ip,
-        username: 'root',
-        privateKeyPath,
-        readyTimeout: 30000,
-      });
+      // Retry SSH connection (cloud-init may restart services)
+      const maxRetries = 6;
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          await ssh.connect({
+            host: droplet.ip,
+            username: 'root',
+            privateKeyPath,
+            readyTimeout: 30000,
+          });
+          break;
+        } catch (err) {
+          if (attempt === maxRetries) throw err;
+          console.log(`[${pipeline}] SSH connection attempt ${attempt} failed, retrying in 10s...`);
+          await new Promise((resolve) => setTimeout(resolve, 10000));
+        }
+      }
+
+      // Wait for cloud-init to complete (ensures docker/nvidia are installed)
+      console.log(`[${pipeline}] Waiting for cloud-init to complete...`);
+      const cloudInitResult = await ssh.execCommand(
+        'cloud-init status --wait || true',
+        { execOptions: { timeout: 300000 } }
+      );
+      console.log(`[${pipeline}] Cloud-init status: ${cloudInitResult.stdout.trim() || 'done'}`);
 
       await ssh.execCommand(`mkdir -p /workspace/${jobId}/input`);
+
+      // Debug: Check GPU and docker status
+      console.log(`[${pipeline}] Checking GPU availability...`);
+      const nvidiaSmi = await ssh.execCommand('nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>&1 || echo "nvidia-smi not available"');
+      console.log(`[${pipeline}] GPU: ${nvidiaSmi.stdout.trim()}`);
+
+      const dockerInfo = await ssh.execCommand('docker info 2>&1 | grep -E "(Runtimes|Default Runtime)" || echo "No runtime info"');
+      console.log(`[${pipeline}] Docker runtimes: ${dockerInfo.stdout.trim()}`);
+
+      // Ensure docker is logged in to GHCR
+      if (GHCR_USERNAME && GHCR_TOKEN) {
+        console.log(`[${pipeline}] Authenticating with GitHub Container Registry...`);
+        const loginResult = await ssh.execCommand(
+          `echo "${GHCR_TOKEN}" | docker login ghcr.io -u ${GHCR_USERNAME} --password-stdin`
+        );
+        if (loginResult.code !== 0) {
+          console.error(`[${pipeline}] Docker login failed: ${loginResult.stderr}`);
+        }
+      }
 
       for (let i = 0; i < imageUrls.length; i++) {
         const url = imageUrls[i];
@@ -257,29 +294,13 @@ class GPUOrchestrator {
       ? `  - echo "${GHCR_TOKEN}" | docker login ghcr.io -u ${GHCR_USERNAME} --password-stdin`
       : '';
 
+    // gpu-h100x1-base image has NVIDIA drivers and docker pre-installed
     return `#cloud-config
 runcmd:
-  - apt-get update
-  - apt-get install -y docker.io nvidia-container-toolkit
-  - systemctl start docker
-  - systemctl enable docker
   - nvidia-smi
 ${dockerLogin}
   - docker pull ${GPU_DOCKER_IMAGE}
   - echo "Ready for job ${jobId}"
-
-write_files:
-  - path: /etc/docker/daemon.json
-    content: |
-      {
-        "default-runtime": "nvidia",
-        "runtimes": {
-          "nvidia": {
-            "path": "nvidia-container-runtime",
-            "runtimeArgs": []
-          }
-        }
-      }
 `;
   }
 }

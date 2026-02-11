@@ -7,7 +7,7 @@
   <div class="home-page">
     <header class="hero">
       <h1>SplatWalk</h1>
-      <p class="hero-subtitle">Transform Zillow listings into walkable VR experiences</p>
+      <p class="hero-subtitle">Transform Realtor.com listings into walkable VR experiences</p>
     </header>
 
     <main class="container">
@@ -15,9 +15,9 @@
         <form id="submit-form" class="submit-form">
           <input
             type="url"
-            id="zillow-url"
-            name="zillowUrl"
-            placeholder="Paste a Zillow listing URL..."
+            id="listing-url"
+            name="listingUrl"
+            placeholder="Paste a Realtor.com listing URL..."
             class="input url-input"
             required
           >
@@ -36,7 +36,7 @@
 
         <% if (jobs.length === 0) { %>
           <div class="empty-state">
-            <p>No listings yet. Paste a Zillow URL above to get started!</p>
+            <p>No listings yet. Paste a Realtor.com URL above to get started!</p>
           </div>
         <% } else { %>
           <div class="jobs-grid">

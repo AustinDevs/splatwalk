@@ -22,11 +22,11 @@ const rateLimitMiddleware = async (req, res, next) => {
   next();
 };
 
-// Validate Zillow URL
-function isValidZillowUrl(url) {
+// Validate Realtor.com URL
+function isValidRealtorUrl(url) {
   try {
     const parsed = new URL(url);
-    return parsed.hostname.includes('zillow.com');
+    return parsed.hostname.includes('realtor.com');
   } catch {
     return false;
   }
@@ -35,26 +35,26 @@ function isValidZillowUrl(url) {
 // POST /api/jobs - Create new job
 jobsRouter.post('/', rateLimitMiddleware, async (req, res) => {
   try {
-    const { zillowUrl } = req.body;
+    const { listingUrl } = req.body;
 
-    if (!zillowUrl) {
+    if (!listingUrl) {
       res.status(400).json({
         success: false,
-        error: 'zillowUrl is required',
+        error: 'listingUrl is required',
       });
       return;
     }
 
-    if (!isValidZillowUrl(zillowUrl)) {
+    if (!isValidRealtorUrl(listingUrl)) {
       res.status(400).json({
         success: false,
-        error: 'Invalid Zillow URL',
+        error: 'Invalid Realtor.com URL',
       });
       return;
     }
 
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
-    const job = jobManager.createJob(zillowUrl, clientIp);
+    const job = jobManager.createJob(listingUrl, clientIp);
 
     // Start processing in background
     processJob(job.id).catch((err) => {

@@ -1,9 +1,10 @@
-# Multi-stage build for SplatWalk GPU processing
-# Stage 1: Builder - Use PyTorch base image (includes CUDA + PyTorch pre-installed)
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime AS builder
+# SplatWalk GPU processing with InstantSplat
+# Use devel image for CUDA compilation of gaussian splatting extensions
+FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 
 RUN apt-get update && apt-get install -y \
     git \
@@ -12,38 +13,32 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    build-essential \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
+# Pin numpy<2 to avoid compatibility issues with CUDA extensions
+RUN pip install --no-cache-dir "numpy<2" scipy pillow tqdm einops timm boto3 awscli plyfile
+
 WORKDIR /opt
 
-# Clone repositories (shallow clone to save space)
-RUN git clone --depth 1 https://github.com/Drexubery/ViewCrafter.git && \
-    git clone --depth 1 https://github.com/NVlabs/InstantSplat.git && \
-    git clone --depth 1 https://github.com/naver/dust3r.git && \
-    git clone --depth 1 https://github.com/naver/mast3r.git
+# Clone InstantSplat and its gaussian splatting dependency
+RUN git clone --depth 1 --recursive https://github.com/NVlabs/InstantSplat.git
 
-# Install Python dependencies
-RUN pip install --no-cache-dir \
-    numpy scipy pillow tqdm einops timm transformers \
-    boto3 awscli plyfile
+# Build diff-gaussian-rasterization CUDA extension
+WORKDIR /opt/InstantSplat/submodules/diff-gaussian-rasterization
+RUN pip install --no-cache-dir .
 
-# Install project dependencies (ignore errors for optional deps)
-WORKDIR /opt/ViewCrafter
-RUN pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
+# Build simple-knn CUDA extension
+WORKDIR /opt/InstantSplat/submodules/simple-knn
+RUN pip install --no-cache-dir .
 
-WORKDIR /opt/dust3r
-RUN pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
-
-WORKDIR /opt/mast3r
-RUN pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
-
+# Install InstantSplat requirements
 WORKDIR /opt/InstantSplat
-RUN pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
+RUN pip install --no-cache-dir -r requirements.txt || true
 
-# Install 3DGS converter
-RUN pip install --no-cache-dir git+https://github.com/francescofugazzi/3dgsconverter.git 2>/dev/null || \
-    pip install --no-cache-dir 3dgsconverter 2>/dev/null || true
+# Install additional dependencies for dust3r/mast3r (used by InstantSplat)
+RUN pip install --no-cache-dir roma opencv-python transformers
 
 # Copy pipeline scripts
 COPY run_pipeline.sh /opt/run_pipeline.sh
