@@ -113,10 +113,17 @@ run_instantsplat() {
 
     cd /opt/InstantSplat
 
-    # Run InstantSplat on input images
-    python train.py \
-        --source_path "$INPUT_DIR" \
-        --model_path "$OUTPUT_DIR/instantsplat" \
+    # run_infer.py handles the full pipeline: DUSt3R pose estimation + Gaussian Splatting
+    # n_views should match or be less than the number of input images
+    local n_views=$IMAGE_COUNT
+    if [ "$n_views" -gt 12 ]; then
+        n_views=12  # Cap at 12 for memory efficiency
+    fi
+
+    python run_infer.py \
+        "$INPUT_DIR" \
+        "$OUTPUT_DIR/instantsplat" \
+        --n_views "$n_views" \
         --iterations 3000 \
         || return 1
 

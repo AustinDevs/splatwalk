@@ -22,8 +22,8 @@ RUN pip install --no-cache-dir "numpy<2" scipy pillow tqdm einops timm boto3 aws
 
 WORKDIR /opt
 
-# Clone InstantSplat and its gaussian splatting dependency
-RUN git clone --depth 1 --recursive https://github.com/NVlabs/InstantSplat.git
+# Clone InstantSplat and its submodules (includes DUSt3R)
+RUN git clone --recursive https://github.com/NVlabs/InstantSplat.git
 
 # Build diff-gaussian-rasterization CUDA extension
 WORKDIR /opt/InstantSplat/submodules/diff-gaussian-rasterization
@@ -33,11 +33,26 @@ RUN pip install --no-cache-dir .
 WORKDIR /opt/InstantSplat/submodules/simple-knn
 RUN pip install --no-cache-dir .
 
-# Install InstantSplat requirements
+# Build fused-ssim if available
+WORKDIR /opt/InstantSplat/submodules
+RUN if [ -d "fused-ssim" ]; then cd fused-ssim && pip install --no-cache-dir .; fi
+
+# Build DUSt3R's RoPE CUDA kernels for faster inference
+WORKDIR /opt/InstantSplat/submodules/dust3r/croco/models/curope
+RUN python setup.py build_ext --inplace || true
+
+# Install InstantSplat and DUSt3R requirements
 WORKDIR /opt/InstantSplat
 RUN pip install --no-cache-dir -r requirements.txt || true
+WORKDIR /opt/InstantSplat/submodules/dust3r
+RUN pip install --no-cache-dir -r requirements.txt || true
 
-# Install additional dependencies for dust3r/mast3r (used by InstantSplat)
+# Download DUSt3R model weights
+RUN mkdir -p /opt/InstantSplat/submodules/dust3r/checkpoints && \
+    wget -q -O /opt/InstantSplat/submodules/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth \
+    "https://download.europe.naverlabs.com/ComputerVision/DUSt3R/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
+
+# Install additional dependencies
 RUN pip install --no-cache-dir roma opencv-python transformers
 
 # Copy pipeline scripts
