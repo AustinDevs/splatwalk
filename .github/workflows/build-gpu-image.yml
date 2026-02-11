@@ -2,6 +2,10 @@ name: Build GPU Docker Image
 
 on:
   workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'docker/gpu/**'
 
 env:
   REGISTRY: ghcr.io
