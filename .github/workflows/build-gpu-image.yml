@@ -62,8 +62,9 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Use registry cache (no size limit) instead of GHA cache (10GB limit)
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.lower.outputs.image_name }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.lower.outputs.image_name }}:buildcache,mode=max
 
       # For private repos: output the image name for reference
       - name: Output image info
