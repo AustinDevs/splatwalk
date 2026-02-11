@@ -1,5 +1,6 @@
 import { NodeSSH } from 'node-ssh';
 import { readFile } from 'fs/promises';
+import { extname } from 'path';
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 
 const DO_API_TOKEN = process.env.DO_API_TOKEN || '';
@@ -58,22 +59,40 @@ class GPUOrchestrator {
     return response.json();
   }
 
-  async uploadImages(jobId, imagePaths) {
+  static VIDEO_EXTENSIONS = ['.mov', '.mp4'];
+  static VIDEO_CONTENT_TYPES = {
+    '.mov': 'video/quicktime',
+    '.mp4': 'video/mp4',
+  };
+
+  isVideoFile(filePath) {
+    return GPUOrchestrator.VIDEO_EXTENSIONS.includes(extname(filePath).toLowerCase());
+  }
+
+  async uploadImages(jobId, filePaths) {
     const uploadedUrls = [];
 
-    for (let i = 0; i < imagePaths.length; i++) {
-      const imagePath = imagePaths[i];
-      const key = `jobs/${jobId}/input/image-${i.toString().padStart(3, '0')}.jpg`;
+    for (let i = 0; i < filePaths.length; i++) {
+      const filePath = filePaths[i];
+      const ext = extname(filePath).toLowerCase();
+      const isVideo = this.isVideoFile(filePath);
 
-      const fileContent = await readFile(imagePath);
+      const key = isVideo
+        ? `jobs/${jobId}/input/video${ext}`
+        : `jobs/${jobId}/input/image-${i.toString().padStart(3, '0')}.jpg`;
+      const contentType = isVideo
+        ? GPUOrchestrator.VIDEO_CONTENT_TYPES[ext] || 'video/mp4'
+        : 'image/jpeg';
+
+      const fileContent = await readFile(filePath);
 
       await this.s3Client.send(
         new PutObjectCommand({
           Bucket: DO_SPACES_BUCKET,
           Key: key,
           Body: fileContent,
-          ContentType: 'image/jpeg',
-          ACL: 'public-read',  // GPU droplet needs to download without auth
+          ContentType: contentType,
+          ACL: 'public-read',
         })
       );
 
@@ -214,7 +233,9 @@ class GPUOrchestrator {
 
       for (let i = 0; i < imageUrls.length; i++) {
         const url = imageUrls[i];
-        const filename = `image-${i.toString().padStart(3, '0')}.jpg`;
+        // Derive filename from the URL key (preserves video.mov / image-NNN.jpg)
+        const urlPath = new URL(url).pathname;
+        const filename = urlPath.split('/').pop();
         await ssh.execCommand(
           `curl -s -o /workspace/${jobId}/input/${filename} "${url}"`,
           { cwd: '/workspace' }

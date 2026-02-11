@@ -36,7 +36,33 @@ pagesRouter.get('/jobs/:id', (req, res) => {
   res.render('job-status', { job, statusLabels: STATUS_LABELS });
 });
 
-// Viewer page
+// Direct splat viewer (by URL)
+pagesRouter.get('/view', (req, res) => {
+  const splatUrl = req.query.url;
+
+  if (!splatUrl) {
+    return res.status(400).render('error', {
+      title: 'Missing URL',
+      message: 'Please provide a splat URL via ?url= parameter.',
+    });
+  }
+
+  // Create a minimal job-like object for the viewer template
+  const job = {
+    metadata: { address: 'Direct Splat Viewer' },
+  };
+
+  const results = [
+    {
+      pipeline: 'splat',
+      splatUrl: splatUrl,
+    },
+  ];
+
+  res.render('viewer', { job, results });
+});
+
+// Viewer page (by job ID)
 pagesRouter.get('/view/:id', (req, res) => {
   const job = jobManager.getJob(req.params.id);
 

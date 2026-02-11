@@ -41,13 +41,21 @@ export AWS_ACCESS_KEY_ID="$SPACES_KEY"
 export AWS_SECRET_ACCESS_KEY="$SPACES_SECRET"
 export AWS_DEFAULT_REGION="$SPACES_REGION"
 
-# Count input images
-IMAGE_COUNT=$(ls -1 "$INPUT_DIR"/*.jpg 2>/dev/null | wc -l)
-echo "Found $IMAGE_COUNT input images"
+# Detect video input
+VIDEO_FILE=$(ls -1 "$INPUT_DIR"/*.mov "$INPUT_DIR"/*.mp4 2>/dev/null | head -1)
+if [ -n "$VIDEO_FILE" ]; then
+    echo "Found video input: $VIDEO_FILE"
+    HAS_VIDEO=1
+else
+    HAS_VIDEO=0
+    # Count input images
+    IMAGE_COUNT=$(ls -1 "$INPUT_DIR"/*.jpg 2>/dev/null | wc -l)
+    echo "Found $IMAGE_COUNT input images"
 
-if [ "$IMAGE_COUNT" -lt 2 ]; then
-    echo "Error: Need at least 2 input images"
-    exit 1
+    if [ "$IMAGE_COUNT" -lt 2 ]; then
+        echo "Error: Need at least 2 input images"
+        exit 1
+    fi
 fi
 
 # Create manifest template
@@ -116,6 +124,18 @@ run_instantsplat() {
     local scene_dir="$OUTPUT_DIR/scene"
     mkdir -p "$scene_dir/images"
 
+    # If video input, extract frames with ffmpeg first
+    if [ "$HAS_VIDEO" -eq 1 ]; then
+        echo "Extracting frames from video: $VIDEO_FILE"
+        local frames_dir="$INPUT_DIR/frames"
+        mkdir -p "$frames_dir"
+        ffmpeg -i "$VIDEO_FILE" -qscale:v 1 -vf "fps=1" "$frames_dir/frame-%04d.jpg" 2>&1
+        local extracted=$(ls -1 "$frames_dir"/*.jpg 2>/dev/null | wc -l)
+        echo "Extracted $extracted frames from video (1 fps)"
+        # Point preprocessing at the extracted frames directory
+        export INPUT_DIR="$frames_dir"
+    fi
+
     # Preprocess images: resize all to consistent dimensions (512x512)
     # InstantSplat requires all images to have the same dimensions
     echo "Preprocessing images to consistent 512x512 size..."
@@ -158,10 +178,10 @@ PREPROCESS_SCRIPT
 
     cd /opt/InstantSplat
 
-    # Determine number of views (cap at 12 for memory)
+    # Determine number of views (cap at 64 for memory)
     local n_views=$num_images
-    if [ "$n_views" -gt 12 ]; then
-        n_views=12
+    if [ "$n_views" -gt 64 ]; then
+        n_views=64
     fi
 
     # Step 1: Initialize geometry with init_geo.py (creates point cloud and camera poses)

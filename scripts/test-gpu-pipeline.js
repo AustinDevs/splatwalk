@@ -28,21 +28,33 @@ async function main() {
     // 1. Find test images
     console.log('Step 1: Loading test images...');
     const files = await readdir(TEST_IMAGES_DIR);
+    const videoFiles = files
+      .filter(f => f.match(/\.(mov|mp4)$/i))
+      .sort()
+      .map(f => join(TEST_IMAGES_DIR, f));
     const imageFiles = files
       .filter(f => f.match(/\.(jpg|jpeg|png|webp)$/i))
       .sort()
       .map(f => join(TEST_IMAGES_DIR, f));
 
-    console.log(`Found ${imageFiles.length} images`);
-    if (imageFiles.length < 2) {
-      throw new Error('Need at least 2 images');
+    const inputFiles = videoFiles.length > 0 ? videoFiles : imageFiles;
+    const isVideo = videoFiles.length > 0;
+
+    if (isVideo) {
+      console.log(`Found ${videoFiles.length} video file(s)`);
+    } else {
+      console.log(`Found ${imageFiles.length} images`);
     }
 
-    // 2. Upload images to Spaces
-    console.log('\nStep 2: Uploading images to DO Spaces...');
+    if (!isVideo && inputFiles.length < 2) {
+      throw new Error('Need at least 2 images or 1 video file');
+    }
+
+    // 2. Upload files to Spaces
+    console.log(`\nStep 2: Uploading ${isVideo ? 'video' : 'images'} to DO Spaces...`);
     const startUpload = Date.now();
-    const imageUrls = await gpuOrchestrator.uploadImages(jobId, imageFiles);
-    console.log(`Uploaded ${imageUrls.length} images in ${(Date.now() - startUpload) / 1000}s`);
+    const imageUrls = await gpuOrchestrator.uploadImages(jobId, inputFiles);
+    console.log(`Uploaded ${imageUrls.length} file(s) in ${(Date.now() - startUpload) / 1000}s`);
 
     // 3. Create GPU droplet
     console.log('\nStep 3: Creating GPU droplet...');
