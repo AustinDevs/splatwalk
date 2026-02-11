@@ -129,15 +129,27 @@ run_instantsplat() {
 
     echo "Prepared $(ls -1 "$scene_dir/images" | wc -l) images"
 
-    # Step 1: Initialize pose estimation with DUSt3R
-    # This creates sparse_0/ directory with camera poses and confidence maps
-    echo "Step 1/2: Running pose estimation with DUSt3R..."
+    # Step 1: Initialize pose estimation with DUSt3R/MASt3R
+    # This creates sparse_N/ directory with camera poses and point clouds
+    echo "Step 1/2: Running pose estimation with MASt3R..."
     python init_test_pose.py \
         --source_path "$scene_dir" \
         --model_path "$OUTPUT_DIR/instantsplat" \
         --n_views "$n_views" \
+        --niter 500 \
         --focal_avg \
-        || return 1
+        --min_conf_thr 1.5 \
+        2>&1 || {
+            echo "init_test_pose.py failed, checking output..."
+            ls -la "$scene_dir/" || true
+            ls -la "$scene_dir/sparse_"* 2>/dev/null || echo "No sparse directories created"
+            return 1
+        }
+
+    # Debug: Show what was created
+    echo "Checking created files..."
+    ls -la "$scene_dir/sparse_"* 2>/dev/null || echo "Warning: No sparse directories found"
+    find "$scene_dir" -name "*.npy" 2>/dev/null | head -10 || echo "No .npy files found"
 
     # Step 2: Train Gaussian Splatting
     echo "Step 2/2: Training Gaussian Splatting..."
