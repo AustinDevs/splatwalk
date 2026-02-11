@@ -111,26 +111,38 @@ run_viewcrafter() {
 run_instantsplat() {
     echo "Running InstantSplat pipeline..."
 
-    cd /opt/InstantSplat
-
-    # Determine number of views (cap at 6 for stability - larger values can cause silent failures)
-    local n_views=$IMAGE_COUNT
-    if [ "$n_views" -gt 6 ]; then
-        n_views=6
-    fi
-
-    # Set up directory structure expected by InstantSplat
-    # InstantSplat expects: <source_path>/images/*.jpg
+    # Set up directory structure
     local scene_dir="$OUTPUT_DIR/scene"
     mkdir -p "$scene_dir/images"
     cp "$INPUT_DIR"/*.jpg "$scene_dir/images/" 2>/dev/null || \
     cp "$INPUT_DIR"/*.png "$scene_dir/images/" 2>/dev/null || \
     cp "$INPUT_DIR"/* "$scene_dir/images/"
 
-    echo "Prepared $(ls -1 "$scene_dir/images" | wc -l) images"
+    local num_images=$(ls -1 "$scene_dir/images" | wc -l)
+    echo "Prepared $num_images images"
 
-    # Step 1: Initialize pose estimation with DUSt3R/MASt3R
-    # This creates sparse_N/ directory with camera poses and point clouds
+    # Try the PyPI instantsplat package first (more robust)
+    echo "Trying instantsplat PyPI package..."
+    if python -m instantsplat.train \
+        -s "$scene_dir" \
+        -d "$OUTPUT_DIR/instantsplat" \
+        -i 3000 \
+        --init \
+        2>&1; then
+        echo "InstantSplat (PyPI) pipeline completed"
+        return 0
+    fi
+
+    echo "PyPI package failed, trying NVlabs version..."
+    cd /opt/InstantSplat
+
+    # Determine number of views
+    local n_views=$num_images
+    if [ "$n_views" -gt 6 ]; then
+        n_views=6
+    fi
+
+    # Step 1: Initialize pose estimation
     echo "Step 1/2: Running pose estimation with MASt3R..."
     python init_test_pose.py \
         --source_path "$scene_dir" \
@@ -140,22 +152,10 @@ run_instantsplat() {
         --focal_avg \
         --min_conf_thr 1.5 \
         2>&1 || {
-            echo "init_test_pose.py failed, checking output..."
-            echo "Scene dir contents:"
-            ls -la "$scene_dir/" || true
-            echo "Sparse dir contents:"
-            ls -la "$scene_dir/sparse_"* 2>/dev/null || echo "No sparse directories created"
-            echo "Sparse_*/0 contents:"
-            ls -la "$scene_dir/sparse_"*/0/ 2>/dev/null || echo "No 0 subdirectory"
-            echo "All .npy files:"
-            find "$scene_dir" -name "*.npy" -ls 2>/dev/null || echo "No .npy files found"
+            echo "init_test_pose.py failed"
+            ls -la "$scene_dir/sparse_"*/0/ 2>/dev/null || echo "No sparse output"
             return 1
         }
-
-    # Debug: Show what was created
-    echo "Checking created files..."
-    ls -la "$scene_dir/sparse_"* 2>/dev/null || echo "Warning: No sparse directories found"
-    find "$scene_dir" -name "*.npy" 2>/dev/null | head -10 || echo "No .npy files found"
 
     # Step 2: Train Gaussian Splatting
     echo "Step 2/2: Training Gaussian Splatting..."

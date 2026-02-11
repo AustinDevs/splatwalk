@@ -64,6 +64,9 @@ RUN mkdir -p /opt/InstantSplat/submodules/mast3r/checkpoints && \
 # Install additional dependencies
 RUN pip install --no-cache-dir roma opencv-python transformers
 
+# Install instantsplat PyPI package as alternative
+RUN pip install --no-cache-dir instantsplat || true
+
 # Copy pipeline scripts
 COPY run_pipeline.sh /opt/run_pipeline.sh
 COPY convert_to_ksplat.py /opt/convert_to_ksplat.py
