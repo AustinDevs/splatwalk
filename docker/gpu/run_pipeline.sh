@@ -76,10 +76,11 @@ upload_to_spaces() {
     local remote_key="$2"
     local content_type="${3:-application/octet-stream}"
 
+    # Redirect progress output to stderr so only URL is captured in variable
     aws s3 cp "$local_path" "s3://$SPACES_BUCKET/$remote_key" \
         --endpoint-url "$SPACES_ENDPOINT" \
         --acl public-read \
-        --content-type "$content_type"
+        --content-type "$content_type" >&2
 
     echo "$SPACES_ENDPOINT/$SPACES_BUCKET/$remote_key"
 }
