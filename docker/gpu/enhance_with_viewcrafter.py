@@ -134,6 +134,12 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
         shutil.copy2(str(img_a), os.path.join(pair_input, "frame_0000.jpg"))
         shutil.copy2(str(img_b), os.path.join(pair_input, "frame_0001.jpg"))
 
+        # Find DUSt3R checkpoint (ViewCrafter uses DUSt3R for depth estimation)
+        dust3r_ckpt = "/opt/InstantSplat/submodules/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
+        if not os.path.exists(dust3r_ckpt):
+            # Fallback: check ViewCrafter's own checkpoints dir
+            dust3r_ckpt = os.path.join(viewcrafter_dir, "checkpoints", "DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth")
+
         # Run ViewCrafter with correct arguments
         cmd = [
             sys.executable,
@@ -141,6 +147,7 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
             "--image_dir", pair_input,
             "--out_dir", pair_output,
             "--ckpt_path", ckpt_file,
+            "--model_path", dust3r_ckpt,
             "--config", config_file,
             "--mode", "sparse_view_interp",
             "--video_length", "25",
