@@ -82,9 +82,17 @@ pip install --no-cache-dir \
 echo ""
 echo "=== Building PyTorch3D from source with CUDA support ==="
 
-# Check if already has GPU support
-if python -c "from pytorch3d.renderer.points.rasterize_points import rasterize_points; print(\"PyTorch3D GPU OK\")" 2>/dev/null; then
-    echo "PyTorch3D already has GPU support!"
+# Check if already has ACTUAL GPU support (not just importable)
+if python -c "
+import torch
+from pytorch3d.renderer.points.rasterize_points import rasterize_points
+# Actually test GPU rasterization, not just import
+pts = torch.randn(1, 100, 3).cuda()
+radius = torch.ones(1, 100).cuda() * 0.01
+idx, zbuf, dists = rasterize_points(pts, (64, 64), radius, 1)
+print(\"PyTorch3D GPU rasterization test PASSED\")
+" 2>/dev/null; then
+    echo "PyTorch3D already has working GPU support!"
 else
     echo "Removing pre-built PyTorch3D (no GPU kernels)..."
     pip uninstall -y pytorch3d 2>/dev/null || true
@@ -94,18 +102,22 @@ else
     FORCE_CUDA=1 pip install --no-cache-dir --no-build-isolation \
         "git+https://github.com/facebookresearch/pytorch3d.git" 2>&1
 
-    # Verify
+    # Verify with actual GPU rasterization test
     echo ""
-    echo "Verifying PyTorch3D GPU support..."
+    echo "Verifying PyTorch3D GPU support with actual rasterization test..."
     python -c "
 import torch
 print(f\"PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}\")
 from pytorch3d.renderer.points.rasterize_points import rasterize_points
-print(\"PyTorch3D GPU rasterization: OK\")
 import pytorch3d
 print(f\"PyTorch3D version: {pytorch3d.__version__}\")
+# Actually test GPU rasterization
+pts = torch.randn(1, 100, 3).cuda()
+radius = torch.ones(1, 100).cuda() * 0.01
+idx, zbuf, dists = rasterize_points(pts, (64, 64), radius, 1)
+print(\"PyTorch3D GPU rasterization test PASSED\")
 " || {
-        echo "ERROR: PyTorch3D compilation failed!"
+        echo "ERROR: PyTorch3D GPU rasterization test failed!"
         exit 1
     }
 fi
@@ -174,11 +186,15 @@ echo "Committed image size: $(docker images --format '{{.Size}}' "$GPU_DOCKER_IM
 echo ""
 echo "=== Step 5/5: Verify committed image ==="
 docker run --rm --gpus all --entrypoint python "$GPU_DOCKER_IMAGE" -c "
-from pytorch3d.renderer.points.rasterize_points import rasterize_points
-print('PyTorch3D GPU: OK')
 import torch
+from pytorch3d.renderer.points.rasterize_points import rasterize_points
 print(f'CUDA: {torch.cuda.is_available()}')
 print(f'GPU: {torch.cuda.get_device_name(0)}')
+# Actual GPU rasterization test
+pts = torch.randn(1, 100, 3).cuda()
+radius = torch.ones(1, 100).cuda() * 0.01
+idx, zbuf, dists = rasterize_points(pts, (64, 64), radius, 1)
+print('PyTorch3D GPU rasterization: PASSED')
 " && echo "Verification PASSED" || {
     echo "ERROR: Verification FAILED"
     exit 1
