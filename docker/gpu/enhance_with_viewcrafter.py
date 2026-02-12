@@ -128,11 +128,11 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
         pair_output = os.path.join(output_dir, f"pair_{i:03d}")
         os.makedirs(pair_output, exist_ok=True)
 
-        # Prepare input directory with ordered images
+        # Prepare input directory with integer-named images (ViewCrafter expects 0.jpg, 1.jpg)
         pair_input = os.path.join(pair_output, "input")
         os.makedirs(pair_input, exist_ok=True)
-        shutil.copy2(str(img_a), os.path.join(pair_input, "frame_0000.jpg"))
-        shutil.copy2(str(img_b), os.path.join(pair_input, "frame_0001.jpg"))
+        shutil.copy2(str(img_a), os.path.join(pair_input, "0.jpg"))
+        shutil.copy2(str(img_b), os.path.join(pair_input, "1.jpg"))
 
         # Find DUSt3R checkpoint (ViewCrafter uses DUSt3R for depth estimation)
         dust3r_ckpt = "/opt/InstantSplat/submodules/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
