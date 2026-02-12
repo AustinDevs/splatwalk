@@ -6,16 +6,16 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 
-# System deps (includes FFmpeg dev headers for PyAV build)
+# System deps
 RUN apt-get update && apt-get install -y \
     git wget curl ffmpeg unzip pkg-config \
     libgl1-mesa-glx libglib2.0-0 build-essential \
-    libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Python deps (one layer)
-RUN pip install --no-cache-dir \
+# Python deps — install av wheel first so open3d doesn't try to build it from source
+RUN pip install --no-cache-dir av && \
+    pip install --no-cache-dir \
     "numpy<2" scipy pillow tqdm einops timm boto3 awscli plyfile \
     roma opencv-python transformers huggingface_hub icecream \
     open3d trimesh "pyglet<2" evo matplotlib tensorboard imageio gdown
