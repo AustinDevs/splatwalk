@@ -515,23 +515,11 @@ docker run --rm --gpus all \\
       curl "\${CURL_ARGS[@]}" "\$BASE_URL/\$script" -o "/opt/\$script" && echo "  Updated \$script"
     done
 
-    echo "Patching Pillow ANTIALIAS for ViewCrafter compatibility..."
-    python -c "
-import PIL.Image
-if not hasattr(PIL.Image, \"ANTIALIAS\"):
-    # Permanently patch the installed module
-    import inspect, pathlib
-    src = pathlib.Path(inspect.getfile(PIL.Image))
-    code = src.read_text()
-    if \"ANTIALIAS\" not in code:
-        code = code.replace(\"LANCZOS = Resampling.LANCZOS\", \"LANCZOS = Resampling.LANCZOS\\nANTIALIAS = Resampling.LANCZOS\")
-        src.write_text(code)
-        print(\"  Patched PIL.Image: added ANTIALIAS = LANCZOS\")
-    else:
-        print(\"  PIL.Image already has ANTIALIAS\")
-else:
-    print(\"  PIL.Image.ANTIALIAS already exists\")
-"
+    echo "Patching ViewCrafter for Pillow 10+ (ANTIALIAS -> LANCZOS)..."
+    grep -rl "Image.ANTIALIAS" /opt/ViewCrafter/ 2>/dev/null | while read f; do
+      sed -i "s/Image.ANTIALIAS/Image.LANCZOS/g" "\$f"
+      echo "  Patched \$f"
+    done
 
     exec /opt/entrypoint.sh
   ' 2>&1
