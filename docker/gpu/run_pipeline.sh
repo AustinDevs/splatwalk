@@ -17,6 +17,19 @@ shopt -s nocaseglob  # case-insensitive globbing (matches .JPG, .jpg, .Jpg, etc.
 # VIEWCRAFTER_BATCH_SIZE - (optional) Frames per ViewCrafter run, default 10 (use 5 for 20GB GPUs)
 # TRAIN_ITERATIONS - (optional) Stage 2 training iterations, default 7000
 
+# --- Fetch latest Python scripts from GitHub (allows hotfixes without Docker rebuild) ---
+echo "Updating pipeline scripts from GitHub..."
+_CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
+[ -n "$GITHUB_TOKEN" ] && _CURL_ARGS+=(-H "Authorization: token $GITHUB_TOKEN")
+_BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/docker/gpu"
+for _script in render_descent.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py; do
+    if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/opt/$_script" 2>/dev/null; then
+        echo "  Updated $_script"
+    else
+        echo "  Using baked-in $_script (fetch failed)"
+    fi
+done
+
 echo "=========================================="
 echo "SplatWalk GPU Pipeline"
 echo "=========================================="
