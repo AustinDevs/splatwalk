@@ -13,12 +13,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Python deps — install av wheel first so open3d doesn't try to build it from source
-RUN pip install --no-cache-dir av && \
-    pip install --no-cache-dir \
-    "numpy<2" scipy pillow tqdm einops timm boto3 awscli plyfile \
-    roma opencv-python transformers huggingface_hub icecream \
-    open3d trimesh "pyglet<2" evo matplotlib tensorboard imageio gdown
+# Pin numpy<2 to avoid compatibility issues with CUDA extensions
+RUN pip install --no-cache-dir "numpy<2" scipy pillow tqdm einops timm boto3 awscli plyfile
 
 WORKDIR /opt
 
