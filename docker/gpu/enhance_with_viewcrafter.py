@@ -144,9 +144,11 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
             "--model_path", dust3r_ckpt,
             "--config", config_file,
             "--mode", "single_view_target",
-            "--d_theta", "5", "-5",
-            "--d_phi", "15", "-15",
+            "--d_theta", "10",
+            "--d_phi", "30",
             "--d_r", "0.0",
+            "--d_x", "0.0",
+            "--d_y", "0.0",
             "--video_length", "25",
             "--ddim_steps", "25",
             "--height", "320",
@@ -253,8 +255,13 @@ def main():
     enhanced_count = run_viewcrafter(renders_dir, enhanced_dir, args.viewcrafter_ckpt, args.batch_size)
 
     if enhanced_count == 0:
-        print("ERROR: ViewCrafter produced no enhanced frames")
-        sys.exit(1)
+        print("WARNING: ViewCrafter produced no enhanced frames, skipping enhancement")
+        print("Copying Stage 3 model as output instead...")
+        if args.model_path != args.output_dir:
+            if os.path.exists(args.output_dir):
+                shutil.rmtree(args.output_dir, ignore_errors=True)
+            shutil.copytree(args.model_path, args.output_dir, dirs_exist_ok=True)
+        sys.exit(1)  # Signal failure so run_pipeline.sh uses fallback path
 
     # Step 3: Add enhanced frames to training set
     print(f"\nAdding {enhanced_count} enhanced frames to training set...")

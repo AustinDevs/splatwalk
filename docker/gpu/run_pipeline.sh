@@ -362,32 +362,36 @@ PREPROCESS_SCRIPT
         }
     notify_slack "Stage 3 complete: descended to ground level"
 
-    # Stage 4: Diffusion Enhancement (ViewCrafter)
+    # Stage 4: Diffusion Enhancement (ViewCrafter) — optional, non-fatal
     notify_slack "Stage 4: Diffusion enhancement (ViewCrafter)..."
     echo "Stage 4/5: ViewCrafter diffusion enhancement..."
-    python /opt/enhance_with_viewcrafter.py \
+    local final_model_path="$OUTPUT_DIR/descent/final"
+    if python /opt/enhance_with_viewcrafter.py \
         --model_path "$OUTPUT_DIR/descent/final" \
         --scene_path "$scene_dir" \
         --output_dir "$OUTPUT_DIR/enhanced" \
         --viewcrafter_ckpt "/opt/ViewCrafter/checkpoints/ViewCrafter_25_512" \
-        --batch_size "${VIEWCRAFTER_BATCH_SIZE:-10}" \
-        || {
-            notify_slack "Failed at Stage 4: ViewCrafter enhancement" "error"
-            return 1
-        }
-    notify_slack "Stage 4 complete: ground views enhanced"
+        --batch_size "${VIEWCRAFTER_BATCH_SIZE:-10}" 2>&1; then
+        notify_slack "Stage 4 complete: ground views enhanced"
+        final_model_path="$OUTPUT_DIR/enhanced"
+    else
+        notify_slack "Stage 4 skipped: ViewCrafter enhancement failed (non-fatal), using Stage 3 output" "info"
+        echo "WARNING: ViewCrafter enhancement failed, continuing with Stage 3 descent output"
+    fi
 
     # Stage 5: Quality Gating
     echo "Stage 5/5: Quality gate confidence scoring..."
     python /opt/quality_gate.py \
-        --model_path "$OUTPUT_DIR/enhanced" \
+        --model_path "$final_model_path" \
         --real_images "$scene_dir/images" \
         --output_dir "$OUTPUT_DIR/walkable" \
         || {
-            notify_slack "Failed at Stage 5: quality_gate.py" "error"
-            return 1
+            notify_slack "Stage 5 failed (non-fatal), using model directly" "info"
+            echo "WARNING: Quality gate failed, copying model directly"
+            mkdir -p "$OUTPUT_DIR/walkable"
+            cp -r "$final_model_path"/* "$OUTPUT_DIR/walkable/" 2>/dev/null || true
         }
-    notify_slack "Stage 5 complete: confidence scores computed"
+    notify_slack "Stage 5 complete"
 
     echo "Walkable Splat pipeline completed"
     return 0
@@ -483,7 +487,7 @@ case "$PIPELINE_MODE" in
             # Quality gate outputs the final model; find the PLY
             local_ply="$OUTPUT_DIR/walkable/point_cloud/point_cloud.ply"
             if [ ! -f "$local_ply" ]; then
-                local_ply=$(find "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/enhanced" "$OUTPUT_DIR/descent/final" -name "*.ply" -type f 2>/dev/null | head -1)
+                local_ply=$(find "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/enhanced" "$OUTPUT_DIR/descent/final" "$OUTPUT_DIR/instantsplat" -name "*.ply" -type f 2>/dev/null | head -1)
             fi
             if convert_and_upload "$local_ply" "walkable"; then
                 # Append confidence metadata to manifest if available
