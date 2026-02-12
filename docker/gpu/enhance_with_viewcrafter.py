@@ -90,8 +90,8 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
     """
     Run ViewCrafter on pairs of rendered views to generate enhanced frames.
 
-    ViewCrafter takes 2 keyframes and generates a video of interpolated views
-    with diffusion-enhanced detail.
+    ViewCrafter takes reference images and generates diffusion-enhanced
+    novel views using its video diffusion model.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -103,9 +103,24 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
     if len(input_images) < 2:
         raise ValueError(f"Need at least 2 input images, got {len(input_images)}")
 
+    # Find the checkpoint model file
+    ckpt_file = os.path.join(viewcrafter_ckpt, "model.ckpt")
+    if not os.path.exists(ckpt_file):
+        # Try finding any .ckpt file in the checkpoint dir
+        ckpt_candidates = list(Path(viewcrafter_ckpt).glob("*.ckpt"))
+        if ckpt_candidates:
+            ckpt_file = str(ckpt_candidates[0])
+        else:
+            ckpt_file = viewcrafter_ckpt  # Use as-is
+
+    # Find the config file (512 variant)
+    config_file = os.path.join(viewcrafter_dir, "configs", "inference_pvd_512.yaml")
+    if not os.path.exists(config_file):
+        config_file = os.path.join(viewcrafter_dir, "configs", "inference_pvd_1024.yaml")
+
     enhanced_count = 0
 
-    # Process pairs of images through ViewCrafter
+    # Process pairs of images through ViewCrafter using sparse_view_interp mode
     for i in range(0, len(input_images) - 1, 2):
         img_a = input_images[i]
         img_b = input_images[min(i + 1, len(input_images) - 1)]
@@ -113,21 +128,25 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
         pair_output = os.path.join(output_dir, f"pair_{i:03d}")
         os.makedirs(pair_output, exist_ok=True)
 
-        # Prepare input for ViewCrafter: expects a directory with ordered frames
+        # Prepare input directory with ordered images
         pair_input = os.path.join(pair_output, "input")
         os.makedirs(pair_input, exist_ok=True)
         shutil.copy2(str(img_a), os.path.join(pair_input, "frame_0000.jpg"))
         shutil.copy2(str(img_b), os.path.join(pair_input, "frame_0001.jpg"))
 
-        # Run ViewCrafter inference
+        # Run ViewCrafter with correct arguments
         cmd = [
             sys.executable,
             os.path.join(viewcrafter_dir, "inference.py"),
-            "--input_dir", pair_input,
-            "--output_dir", pair_output,
-            "--ckpt_path", viewcrafter_ckpt,
-            "--num_views", str(batch_size),
-            "--save_video",
+            "--image_dir", pair_input,
+            "--out_dir", pair_output,
+            "--ckpt_path", ckpt_file,
+            "--config", config_file,
+            "--mode", "sparse_view_interp",
+            "--video_length", "25",
+            "--ddim_steps", "25",
+            "--height", "320",
+            "--width", "512",
         ]
 
         print(f"  Running ViewCrafter on pair {i//2 + 1}/{(len(input_images)+1)//2}...")
@@ -146,9 +165,9 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
             print(f"  Warning: ViewCrafter timed out on pair {i}")
             continue
 
-        # Collect generated frames
-        for frame in sorted(Path(pair_output).glob("*.png")) + sorted(
-            Path(pair_output).glob("*.jpg")
+        # Collect generated frames from output
+        for frame in sorted(Path(pair_output).rglob("*.png")) + sorted(
+            Path(pair_output).rglob("*.jpg")
         ):
             if frame.parent.name != "input":
                 dest = os.path.join(output_dir, f"enhanced_{enhanced_count:04d}.jpg")

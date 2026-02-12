@@ -503,7 +503,20 @@ docker run --rm --gpus all \\
   -e TRAIN_ITERATIONS=${TRAIN_ITERATIONS || '7000'} \\
   -e GITHUB_TOKEN=${GHCR_TOKEN || ''} \\
   --entrypoint bash \\
-  ${GPU_DOCKER_IMAGE} -c "pip install --no-cache-dir icecream open3d trimesh pyglet==1.5.0 evo matplotlib tensorboard imageio gdown roma opencv-python transformers huggingface_hub omegaconf pytorch-lightning open-clip-torch kornia decord imageio-ffmpeg scikit-image moviepy 2>&1 | tail -3 && /opt/entrypoint.sh" 2>&1
+  ${GPU_DOCKER_IMAGE} -c '
+    echo "Installing runtime deps..."
+    pip install --no-cache-dir icecream open3d trimesh "pyglet<2" evo matplotlib tensorboard imageio gdown roma opencv-python transformers huggingface_hub omegaconf pytorch-lightning open-clip-torch kornia decord imageio-ffmpeg scikit-image moviepy 2>&1 | tail -3
+
+    echo "Fetching latest pipeline scripts from GitHub..."
+    CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
+    [ -n "\$GITHUB_TOKEN" ] && CURL_ARGS+=(-H "Authorization: token \$GITHUB_TOKEN")
+    BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/docker/gpu"
+    for script in render_descent.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py; do
+      curl "\${CURL_ARGS[@]}" "\$BASE_URL/\$script" -o "/opt/\$script" && echo "  Updated \$script"
+    done
+
+    exec /opt/entrypoint.sh
+  ' 2>&1
 DOCKER_EXIT=\$?
 echo "=== DOCKER RUN END (exit \$DOCKER_EXIT) ==="
 
