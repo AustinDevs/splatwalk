@@ -28,6 +28,10 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pillow"])
     from PIL import Image
 
+# Monkey-patch for Pillow 10+ (ANTIALIAS removed, ViewCrafter still uses it)
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.LANCZOS
+
 
 def find_ply_and_load(model_path):
     """Find and load the latest PLY checkpoint."""
