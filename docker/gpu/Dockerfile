@@ -8,7 +8,7 @@ ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 
 # System deps
 RUN apt-get update && apt-get install -y \
-    git wget curl ffmpeg unzip \
+    git wget curl ffmpeg unzip pkg-config \
     libgl1-mesa-glx libglib2.0-0 build-essential \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
@@ -52,7 +52,8 @@ RUN git clone https://github.com/Drexubery/ViewCrafter.git /opt/ViewCrafter && \
     rm -rf /opt/ViewCrafter/.git
 
 # ViewCrafter checkpoint (~14GB) — separate layer so it caches independently
-RUN mkdir -p /opt/ViewCrafter/checkpoints && \
+RUN pip install --no-cache-dir huggingface_hub && \
+    mkdir -p /opt/ViewCrafter/checkpoints && \
     python -c "from huggingface_hub import snapshot_download; \
     snapshot_download('Drexubery/ViewCrafter_25_512', local_dir='/opt/ViewCrafter/checkpoints/ViewCrafter_25_512')" && \
     rm -rf /root/.cache/huggingface
