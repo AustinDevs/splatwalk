@@ -509,16 +509,18 @@ docker run --rm --gpus all \\
 
     echo "Building PyTorch3D from source with CUDA support (required for ViewCrafter)..."
     # Check if PyTorch3D already has GPU support
-    if python -c "import pytorch3d; from pytorch3d import _C; print(\"PyTorch3D GPU OK\")" 2>/dev/null; then
+    if python -c "from pytorch3d.renderer.points.rasterize_points import rasterize_points; print(\"PyTorch3D GPU OK\")" 2>/dev/null; then
       echo "  PyTorch3D already has GPU support"
     else
+      echo "  Removing pre-built PyTorch3D (no GPU support)..."
+      pip uninstall -y pytorch3d 2>/dev/null || true
       echo "  Compiling PyTorch3D from source (this takes ~15-20 min)..."
-      pip install --no-cache-dir "git+https://github.com/facebookresearch/pytorch3d.git@stable" 2>&1 | tail -5
+      FORCE_CUDA=1 pip install --no-cache-dir --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git" 2>&1 | tail -10
       # Verify it works
-      if python -c "import pytorch3d; from pytorch3d import _C; print(\"PyTorch3D GPU OK\")" 2>/dev/null; then
+      if python -c "from pytorch3d.renderer.points.rasterize_points import rasterize_points; print(\"PyTorch3D GPU OK\")" 2>/dev/null; then
         echo "  PyTorch3D compiled successfully with GPU support!"
       else
-        echo "  WARNING: PyTorch3D GPU compilation may have failed"
+        echo "  WARNING: PyTorch3D GPU compilation failed, ViewCrafter Stage 4 will be skipped"
       fi
     fi
 
