@@ -32,11 +32,11 @@ notify_slack() {
 
     if [ -z "$SLACK_WEBHOOK_URL" ]; then return; fi
 
-    local emoji="🔄"
-    [ "$status" = "success" ] && emoji="✅"
-    [ "$status" = "error" ] && emoji="❌"
+    local emoji=":arrows_counterclockwise:"
+    [ "$status" = "success" ] && emoji=":white_check_mark:"
+    [ "$status" = "error" ] && emoji=":x:"
 
-    local payload="{\"text\":\"${emoji} *[${JOB_ID:0:8}] ${PIPELINE_MODE}* — ${message}\"}"
+    local payload="{\"text\":\"${emoji} *[${JOB_ID:0:8}] ${PIPELINE_MODE}* -- ${message}\"}"
     curl -s -X POST -H 'Content-type: application/json' \
         --data "$payload" "$SLACK_WEBHOOK_URL" > /dev/null 2>&1 &
 }

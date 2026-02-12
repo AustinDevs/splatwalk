@@ -123,6 +123,7 @@ class GPUOrchestrator {
       image: GPU_DROPLET_IMAGE,
       ssh_keys: [DO_SSH_KEY_ID],
       user_data: cloudInit,
+      monitoring: true,
     });
 
     const dropletId = response.droplet.id.toString();
@@ -391,7 +392,6 @@ echo "Downloaded ${imageUrls.length} files"
     }
 
     return `#!/bin/bash
-set -euo pipefail
 exec > /var/log/splatwalk-job.log 2>&1
 
 echo "=== SplatWalk Autonomous Job Runner ==="
@@ -403,23 +403,43 @@ notify_slack() {
   local message="\$1"
   local status="\${2:-info}"
   if [ -z "${SLACK_WEBHOOK_URL}" ]; then return; fi
-  local emoji="🔄"
-  [ "\$status" = "success" ] && emoji="✅"
-  [ "\$status" = "error" ] && emoji="❌"
-  local payload="{\\"text\\":\\"\${emoji} *[${jobId.slice(0, 8)}] ${pipeline}* — \${message}\\"}"
+  local emoji=":arrows_counterclockwise:"
+  [ "\$status" = "success" ] && emoji=":white_check_mark:"
+  [ "\$status" = "error" ] && emoji=":x:"
+  local payload="{\\"text\\":\\"\${emoji} *[${jobId.slice(0, 8)}] ${pipeline}* -- \${message}\\"}"
   curl -s -X POST -H 'Content-type: application/json' --data "\$payload" "${SLACK_WEBHOOK_URL}" > /dev/null 2>&1 &
 }
+
+# --- Always self-destruct, no matter what ---
+self_destruct() {
+  echo "Self-destructing droplet..."
+  notify_slack "Droplet self-destructing." "info"
+  sleep 2  # let Slack message send
+  DROPLET_ID=\$(curl -s http://169.254.169.254/metadata/v1/id)
+  curl -s -X DELETE \\
+    -H "Authorization: Bearer ${DO_API_TOKEN}" \\
+    "https://api.digitalocean.com/v2/droplets/\$DROPLET_ID"
+}
+trap self_destruct EXIT
+
+# --- Safety timeout: self-destruct after 5 hours no matter what ---
+(
+  sleep 18000
+  echo "Safety timeout reached..."
+  notify_slack "Safety timeout (5h) reached. Force killing." "error"
+  kill -9 \$\$ 2>/dev/null  # kill the main script, triggers EXIT trap
+) &
 
 notify_slack "Droplet booted, waiting for GPU driver..."
 
 # --- Wait for GPU/docker readiness ---
-for i in $(seq 1 30); do
+for i in \$(seq 1 30); do
   nvidia-smi && break
-  echo "Waiting for GPU driver... (attempt $i)"
+  echo "Waiting for GPU driver... (attempt \$i)"
   sleep 10
 done
 
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "unknown")
+GPU_NAME=\$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "unknown")
 notify_slack "GPU ready: \$GPU_NAME. Pulling Docker image..."
 
 # --- Docker login + pull ---
@@ -431,16 +451,6 @@ notify_slack "Docker image pulled. Downloading input data..."
 ${downloadBlock}
 
 notify_slack "Input data ready. Starting pipeline..."
-
-# --- Safety timeout: self-destruct after 5 hours no matter what ---
-(
-  sleep 18000
-  echo "Safety timeout reached, self-destructing..."
-  notify_slack "Safety timeout (5h) reached. Force self-destructing." "error"
-  DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
-  curl -s -X DELETE -H "Authorization: Bearer ${DO_API_TOKEN}" \\
-    "https://api.digitalocean.com/v2/droplets/$DROPLET_ID"
-) &
 
 # --- Run the pipeline ---
 if docker run --rm --gpus all \\
@@ -460,18 +470,11 @@ if docker run --rm --gpus all \\
   ${TRAIN_ITERATIONS ? `-e TRAIN_ITERATIONS=${TRAIN_ITERATIONS}` : ''} \\
   ${GHCR_TOKEN ? `-e GITHUB_TOKEN=${GHCR_TOKEN}` : ''} \\
   ${GPU_DOCKER_IMAGE}; then
-  echo "Pipeline succeeded"
+  notify_slack "Pipeline finished successfully!" "success"
 else
-  notify_slack "Docker pipeline exited with error code \$?" "error"
+  notify_slack "Pipeline failed (exit code \$?)" "error"
 fi
-
-# --- Self-destruct ---
-echo "Pipeline finished, self-destructing droplet..."
-notify_slack "Pipeline finished. Droplet self-destructing." "success"
-DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
-curl -s -X DELETE \\
-  -H "Authorization: Bearer ${DO_API_TOKEN}" \\
-  "https://api.digitalocean.com/v2/droplets/$DROPLET_ID"
+# EXIT trap fires here → self_destruct → droplet deleted
 `;
   }
 }
