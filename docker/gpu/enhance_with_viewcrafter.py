@@ -161,11 +161,11 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=1200,
                 cwd=viewcrafter_dir,
             )
             if result.returncode != 0:
-                print(f"  Warning: ViewCrafter failed on view {i}: {result.stderr[-200:]}")
+                print(f"  Warning: ViewCrafter failed on view {i}: {result.stderr[-500:]}")
                 continue
         except subprocess.TimeoutExpired:
             print(f"  Warning: ViewCrafter timed out on view {i}")

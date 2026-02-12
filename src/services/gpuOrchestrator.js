@@ -507,6 +507,21 @@ docker run --rm --gpus all \\
     echo "Installing runtime deps..."
     pip install --no-cache-dir icecream open3d trimesh "pyglet<2" evo matplotlib tensorboard imageio gdown roma opencv-python transformers huggingface_hub omegaconf pytorch-lightning open-clip-torch kornia decord imageio-ffmpeg scikit-image moviepy 2>&1 | tail -3
 
+    echo "Building PyTorch3D from source with CUDA support (required for ViewCrafter)..."
+    # Check if PyTorch3D already has GPU support
+    if python -c "import pytorch3d; from pytorch3d import _C; print(\"PyTorch3D GPU OK\")" 2>/dev/null; then
+      echo "  PyTorch3D already has GPU support"
+    else
+      echo "  Compiling PyTorch3D from source (this takes ~15-20 min)..."
+      pip install --no-cache-dir "git+https://github.com/facebookresearch/pytorch3d.git@stable" 2>&1 | tail -5
+      # Verify it works
+      if python -c "import pytorch3d; from pytorch3d import _C; print(\"PyTorch3D GPU OK\")" 2>/dev/null; then
+        echo "  PyTorch3D compiled successfully with GPU support!"
+      else
+        echo "  WARNING: PyTorch3D GPU compilation may have failed"
+      fi
+    fi
+
     echo "Fetching latest pipeline scripts from GitHub..."
     CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
     [ -n "\$GITHUB_TOKEN" ] && CURL_ARGS+=(-H "Authorization: token \$GITHUB_TOKEN")
