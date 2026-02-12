@@ -410,9 +410,28 @@ notify_slack() {
   curl -s -X POST -H 'Content-type: application/json' --data "\$payload" "${SLACK_WEBHOOK_URL}" > /dev/null 2>&1 &
 }
 
+# --- Upload log to Spaces ---
+upload_log() {
+  local log_key="jobs/${jobId}/logs/cloud-init.log"
+  echo "Uploading log to s3://${DO_SPACES_BUCKET}/\$log_key ..."
+  local date_str=\$(date -u +"%a, %d %b %Y %H:%M:%S GMT")
+  local content_type="text/plain"
+  local resource="/${DO_SPACES_BUCKET}/\$log_key"
+  local string_to_sign="PUT\\n\\n\${content_type}\\n\${date_str}\\n\${resource}"
+  local signature=\$(echo -en "\$string_to_sign" | openssl dgst -sha1 -hmac "${DO_SPACES_SECRET}" -binary | base64)
+  curl -s -X PUT \\
+    -H "Date: \$date_str" \\
+    -H "Content-Type: \$content_type" \\
+    -H "Authorization: AWS ${DO_SPACES_KEY}:\$signature" \\
+    --data-binary @/var/log/splatwalk-job.log \\
+    "${DO_SPACES_ENDPOINT}/${DO_SPACES_BUCKET}/\$log_key" || true
+  notify_slack "Log uploaded: ${DO_SPACES_ENDPOINT}/${DO_SPACES_BUCKET}/\$log_key"
+}
+
 # --- Always self-destruct, no matter what ---
 self_destruct() {
   echo "Self-destructing droplet..."
+  upload_log
   notify_slack "Droplet self-destructing." "info"
   sleep 2  # let Slack message send
   DROPLET_ID=\$(curl -s http://169.254.169.254/metadata/v1/id)
@@ -440,11 +459,24 @@ for i in \$(seq 1 30); do
 done
 
 GPU_NAME=\$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "unknown")
-notify_slack "GPU ready: \$GPU_NAME. Pulling Docker image..."
+notify_slack "GPU ready: \$GPU_NAME. Configuring Docker GPU runtime..."
 
-# --- Docker login + pull ---
+# --- Ensure nvidia-container-toolkit is configured ---
+apt-get update && apt-get install -y nvidia-container-toolkit
+nvidia-ctk runtime configure --runtime=docker
+systemctl restart docker
+sleep 5
+
+notify_slack "Docker GPU configured. Pulling image..."
+
+# --- Docker login + pull (with retry for rate limits) ---
 ${GHCR_USERNAME && GHCR_TOKEN ? `echo "${GHCR_TOKEN}" | docker login ghcr.io -u ${GHCR_USERNAME} --password-stdin` : 'echo "No GHCR credentials, skipping login"'}
-docker pull ${GPU_DOCKER_IMAGE}
+for attempt in 1 2 3; do
+  docker pull ${GPU_DOCKER_IMAGE} && break
+  echo "Docker pull failed (attempt \$attempt/3), waiting 30s..."
+  notify_slack "Docker pull failed (attempt \$attempt/3), retrying..." "error"
+  sleep 30
+done
 
 notify_slack "Docker image pulled. Downloading input data..."
 
@@ -452,8 +484,9 @@ ${downloadBlock}
 
 notify_slack "Input data ready. Starting pipeline..."
 
-# --- Run the pipeline ---
-if docker run --rm --gpus all \\
+# --- Run the pipeline (stream output to log) ---
+echo "=== DOCKER RUN START ==="
+docker run --rm --gpus all \\
   -v /workspace/${jobId}:/data \\
   -e INPUT_DIR=/data/input \\
   -e OUTPUT_DIR=/data/output \\
@@ -464,15 +497,19 @@ if docker run --rm --gpus all \\
   -e SPACES_BUCKET=${DO_SPACES_BUCKET} \\
   -e SPACES_REGION=${DO_SPACES_REGION} \\
   -e SPACES_ENDPOINT=${DO_SPACES_ENDPOINT} \\
-  -e SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL} \\
-  ${MAX_N_VIEWS ? `-e MAX_N_VIEWS=${MAX_N_VIEWS}` : ''} \\
-  ${VIEWCRAFTER_BATCH_SIZE ? `-e VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE}` : ''} \\
-  ${TRAIN_ITERATIONS ? `-e TRAIN_ITERATIONS=${TRAIN_ITERATIONS}` : ''} \\
-  ${GHCR_TOKEN ? `-e GITHUB_TOKEN=${GHCR_TOKEN}` : ''} \\
-  ${GPU_DOCKER_IMAGE}; then
+  -e SLACK_WEBHOOK_URL='${SLACK_WEBHOOK_URL}' \\
+  -e MAX_N_VIEWS=${MAX_N_VIEWS || '24'} \\
+  -e VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE || '10'} \\
+  -e TRAIN_ITERATIONS=${TRAIN_ITERATIONS || '7000'} \\
+  -e GITHUB_TOKEN=${GHCR_TOKEN || ''} \\
+  ${GPU_DOCKER_IMAGE} 2>&1
+DOCKER_EXIT=\$?
+echo "=== DOCKER RUN END (exit \$DOCKER_EXIT) ==="
+
+if [ "\$DOCKER_EXIT" -eq 0 ]; then
   notify_slack "Pipeline finished successfully!" "success"
 else
-  notify_slack "Pipeline failed (exit code \$?)" "error"
+  notify_slack "Pipeline failed (exit \$DOCKER_EXIT). Check log in Spaces." "error"
 fi
 # EXIT trap fires here → self_destruct → droplet deleted
 `;
