@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+shopt -s nocaseglob  # case-insensitive globbing (matches .JPG, .jpg, .Jpg, etc.)
 
 # Environment variables expected:
 # INPUT_DIR - Directory containing input images
