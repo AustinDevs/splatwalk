@@ -502,7 +502,8 @@ docker run --rm --gpus all \\
   -e VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE || '10'} \\
   -e TRAIN_ITERATIONS=${TRAIN_ITERATIONS || '7000'} \\
   -e GITHUB_TOKEN=${GHCR_TOKEN || ''} \\
-  ${GPU_DOCKER_IMAGE} 2>&1
+  --entrypoint bash \\
+  ${GPU_DOCKER_IMAGE} -c "pip install --no-cache-dir icecream open3d trimesh pyglet==1.5.0 evo matplotlib tensorboard imageio gdown roma opencv-python transformers huggingface_hub omegaconf pytorch-lightning open-clip-torch kornia decord imageio-ffmpeg scikit-image moviepy 2>&1 | tail -3 && /opt/entrypoint.sh" 2>&1
 DOCKER_EXIT=\$?
 echo "=== DOCKER RUN END (exit \$DOCKER_EXIT) ==="
 
