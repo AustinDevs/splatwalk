@@ -103,6 +103,16 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
     if not os.path.isdir(viewcrafter_dir):
         raise FileNotFoundError("ViewCrafter not installed at /opt/ViewCrafter")
 
+    # Patch ANTIALIAS -> LANCZOS in ViewCrafter's bundled dust3r (Pillow 10+ removed ANTIALIAS)
+    for pyfile in Path(viewcrafter_dir).rglob("*.py"):
+        try:
+            content = pyfile.read_text()
+            if "Image.ANTIALIAS" in content:
+                pyfile.write_text(content.replace("Image.ANTIALIAS", "Image.LANCZOS"))
+                print(f"  Patched {pyfile} (ANTIALIAS -> LANCZOS)")
+        except Exception:
+            pass
+
     input_images = sorted(Path(input_dir).glob("*.jpg")) + sorted(Path(input_dir).glob("*.png"))
     if len(input_images) < 2:
         raise ValueError(f"Need at least 2 input images, got {len(input_images)}")

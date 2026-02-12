@@ -502,44 +502,7 @@ docker run --rm --gpus all \\
   -e VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE || '10'} \\
   -e TRAIN_ITERATIONS=${TRAIN_ITERATIONS || '7000'} \\
   -e GITHUB_TOKEN=${GHCR_TOKEN || ''} \\
-  --entrypoint bash \\
-  ${GPU_DOCKER_IMAGE} -c '
-    echo "Installing runtime deps..."
-    pip install --no-cache-dir icecream open3d trimesh "pyglet<2" evo matplotlib tensorboard imageio gdown roma opencv-python transformers huggingface_hub omegaconf pytorch-lightning open-clip-torch kornia decord imageio-ffmpeg scikit-image moviepy 2>&1 | tail -3
-
-    echo "Building PyTorch3D from source with CUDA support (required for ViewCrafter)..."
-    # Check if PyTorch3D already has GPU support
-    if python -c "from pytorch3d.renderer.points.rasterize_points import rasterize_points; print(\"PyTorch3D GPU OK\")" 2>/dev/null; then
-      echo "  PyTorch3D already has GPU support"
-    else
-      echo "  Removing pre-built PyTorch3D (no GPU support)..."
-      pip uninstall -y pytorch3d 2>/dev/null || true
-      echo "  Compiling PyTorch3D from source (this takes ~15-20 min)..."
-      FORCE_CUDA=1 pip install --no-cache-dir --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git" 2>&1 | tail -10
-      # Verify it works
-      if python -c "from pytorch3d.renderer.points.rasterize_points import rasterize_points; print(\"PyTorch3D GPU OK\")" 2>/dev/null; then
-        echo "  PyTorch3D compiled successfully with GPU support!"
-      else
-        echo "  WARNING: PyTorch3D GPU compilation failed, ViewCrafter Stage 4 will be skipped"
-      fi
-    fi
-
-    echo "Fetching latest pipeline scripts from GitHub..."
-    CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
-    [ -n "\$GITHUB_TOKEN" ] && CURL_ARGS+=(-H "Authorization: token \$GITHUB_TOKEN")
-    BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/docker/gpu"
-    for script in render_descent.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py; do
-      curl "\${CURL_ARGS[@]}" "\$BASE_URL/\$script" -o "/opt/\$script" && echo "  Updated \$script"
-    done
-
-    echo "Patching ViewCrafter for Pillow 10+ (ANTIALIAS -> LANCZOS)..."
-    grep -rl "Image.ANTIALIAS" /opt/ViewCrafter/ 2>/dev/null | while read f; do
-      sed -i "s/Image.ANTIALIAS/Image.LANCZOS/g" "\$f"
-      echo "  Patched \$f"
-    done
-
-    exec /opt/entrypoint.sh
-  ' 2>&1
+  ${GPU_DOCKER_IMAGE} 2>&1
 DOCKER_EXIT=\$?
 echo "=== DOCKER RUN END (exit \$DOCKER_EXIT) ==="
 
