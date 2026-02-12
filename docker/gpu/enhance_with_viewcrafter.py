@@ -124,43 +124,36 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
 
     enhanced_count = 0
 
-    # Process pairs of images through ViewCrafter using sparse_view_interp mode
-    for i in range(0, len(input_images) - 1, 2):
-        img_a = input_images[i]
-        img_b = input_images[min(i + 1, len(input_images) - 1)]
+    # Find DUSt3R checkpoint (ViewCrafter uses DUSt3R for depth estimation)
+    dust3r_ckpt = "/opt/InstantSplat/submodules/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
+    if not os.path.exists(dust3r_ckpt):
+        dust3r_ckpt = os.path.join(viewcrafter_dir, "checkpoints", "DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth")
 
-        pair_output = os.path.join(output_dir, f"pair_{i:03d}")
-        os.makedirs(pair_output, exist_ok=True)
+    # Use single_view_target mode (avoids pytorch3d GPU compilation issues)
+    # Process each image individually with slight camera movements
+    for i, img_path in enumerate(input_images[:batch_size]):
+        view_output = os.path.join(output_dir, f"view_{i:03d}")
+        os.makedirs(view_output, exist_ok=True)
 
-        # Prepare input directory with integer-named images (ViewCrafter expects 0.jpg, 1.jpg)
-        pair_input = os.path.join(pair_output, "input")
-        os.makedirs(pair_input, exist_ok=True)
-        shutil.copy2(str(img_a), os.path.join(pair_input, "0.jpg"))
-        shutil.copy2(str(img_b), os.path.join(pair_input, "1.jpg"))
-
-        # Find DUSt3R checkpoint (ViewCrafter uses DUSt3R for depth estimation)
-        dust3r_ckpt = "/opt/InstantSplat/submodules/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
-        if not os.path.exists(dust3r_ckpt):
-            # Fallback: check ViewCrafter's own checkpoints dir
-            dust3r_ckpt = os.path.join(viewcrafter_dir, "checkpoints", "DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth")
-
-        # Run ViewCrafter with correct arguments
         cmd = [
             sys.executable,
             os.path.join(viewcrafter_dir, "inference.py"),
-            "--image_dir", pair_input,
-            "--out_dir", pair_output,
+            "--image_dir", str(img_path),
+            "--out_dir", view_output,
             "--ckpt_path", ckpt_file,
             "--model_path", dust3r_ckpt,
             "--config", config_file,
-            "--mode", "sparse_view_interp",
+            "--mode", "single_view_target",
+            "--d_theta", "5", "-5",
+            "--d_phi", "15", "-15",
+            "--d_r", "0.0",
             "--video_length", "25",
             "--ddim_steps", "25",
             "--height", "320",
             "--width", "512",
         ]
 
-        print(f"  Running ViewCrafter on pair {i//2 + 1}/{(len(input_images)+1)//2}...")
+        print(f"  Running ViewCrafter on view {i+1}/{min(len(input_images), batch_size)}...")
         try:
             result = subprocess.run(
                 cmd,
@@ -170,21 +163,24 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
                 cwd=viewcrafter_dir,
             )
             if result.returncode != 0:
-                print(f"  Warning: ViewCrafter failed on pair {i}: {result.stderr[-200:]}")
+                print(f"  Warning: ViewCrafter failed on view {i}: {result.stderr[-200:]}")
                 continue
         except subprocess.TimeoutExpired:
-            print(f"  Warning: ViewCrafter timed out on pair {i}")
+            print(f"  Warning: ViewCrafter timed out on view {i}")
             continue
 
         # Collect generated frames from output
-        for frame in sorted(Path(pair_output).rglob("*.png")) + sorted(
-            Path(pair_output).rglob("*.jpg")
+        for frame in sorted(Path(view_output).rglob("*.png")) + sorted(
+            Path(view_output).rglob("*.jpg")
         ):
-            if frame.parent.name != "input":
+            if "input" not in str(frame.parent):
                 dest = os.path.join(output_dir, f"enhanced_{enhanced_count:04d}.jpg")
-                img = Image.open(str(frame)).convert("RGB")
-                img.save(dest, "JPEG", quality=95)
-                enhanced_count += 1
+                try:
+                    img = Image.open(str(frame)).convert("RGB")
+                    img.save(dest, "JPEG", quality=95)
+                    enhanced_count += 1
+                except Exception:
+                    pass
 
     print(f"  ViewCrafter generated {enhanced_count} enhanced frames")
     return enhanced_count
