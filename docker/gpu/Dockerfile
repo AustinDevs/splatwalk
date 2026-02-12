@@ -6,10 +6,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 
-# System deps
+# System deps (includes FFmpeg dev headers for PyAV build)
 RUN apt-get update && apt-get install -y \
     git wget curl ffmpeg unzip pkg-config \
     libgl1-mesa-glx libglib2.0-0 build-essential \
+    libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
