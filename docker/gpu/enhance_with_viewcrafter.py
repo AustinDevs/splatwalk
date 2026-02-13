@@ -92,10 +92,11 @@ def render_low_altitude_views(model_path, scene_path, output_dir, num_views=24):
 
 def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
     """
-    Run ViewCrafter on pairs of rendered views to generate enhanced frames.
+    Run ViewCrafter in sparse_view_interp mode on pairs of rendered views.
 
-    ViewCrafter takes reference images and generates diffusion-enhanced
-    novel views using its video diffusion model.
+    sparse_view_interp takes 2+ images of the same scene, uses DUSt3R to
+    recover camera poses, builds a PyTorch3D point cloud, and generates
+    diffusion-enhanced interpolated frames between the viewpoints.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -117,68 +118,93 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
     if len(input_images) < 2:
         raise ValueError(f"Need at least 2 input images, got {len(input_images)}")
 
-    # Find the checkpoint model file
-    ckpt_file = os.path.join(viewcrafter_ckpt, "model.ckpt")
-    if not os.path.exists(ckpt_file):
-        # Try finding any .ckpt file in the checkpoint dir
-        ckpt_candidates = list(Path(viewcrafter_ckpt).glob("*.ckpt"))
-        if ckpt_candidates:
-            ckpt_file = str(ckpt_candidates[0])
-        else:
-            ckpt_file = viewcrafter_ckpt  # Use as-is
+    # Find the SPARSE checkpoint (different from single-view model.ckpt)
+    sparse_ckpt = os.path.join(viewcrafter_dir, "checkpoints", "model_sparse.ckpt")
+    if not os.path.exists(sparse_ckpt):
+        # Try downloading from HuggingFace at runtime
+        print("  Sparse checkpoint not found, downloading from HuggingFace...")
+        try:
+            subprocess.check_call([
+                sys.executable, "-c",
+                "from huggingface_hub import hf_hub_download; "
+                "import os, shutil; "
+                f"path = hf_hub_download('Drexubery/ViewCrafter_25', 'model.ckpt'); "
+                f"shutil.copy2(path, '{sparse_ckpt}')"
+            ], timeout=600)
+            print(f"  Downloaded sparse checkpoint: {sparse_ckpt}")
+        except Exception as e:
+            print(f"  WARNING: Could not download sparse checkpoint: {e}")
+            # Fall back to the single-view checkpoint (may still work)
+            ckpt_file = os.path.join(viewcrafter_ckpt, "model.ckpt")
+            if os.path.exists(ckpt_file):
+                sparse_ckpt = ckpt_file
+                print(f"  Falling back to single-view checkpoint: {sparse_ckpt}")
+            else:
+                ckpt_candidates = list(Path(viewcrafter_ckpt).glob("*.ckpt"))
+                if ckpt_candidates:
+                    sparse_ckpt = str(ckpt_candidates[0])
+                else:
+                    raise FileNotFoundError("No ViewCrafter checkpoint found")
 
-    # Find the config file (512 variant)
+    # Find the config file
     config_file = os.path.join(viewcrafter_dir, "configs", "inference_pvd_512.yaml")
     if not os.path.exists(config_file):
         config_file = os.path.join(viewcrafter_dir, "configs", "inference_pvd_1024.yaml")
 
-    enhanced_count = 0
-
-    # Find DUSt3R checkpoint (ViewCrafter uses DUSt3R for depth estimation)
+    # Find DUSt3R checkpoint (ViewCrafter uses DUSt3R for pose estimation + depth)
     dust3r_ckpt = "/opt/InstantSplat/submodules/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
     if not os.path.exists(dust3r_ckpt):
         dust3r_ckpt = os.path.join(viewcrafter_dir, "checkpoints", "DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth")
 
-    # Use single_view_target mode (avoids pytorch3d GPU compilation issues)
-    # Process each image individually with slight camera movements
-    for i, img_path in enumerate(input_images[:batch_size]):
-        view_output = os.path.join(output_dir, f"view_{i:03d}")
+    enhanced_count = 0
+
+    # Process consecutive pairs of images using sparse_view_interp mode.
+    # Each pair produces ~25 interpolated frames via diffusion.
+    num_pairs = min(len(input_images) - 1, batch_size)
+    for i in range(num_pairs):
+        # Create a temp directory with just this pair of images
+        pair_dir = os.path.join(output_dir, f"pair_{i:03d}_input")
+        view_output = os.path.join(output_dir, f"pair_{i:03d}_output")
+        os.makedirs(pair_dir, exist_ok=True)
         os.makedirs(view_output, exist_ok=True)
+
+        # Copy consecutive images as 000.jpg, 001.jpg (sorted order matters)
+        img_a = Image.open(str(input_images[i])).convert("RGB")
+        img_b = Image.open(str(input_images[i + 1])).convert("RGB")
+        img_a.save(os.path.join(pair_dir, "000.jpg"), "JPEG", quality=95)
+        img_b.save(os.path.join(pair_dir, "001.jpg"), "JPEG", quality=95)
 
         cmd = [
             sys.executable,
             os.path.join(viewcrafter_dir, "inference.py"),
-            "--image_dir", str(img_path),
+            "--image_dir", pair_dir,
             "--out_dir", view_output,
-            "--ckpt_path", ckpt_file,
+            "--ckpt_path", sparse_ckpt,
             "--model_path", dust3r_ckpt,
             "--config", config_file,
-            "--mode", "single_view_target",
-            "--d_theta", "10",
-            "--d_phi", "30",
-            "--d_r", "0.0",
-            "--d_x", "0.0",
-            "--d_y", "0.0",
+            "--mode", "sparse_view_interp",
+            "--bg_trd", "0.2",
             "--video_length", "25",
             "--ddim_steps", "25",
             "--height", "320",
             "--width", "512",
+            "--seed", "123",
         ]
 
-        print(f"  Running ViewCrafter on view {i+1}/{min(len(input_images), batch_size)}...")
+        print(f"  Running ViewCrafter sparse_view_interp on pair {i+1}/{num_pairs}...")
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=1200,
+                timeout=1800,  # 30 min per pair (sparse mode is slower)
                 cwd=viewcrafter_dir,
             )
             if result.returncode != 0:
-                print(f"  Warning: ViewCrafter failed on view {i}: {result.stderr[-500:]}")
+                print(f"  Warning: ViewCrafter failed on pair {i}: {result.stderr[-500:]}")
                 continue
         except subprocess.TimeoutExpired:
-            print(f"  Warning: ViewCrafter timed out on view {i}")
+            print(f"  Warning: ViewCrafter timed out on pair {i}")
             continue
 
         # Collect generated frames from output
@@ -193,6 +219,9 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
                     enhanced_count += 1
                 except Exception:
                     pass
+
+        # Clean up pair input dir to save disk space
+        shutil.rmtree(pair_dir, ignore_errors=True)
 
     print(f"  ViewCrafter generated {enhanced_count} enhanced frames")
     return enhanced_count
