@@ -377,18 +377,20 @@ notify_slack() {
   curl -s -X POST -H 'Content-type: application/json' --data "\$payload" "${SLACK_WEBHOOK_URL}" > /dev/null 2>&1 &
 }
 
-# --- Upload log to Spaces ---
+# --- Upload log to Spaces (public-read for debugging) ---
 upload_log() {
   local log_key="jobs/${jobId}/logs/cloud-init.log"
   echo "Uploading log to s3://${DO_SPACES_BUCKET}/\$log_key ..."
   local date_str=\$(date -u +"%a, %d %b %Y %H:%M:%S GMT")
   local content_type="text/plain"
+  local acl="public-read"
   local resource="/${DO_SPACES_BUCKET}/\$log_key"
-  local string_to_sign="PUT\\n\\n\${content_type}\\n\${date_str}\\n\${resource}"
+  local string_to_sign="PUT\\n\\n\${content_type}\\n\${date_str}\\nx-amz-acl:\${acl}\\n\${resource}"
   local signature=\$(echo -en "\$string_to_sign" | openssl dgst -sha1 -hmac "${DO_SPACES_SECRET}" -binary | base64)
   curl -s -X PUT \\
     -H "Date: \$date_str" \\
     -H "Content-Type: \$content_type" \\
+    -H "x-amz-acl: \$acl" \\
     -H "Authorization: AWS ${DO_SPACES_KEY}:\$signature" \\
     --data-binary @/var/log/splatwalk-job.log \\
     "${DO_SPACES_ENDPOINT}/${DO_SPACES_BUCKET}/\$log_key" || true

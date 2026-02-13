@@ -32,16 +32,27 @@ except ImportError:
 if not hasattr(Image, "ANTIALIAS"):
     Image.ANTIALIAS = Image.LANCZOS
 
-# Ensure PyAV is installed (required by torchvision.io.write_video in ViewCrafter)
-try:
-    import av as _av
-except ImportError:
-    print("Installing PyAV (required by ViewCrafter for video output)...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "av"])
-    import av as _av
+# Ensure PyAV is installed with working h264 codec.
+# The snapshot's source-built av may import OK but lack h264 support.
+# Force-reinstall from PyPI binary wheel which bundles FFmpeg with h264.
+def _ensure_pyav():
+    try:
+        import av
+        # Verify h264 encoding actually works
+        av.CodecContext.create("libx264", "w")
+        return
+    except Exception:
+        pass
+    print("Installing PyAV with h264 support (binary wheel)...")
+    subprocess.call(
+        [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-cache-dir", "av"],
+        timeout=120,
+    )
+
+_ensure_pyav()
 
 
-def extract_frames_from_video(video_path, output_dir, prefix="frame"):
+def extract_frames_from_video(video_path, output_dir, start_index=0):
     """Extract individual frames from a video file using PyAV."""
     import av
 
@@ -50,7 +61,7 @@ def extract_frames_from_video(video_path, output_dir, prefix="frame"):
         container = av.open(str(video_path))
         for frame in container.decode(video=0):
             img = frame.to_image()  # PIL Image
-            dest = os.path.join(output_dir, f"{prefix}_{count:04d}.jpg")
+            dest = os.path.join(output_dir, f"enhanced_{start_index + count:04d}.jpg")
             img.save(dest, "JPEG", quality=95)
             count += 1
         container.close()
@@ -241,9 +252,7 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
         # NOT as individual frames. Extract frames from the diffusion video.
         diffusion_videos = sorted(Path(view_output).rglob("diffusion.mp4"))
         for video in diffusion_videos:
-            n = extract_frames_from_video(
-                video, output_dir, prefix=f"enhanced_{enhanced_count:04d}"
-            )
+            n = extract_frames_from_video(video, output_dir, start_index=enhanced_count)
             if n > 0:
                 print(f"  Extracted {n} frames from {video.name}")
                 enhanced_count += n
@@ -252,9 +261,7 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
         if not diffusion_videos:
             render_videos = sorted(Path(view_output).rglob("render.mp4"))
             for video in render_videos:
-                n = extract_frames_from_video(
-                    video, output_dir, prefix=f"enhanced_{enhanced_count:04d}"
-                )
+                n = extract_frames_from_video(video, output_dir, start_index=enhanced_count)
                 if n > 0:
                     print(f"  Extracted {n} frames from {video.name} (fallback)")
                     enhanced_count += n
