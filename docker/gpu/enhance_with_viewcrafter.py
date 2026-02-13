@@ -152,9 +152,12 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
         config_file = os.path.join(viewcrafter_dir, "configs", "inference_pvd_1024.yaml")
 
     # Find DUSt3R checkpoint (ViewCrafter uses DUSt3R for pose estimation + depth)
-    dust3r_ckpt = "/opt/InstantSplat/submodules/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
-    if not os.path.exists(dust3r_ckpt):
-        dust3r_ckpt = os.path.join(viewcrafter_dir, "checkpoints", "DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth")
+    dust3r_candidates = [
+        "/opt/InstantSplat/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth",
+        "/opt/InstantSplat/submodules/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth",
+        os.path.join(viewcrafter_dir, "checkpoints", "DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"),
+    ]
+    dust3r_ckpt = next((p for p in dust3r_candidates if os.path.exists(p)), dust3r_candidates[0])
 
     enhanced_count = 0
 

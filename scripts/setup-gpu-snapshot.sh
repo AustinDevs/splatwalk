@@ -176,10 +176,14 @@ else
         "https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
 fi
 
-# Symlink for alternate lookup path used by old Dockerfile layout
+# Symlinks for alternate lookup paths (old Dockerfile layout + ViewCrafter)
 MAST3R_ALT="/opt/InstantSplat/submodules/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
 mkdir -p "$(dirname "$MAST3R_ALT")"
 ln -sf "$MAST3R_CKPT" "$MAST3R_ALT" 2>/dev/null || true
+
+# ViewCrafter's DUSt3R code looks for the checkpoint under its own checkpoints dir
+mkdir -p /opt/ViewCrafter/checkpoints 2>/dev/null || true
+ln -sf "$DUST3R_CKPT" /opt/ViewCrafter/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth 2>/dev/null || true
 
 # --- Step 7: ViewCrafter + PyTorch3D ---
 echo ""
