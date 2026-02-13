@@ -32,24 +32,13 @@ except ImportError:
 if not hasattr(Image, "ANTIALIAS"):
     Image.ANTIALIAS = Image.LANCZOS
 
-# Ensure PyAV is installed with working h264 codec.
-# The snapshot's source-built av may import OK but lack h264 support.
-# Force-reinstall from PyPI binary wheel which bundles FFmpeg with h264.
-def _ensure_pyav():
-    try:
-        import av
-        # Verify h264 encoding actually works
-        av.CodecContext.create("libx264", "w")
-        return
-    except Exception:
-        pass
-    print("Installing PyAV with h264 support (binary wheel)...")
-    subprocess.call(
-        [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-cache-dir", "av"],
-        timeout=120,
-    )
-
-_ensure_pyav()
+# Ensure PyAV <14 is installed (av>=14 breaks torchvision 0.19's write_video
+# with "TypeError: an integer is required" on frame.pict_type = "NONE").
+print("Ensuring compatible PyAV version (av<14)...")
+subprocess.call(
+    [sys.executable, "-m", "pip", "install", "av<14"],
+    timeout=120,
+)
 
 
 def extract_frames_from_video(video_path, output_dir, start_index=0):
@@ -151,6 +140,46 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
         except Exception:
             pass
 
+    # Patch ViewCrafter's save_video to also save individual frames and catch video errors.
+    # This ensures we get frames even if torchvision.io.write_video fails.
+    pvd_utils = os.path.join(viewcrafter_dir, "utils", "pvd_utils.py")
+    if os.path.exists(pvd_utils):
+        try:
+            content = Path(pvd_utils).read_text()
+            if "# PATCHED_SAVE_FRAMES" not in content:
+                # Add a patched save_video that saves frames alongside video
+                patched_fn = '''
+# PATCHED_SAVE_FRAMES
+import os as _os
+_original_save_video = save_video
+def save_video(data, images_path, folder=None):
+    """Patched save_video: saves individual frames and tries video."""
+    import torch
+    from PIL import Image as _Image
+    # Save individual frames first (always works)
+    frames_dir = images_path.rsplit(".", 1)[0] + "_frames"
+    _os.makedirs(frames_dir, exist_ok=True)
+    if isinstance(data, torch.Tensor):
+        if data.dtype != torch.uint8:
+            data_uint8 = (data.clamp(0, 1) * 255).byte() if data.max() <= 1.0 else data.byte()
+        else:
+            data_uint8 = data
+        for i in range(data_uint8.shape[0]):
+            frame = data_uint8[i].cpu().numpy()
+            _Image.fromarray(frame).save(_os.path.join(frames_dir, f"{i:04d}.jpg"), "JPEG", quality=95)
+        print(f"  Saved {data_uint8.shape[0]} frames to {frames_dir}")
+    # Try video saving (may fail with av version issues)
+    try:
+        _original_save_video(data, images_path, folder)
+    except Exception as e:
+        print(f"  Video save failed (frames already saved): {e}")
+'''
+                content += patched_fn
+                Path(pvd_utils).write_text(content)
+                print(f"  Patched {pvd_utils} (added frame-saving save_video)")
+        except Exception as e:
+            print(f"  Warning: Could not patch pvd_utils.py: {e}")
+
     input_images = sorted(Path(input_dir).glob("*.jpg")) + sorted(Path(input_dir).glob("*.png"))
     if len(input_images) < 2:
         raise ValueError(f"Need at least 2 input images, got {len(input_images)}")
@@ -248,29 +277,37 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
             print(f"  Warning: ViewCrafter timed out on pair {i}")
             continue
 
-        # ViewCrafter saves output as MP4 videos (diffusion.mp4, render.mp4),
-        # NOT as individual frames. Extract frames from the diffusion video.
-        diffusion_videos = sorted(Path(view_output).rglob("diffusion.mp4"))
-        for video in diffusion_videos:
-            n = extract_frames_from_video(video, output_dir, start_index=enhanced_count)
-            if n > 0:
-                print(f"  Extracted {n} frames from {video.name}")
-                enhanced_count += n
+        # Collect frames from output. Our patched save_video saves frames to
+        # *_frames/ dirs. Also extract from MP4 videos as fallback.
+        pre_count = enhanced_count
 
-        # Also check render.mp4 as fallback if no diffusion output
-        if not diffusion_videos:
-            render_videos = sorted(Path(view_output).rglob("render.mp4"))
-            for video in render_videos:
+        # 1. Check for frame directories created by our patched save_video
+        for frames_dir in sorted(Path(view_output).rglob("*_frames")):
+            for frame in sorted(frames_dir.glob("*.jpg")):
+                dest = os.path.join(output_dir, f"enhanced_{enhanced_count:04d}.jpg")
+                shutil.copy2(str(frame), dest)
+                enhanced_count += 1
+
+        # 2. Extract from MP4 videos if no frames found yet
+        if enhanced_count == pre_count:
+            for video in sorted(Path(view_output).rglob("diffusion.mp4")):
+                n = extract_frames_from_video(video, output_dir, start_index=enhanced_count)
+                if n > 0:
+                    print(f"  Extracted {n} frames from {video.name}")
+                    enhanced_count += n
+
+        if enhanced_count == pre_count:
+            for video in sorted(Path(view_output).rglob("render.mp4")):
                 n = extract_frames_from_video(video, output_dir, start_index=enhanced_count)
                 if n > 0:
                     print(f"  Extracted {n} frames from {video.name} (fallback)")
                     enhanced_count += n
 
-        # Also collect any loose PNG/JPG frames (in case ViewCrafter version saves them)
+        # 3. Collect any other loose PNG/JPG frames
         for frame in sorted(Path(view_output).rglob("*.png")) + sorted(
             Path(view_output).rglob("*.jpg")
         ):
-            if "input" not in str(frame.parent):
+            if "input" not in str(frame.parent) and "_frames" not in str(frame.parent):
                 dest = os.path.join(output_dir, f"enhanced_{enhanced_count:04d}.jpg")
                 try:
                     img = Image.open(str(frame)).convert("RGB")
@@ -278,6 +315,10 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
                     enhanced_count += 1
                 except Exception:
                     pass
+
+        pair_frames = enhanced_count - pre_count
+        if pair_frames > 0:
+            print(f"  Collected {pair_frames} frames from pair {i}")
 
         # Clean up pair input dir to save disk space
         shutil.rmtree(pair_dir, ignore_errors=True)
