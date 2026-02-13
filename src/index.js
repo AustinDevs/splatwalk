@@ -20,6 +20,14 @@ app.set('views', join(__dirname, 'views'));
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Required for SharedArrayBuffer (used by gaussian-splats-3d web workers)
+app.use((req, res, next) => {
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
+  next();
+});
+
 app.use(express.static(join(__dirname, 'public')));
 
 // Routes

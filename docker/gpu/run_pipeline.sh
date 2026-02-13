@@ -415,7 +415,7 @@ convert_and_upload() {
     local ply_path="$1"
     local pipeline_name="$2"
 
-    echo "Converting PLY to KSPLAT..."
+    echo "Converting PLY to .splat..."
 
     # Find the PLY file
     if [ ! -f "$ply_path" ]; then
@@ -428,24 +428,20 @@ convert_and_upload() {
         return 1
     fi
 
-    local ksplat_path="$OUTPUT_DIR/output.ksplat"
+    local splat_path="$OUTPUT_DIR/output.splat"
 
-    # Convert using 3dgsconverter
-    python /opt/convert_to_ksplat.py "$ply_path" "$ksplat_path" || {
-        # Fallback: try 3dgsconverter CLI
-        3dgsconverter -i "$ply_path" -o "$ksplat_path" -f ksplat || return 1
-    }
+    python /opt/convert_to_ksplat.py "$ply_path" "$splat_path" || return 1
 
-    if [ ! -f "$ksplat_path" ]; then
-        echo "Error: KSPLAT conversion failed"
+    if [ ! -f "$splat_path" ]; then
+        echo "Error: .splat conversion failed"
         return 1
     fi
 
     echo "Uploading results to Spaces..."
 
     # Upload KSPLAT
-    local splat_key="jobs/$JOB_ID/output/$pipeline_name/scene.ksplat"
-    local splat_url=$(upload_to_spaces "$ksplat_path" "$splat_key" "application/octet-stream")
+    local splat_key="jobs/$JOB_ID/output/$pipeline_name/scene.splat"
+    local splat_url=$(upload_to_spaces "$splat_path" "$splat_key" "application/octet-stream")
 
     # Upload thumbnail if available
     local thumb_url=""
@@ -515,7 +511,7 @@ with open('$OUTPUT_DIR/manifest.json', 'w') as f: json.dump(m, f, indent=2)
 "
                     upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/walkable/manifest.json" "application/json"
                 fi
-                notify_slack "Pipeline complete! Splat URL: $SPACES_ENDPOINT/$SPACES_BUCKET/jobs/$JOB_ID/output/walkable/scene.ksplat" "success"
+                notify_slack "Pipeline complete! Splat URL: $SPACES_ENDPOINT/$SPACES_BUCKET/jobs/$JOB_ID/output/walkable/scene.splat" "success"
             else
                 create_manifest "failed" "" "" "Walkable pipeline conversion/upload failed"
                 upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/walkable/manifest.json" "application/json"
