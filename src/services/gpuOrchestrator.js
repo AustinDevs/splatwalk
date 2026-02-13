@@ -10,12 +10,9 @@ const DO_SSH_PRIVATE_KEY_PATH = process.env.DO_SSH_PRIVATE_KEY_PATH || '~/.ssh/s
 const GPU_DROPLET_SIZE = process.env.GPU_DROPLET_SIZE || 'g-2vcpu-8gb';
 const GPU_DROPLET_REGION = process.env.GPU_DROPLET_REGION || 'nyc1';
 const GPU_DROPLET_IMAGE = process.env.GPU_DROPLET_IMAGE || 'docker-20-04';
-const GPU_DOCKER_IMAGE = process.env.GPU_DOCKER_IMAGE || 'ghcr.io/your-org/splatwalk-gpu:latest';
-
 const GPU_TIMEOUT_MS = parseInt(process.env.GPU_TIMEOUT_MS || '3600000', 10);
 
-// GitHub Container Registry credentials (for private repos)
-const GHCR_USERNAME = process.env.GHCR_USERNAME || '';
+// GitHub token for fetching pipeline scripts from private repo at runtime
 const GHCR_TOKEN = process.env.GHCR_TOKEN || '';
 
 const DO_SPACES_KEY = process.env.DO_SPACES_KEY || '';
@@ -114,7 +111,7 @@ class GPUOrchestrator {
   }
 
   async createDroplet(jobId, cloudInitOverride) {
-    const cloudInit = cloudInitOverride || this.generateCloudInit(jobId);
+    const cloudInit = cloudInitOverride;
 
     const response = await this.doRequest('POST', '/droplets', {
       name: `splatwalk-gpu-${jobId.slice(0, 8)}`,
@@ -233,7 +230,7 @@ class GPUOrchestrator {
         }
       }
 
-      // Wait for cloud-init to complete (ensures docker/nvidia are installed)
+      // Wait for cloud-init to complete (ensures nvidia drivers are ready)
       console.log(`[${pipeline}] Waiting for cloud-init to complete...`);
       const cloudInitResult = await ssh.execCommand(
         'cloud-init status --wait || true',
@@ -243,24 +240,10 @@ class GPUOrchestrator {
 
       await ssh.execCommand(`mkdir -p /workspace/${jobId}/input`);
 
-      // Debug: Check GPU and docker status
+      // Debug: Check GPU availability
       console.log(`[${pipeline}] Checking GPU availability...`);
       const nvidiaSmi = await ssh.execCommand('nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>&1 || echo "nvidia-smi not available"');
       console.log(`[${pipeline}] GPU: ${nvidiaSmi.stdout.trim()}`);
-
-      const dockerInfo = await ssh.execCommand('docker info 2>&1 | grep -E "(Runtimes|Default Runtime)" || echo "No runtime info"');
-      console.log(`[${pipeline}] Docker runtimes: ${dockerInfo.stdout.trim()}`);
-
-      // Ensure docker is logged in to GHCR
-      if (GHCR_USERNAME && GHCR_TOKEN) {
-        console.log(`[${pipeline}] Authenticating with GitHub Container Registry...`);
-        const loginResult = await ssh.execCommand(
-          `echo "${GHCR_TOKEN}" | docker login ghcr.io -u ${GHCR_USERNAME} --password-stdin`
-        );
-        if (loginResult.code !== 0) {
-          console.error(`[${pipeline}] Docker login failed: ${loginResult.stderr}`);
-        }
-      }
 
       for (let i = 0; i < imageUrls.length; i++) {
         const url = imageUrls[i];
@@ -273,28 +256,28 @@ class GPUOrchestrator {
         );
       }
 
-      const dockerCmd = [
-        'docker run --rm --gpus all',
-        `-v /workspace/${jobId}:/data`,
-        `-e INPUT_DIR=/data/input`,
-        `-e OUTPUT_DIR=/data/output`,
-        `-e PIPELINE_MODE=${pipeline}`,
-        `-e JOB_ID=${jobId}`,
-        `-e SPACES_KEY=${DO_SPACES_KEY}`,
-        `-e SPACES_SECRET=${DO_SPACES_SECRET}`,
-        `-e SPACES_BUCKET=${DO_SPACES_BUCKET}`,
-        `-e SPACES_REGION=${DO_SPACES_REGION}`,
-        `-e SPACES_ENDPOINT=${DO_SPACES_ENDPOINT}`,
-        SLACK_WEBHOOK_URL ? `-e SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}` : '',
-        MAX_N_VIEWS ? `-e MAX_N_VIEWS=${MAX_N_VIEWS}` : '',
-        VIEWCRAFTER_BATCH_SIZE ? `-e VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE}` : '',
-        TRAIN_ITERATIONS ? `-e TRAIN_ITERATIONS=${TRAIN_ITERATIONS}` : '',
-        GHCR_TOKEN ? `-e GITHUB_TOKEN=${GHCR_TOKEN}` : '',
-        GPU_DOCKER_IMAGE,
-      ].join(' ');
+      // Run the pipeline natively (no Docker)
+      const runCmd = [
+        'export PATH="/opt/conda/bin:$PATH"',
+        `export INPUT_DIR=/workspace/${jobId}/input`,
+        `export OUTPUT_DIR=/workspace/${jobId}/output`,
+        `export PIPELINE_MODE=${pipeline}`,
+        `export JOB_ID=${jobId}`,
+        `export SPACES_KEY=${DO_SPACES_KEY}`,
+        `export SPACES_SECRET=${DO_SPACES_SECRET}`,
+        `export SPACES_BUCKET=${DO_SPACES_BUCKET}`,
+        `export SPACES_REGION=${DO_SPACES_REGION}`,
+        `export SPACES_ENDPOINT=${DO_SPACES_ENDPOINT}`,
+        SLACK_WEBHOOK_URL ? `export SLACK_WEBHOOK_URL='${SLACK_WEBHOOK_URL}'` : '',
+        MAX_N_VIEWS ? `export MAX_N_VIEWS=${MAX_N_VIEWS}` : '',
+        VIEWCRAFTER_BATCH_SIZE ? `export VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE}` : '',
+        TRAIN_ITERATIONS ? `export TRAIN_ITERATIONS=${TRAIN_ITERATIONS}` : '',
+        GHCR_TOKEN ? `export GITHUB_TOKEN=${GHCR_TOKEN}` : '',
+        '/opt/entrypoint.sh',
+      ].filter(Boolean).join(' && ');
 
-      console.log(`Running pipeline ${pipeline} on droplet ${dropletId}`);
-      const result = await ssh.execCommand(dockerCmd, {
+      console.log(`Running pipeline ${pipeline} natively on droplet ${dropletId}`);
+      const result = await ssh.execCommand(runCmd, {
         cwd: '/workspace',
         onStdout: (chunk) => console.log(`[${pipeline}] ${chunk.toString()}`),
         onStderr: (chunk) => console.error(`[${pipeline}] ${chunk.toString()}`),
@@ -343,22 +326,6 @@ class GPUOrchestrator {
 
     console.log(`Destroying droplet ${dropletId}`);
     await this.doRequest('DELETE', `/droplets/${dropletId}`);
-  }
-
-  generateCloudInit(jobId) {
-    // Add docker login for private repos if credentials provided
-    const dockerLogin = GHCR_USERNAME && GHCR_TOKEN
-      ? `  - echo "${GHCR_TOKEN}" | docker login ghcr.io -u ${GHCR_USERNAME} --password-stdin`
-      : '';
-
-    // gpu-h100x1-base image has NVIDIA drivers and docker pre-installed
-    return `#cloud-config
-runcmd:
-  - nvidia-smi
-${dockerLogin}
-  - docker pull ${GPU_DOCKER_IMAGE}
-  - echo "Ready for job ${jobId}"
-`;
   }
 
   generateAutonomousCloudInit(jobId, pipeline, { datasetUrl, imageUrls }) {
@@ -451,7 +418,7 @@ trap self_destruct EXIT
 
 notify_slack "Droplet booted, waiting for GPU driver..."
 
-# --- Wait for GPU/docker readiness ---
+# --- Wait for GPU readiness ---
 for i in \$(seq 1 30); do
   nvidia-smi && break
   echo "Waiting for GPU driver... (attempt \$i)"
@@ -459,57 +426,38 @@ for i in \$(seq 1 30); do
 done
 
 GPU_NAME=\$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "unknown")
-notify_slack "GPU ready: \$GPU_NAME. Configuring Docker GPU runtime..."
-
-# --- Ensure nvidia-container-toolkit is configured ---
-apt-get update && apt-get install -y nvidia-container-toolkit
-nvidia-ctk runtime configure --runtime=docker
-systemctl restart docker
-sleep 5
-
-notify_slack "Docker GPU configured. Pulling image..."
-
-# --- Docker login + pull (with retry for rate limits) ---
-${GHCR_USERNAME && GHCR_TOKEN ? `echo "${GHCR_TOKEN}" | docker login ghcr.io -u ${GHCR_USERNAME} --password-stdin` : 'echo "No GHCR credentials, skipping login"'}
-for attempt in 1 2 3; do
-  docker pull ${GPU_DOCKER_IMAGE} && break
-  echo "Docker pull failed (attempt \$attempt/3), waiting 30s..."
-  notify_slack "Docker pull failed (attempt \$attempt/3), retrying..." "error"
-  sleep 30
-done
-
-notify_slack "Docker image pulled. Downloading input data..."
+notify_slack "GPU ready: \$GPU_NAME. Downloading input data..."
 
 ${downloadBlock}
 
 notify_slack "Input data ready. Starting pipeline..."
 
-# --- Run the pipeline (stream output to log) ---
-echo "=== DOCKER RUN START ==="
-docker run --rm --gpus all \\
-  -v /workspace/${jobId}:/data \\
-  -e INPUT_DIR=/data/input \\
-  -e OUTPUT_DIR=/data/output \\
-  -e PIPELINE_MODE=${pipeline} \\
-  -e JOB_ID=${jobId} \\
-  -e SPACES_KEY=${DO_SPACES_KEY} \\
-  -e SPACES_SECRET=${DO_SPACES_SECRET} \\
-  -e SPACES_BUCKET=${DO_SPACES_BUCKET} \\
-  -e SPACES_REGION=${DO_SPACES_REGION} \\
-  -e SPACES_ENDPOINT=${DO_SPACES_ENDPOINT} \\
-  -e SLACK_WEBHOOK_URL='${SLACK_WEBHOOK_URL}' \\
-  -e MAX_N_VIEWS=${MAX_N_VIEWS || '24'} \\
-  -e VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE || '10'} \\
-  -e TRAIN_ITERATIONS=${TRAIN_ITERATIONS || '7000'} \\
-  -e GITHUB_TOKEN=${GHCR_TOKEN || ''} \\
-  ${GPU_DOCKER_IMAGE} 2>&1
-DOCKER_EXIT=\$?
-echo "=== DOCKER RUN END (exit \$DOCKER_EXIT) ==="
+# --- Run the pipeline natively (no Docker) ---
+export PATH="/opt/conda/bin:\$PATH"
+export INPUT_DIR=/workspace/${jobId}/input
+export OUTPUT_DIR=/workspace/${jobId}/output
+export PIPELINE_MODE=${pipeline}
+export JOB_ID=${jobId}
+export SPACES_KEY=${DO_SPACES_KEY}
+export SPACES_SECRET=${DO_SPACES_SECRET}
+export SPACES_BUCKET=${DO_SPACES_BUCKET}
+export SPACES_REGION=${DO_SPACES_REGION}
+export SPACES_ENDPOINT=${DO_SPACES_ENDPOINT}
+export SLACK_WEBHOOK_URL='${SLACK_WEBHOOK_URL}'
+export MAX_N_VIEWS=${MAX_N_VIEWS || '24'}
+export VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE || '10'}
+export TRAIN_ITERATIONS=${TRAIN_ITERATIONS || '7000'}
+export GITHUB_TOKEN=${GHCR_TOKEN || ''}
 
-if [ "\$DOCKER_EXIT" -eq 0 ]; then
+echo "=== PIPELINE START ==="
+/opt/entrypoint.sh 2>&1
+PIPELINE_EXIT=\$?
+echo "=== PIPELINE END (exit \$PIPELINE_EXIT) ==="
+
+if [ "\$PIPELINE_EXIT" -eq 0 ]; then
   notify_slack "Pipeline finished successfully!" "success"
 else
-  notify_slack "Pipeline failed (exit \$DOCKER_EXIT). Check log in Spaces." "error"
+  notify_slack "Pipeline failed (exit \$PIPELINE_EXIT). Check log in Spaces." "error"
 fi
 # EXIT trap fires here → self_destruct → droplet deleted
 `;

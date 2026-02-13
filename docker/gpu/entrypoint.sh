@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+export PATH="/opt/conda/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 
 # Install runtime Python deps if not already present (snapshot images have them pre-installed)
 if python -c "import open3d, kornia, transformers" 2>/dev/null; then

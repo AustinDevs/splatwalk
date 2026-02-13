@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+export PATH="/opt/conda/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 shopt -s nocaseglob  # case-insensitive globbing (matches .JPG, .jpg, .Jpg, etc.)
 
 # Environment variables expected:
@@ -180,7 +181,7 @@ from PIL import Image
 from pathlib import Path
 
 input_dir = os.environ.get('INPUT_DIR', '/data/input')
-output_dir = '/data/output/scene/images'
+output_dir = os.path.join(os.environ.get('OUTPUT_DIR', '/data/output'), 'scene', 'images')
 target_size = (512, 512)
 
 os.makedirs(output_dir, exist_ok=True)
@@ -291,7 +292,7 @@ from PIL import Image
 from pathlib import Path
 
 input_dir = os.environ.get('INPUT_DIR', '/data/input')
-output_dir = '/data/output/scene/images'
+output_dir = os.path.join(os.environ.get('OUTPUT_DIR', '/data/output'), 'scene', 'images')
 target_size = (512, 512)
 os.makedirs(output_dir, exist_ok=True)
 

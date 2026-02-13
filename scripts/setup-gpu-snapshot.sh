@@ -1,10 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 #
-# Setup script for SplatWalk GPU snapshot.
+# Setup script for SplatWalk GPU snapshot — NATIVE installation (no Docker).
 #
-# INCREMENTAL: Safe to run on either a fresh base image or an existing snapshot.
-# It detects what's already present and skips those steps.
+# Installs everything directly on the droplet filesystem:
+#   Miniconda, PyTorch 2.4+CUDA 12.4, InstantSplat, ViewCrafter, PyTorch3D, etc.
+#
+# INCREMENTAL: Safe to re-run on an existing snapshot. Each step checks
+# whether its work is already present and skips if so.
 #
 # Usage (from your local machine):
 #   1. Create a GPU droplet (from base image or existing snapshot):
@@ -18,26 +21,21 @@ set -euo pipefail
 #          "https://api.digitalocean.com/v2/droplets" | python3 -c "import sys,json; print(json.load(sys.stdin)['droplet']['id'])")
 #        echo "Droplet: $DROPLET_ID"
 #
-#   2. Wait for it to boot, get IP, upload + run:
+#   2. Wait for it to boot, get IP, upload repo scripts + run:
 #        scp -i ~/.ssh/splatwalk_gpu scripts/setup-gpu-snapshot.sh root@<IP>:/root/
-#        ssh -i ~/.ssh/splatwalk_gpu root@<IP> \
-#          "GHCR_TOKEN=$GHCR_TOKEN bash /root/setup-gpu-snapshot.sh"
+#        scp -i ~/.ssh/splatwalk_gpu docker/gpu/*.sh docker/gpu/*.py root@<IP>:/root/pipeline-scripts/
+#        ssh -i ~/.ssh/splatwalk_gpu root@<IP> "bash /root/setup-gpu-snapshot.sh"
 #
 #   3. After completion, power off + snapshot + update .env (script prints commands)
 #
 
 echo "============================================"
-echo "SplatWalk GPU Snapshot Setup (incremental)"
+echo "SplatWalk GPU Snapshot Setup (native, no Docker)"
 echo "============================================"
-
-# --- Env vars (override via environment or edit here) ---
-GHCR_USERNAME="${GHCR_USERNAME:-KevinColten}"
-GHCR_TOKEN="${GHCR_TOKEN:-}"
-GPU_DOCKER_IMAGE="${GPU_DOCKER_IMAGE:-ghcr.io/austindevs/splatwalk-gpu:latest}"
 
 # --- Step 1: Verify GPU ---
 echo ""
-echo "=== Step 1/5: Verify GPU ==="
+echo "=== Step 1/12: Verify GPU ==="
 if ! nvidia-smi; then
     echo "ERROR: No NVIDIA GPU detected. This script must run on a GPU droplet."
     exit 1
@@ -45,75 +43,165 @@ fi
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 echo "GPU: $GPU_NAME"
 
-# --- Step 2: Configure Docker with NVIDIA runtime (idempotent) ---
+# --- Step 2: System packages ---
 echo ""
-echo "=== Step 2/5: Configure Docker + NVIDIA runtime ==="
-if docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi > /dev/null 2>&1; then
-    echo "Docker GPU access already configured — skipping"
+echo "=== Step 2/12: System packages ==="
+if command -v ffmpeg &>/dev/null && command -v git &>/dev/null && dpkg -s build-essential &>/dev/null 2>&1; then
+    echo "System packages already installed — skipping"
 else
-    echo "Configuring Docker GPU runtime..."
+    echo "Installing system packages..."
     apt-get update -qq
-    apt-get install -y -qq nvidia-container-toolkit
-    nvidia-ctk runtime configure --runtime=docker
-    systemctl restart docker
-    sleep 5
-    docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi > /dev/null 2>&1 && echo "Docker GPU access OK" || {
-        echo "WARNING: Docker GPU test failed, trying anyway..."
-    }
+    apt-get install -y -qq \
+        git wget curl ffmpeg unzip pkg-config \
+        libgl1-mesa-glx libglib2.0-0 build-essential
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
 fi
 
-# --- Step 3: Pull the Docker image (skips if already present) ---
+# --- Step 3: Miniconda + Python 3.11 ---
 echo ""
-echo "=== Step 3/5: Pull Docker image ==="
-if docker image inspect "$GPU_DOCKER_IMAGE" > /dev/null 2>&1; then
-    echo "Docker image already present — skipping pull"
-    echo "Image size: $(docker images --format '{{.Size}}' "$GPU_DOCKER_IMAGE")"
+echo "=== Step 3/12: Miniconda + Python 3.11 ==="
+if [ -x /opt/conda/bin/python ]; then
+    echo "Miniconda already installed"
 else
-    echo "Pulling Docker image (this takes ~5-10 min for 31GB)..."
-    if [ -n "$GHCR_TOKEN" ]; then
-        echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
-    fi
-    docker pull "$GPU_DOCKER_IMAGE"
-    echo "Docker image pulled: $(docker images --format '{{.Size}}' "$GPU_DOCKER_IMAGE")"
+    echo "Installing Miniconda to /opt/conda..."
+    wget -q -O /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+    bash /tmp/miniconda.sh -b -p /opt/conda
+    rm /tmp/miniconda.sh
 fi
+export PATH="/opt/conda/bin:$PATH"
+# Pin Python 3.11 to match PyTorch 2.4 compatibility (3.13 is too new)
+PYVER=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+if [ "$PYVER" != "3.11" ]; then
+    echo "Python $PYVER detected, downgrading to 3.11..."
+    conda install -y python=3.11
+fi
+echo "Python: $(python --version 2>&1)"
 
-# --- Step 4: Build prepared image (install deps + compile PyTorch3D) ---
+# --- Step 4: PyTorch 2.4 + CUDA 12.4 ---
 echo ""
-echo "=== Step 4/5: Build prepared image (install deps + compile PyTorch3D) ==="
-echo "This will take ~20-30 minutes on first run..."
-
-CONTAINER_NAME="splatwalk-setup"
-docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-
-# FORCE_CUDA=1 + explicit TORCH_CUDA_ARCH_LIST ensures nvcc compiles real CUDA kernels.
-# Without TORCH_CUDA_ARCH_LIST, the build silently produces a CPU-only _C.so (~10MB).
-# With it, we get a proper CUDA build (~27MB _C.so).
-docker run --gpus all --name "$CONTAINER_NAME" \
-    -e FORCE_CUDA=1 \
-    -e TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" \
-    --entrypoint bash \
-    "$GPU_DOCKER_IMAGE" -c '
-set -e
-
-# --- Runtime Python deps (skip if already installed) ---
-if python -c "import open3d, kornia, transformers" 2>/dev/null; then
-    echo "Runtime Python deps already installed — skipping"
+echo "=== Step 4/12: PyTorch + CUDA ==="
+if python -c "import torch; assert torch.cuda.is_available(); print(f'PyTorch {torch.__version__} CUDA OK')" 2>/dev/null; then
+    echo "PyTorch with CUDA already installed — skipping"
 else
-    echo "=== Installing runtime Python dependencies ==="
+    echo "Installing PyTorch 2.4 with CUDA 12.4..."
     pip install --no-cache-dir \
-        icecream open3d trimesh "pyglet<2" evo matplotlib tensorboard imageio gdown \
-        roma opencv-python transformers huggingface_hub \
-        omegaconf pytorch-lightning open-clip-torch kornia decord \
-        imageio-ffmpeg scikit-image moviepy 2>&1 | tail -5
+        torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 \
+        --index-url https://download.pytorch.org/whl/cu124
 fi
 
-# --- PyTorch3D with CUDA kernels ---
+# --- Step 5: InstantSplat + CUDA extensions ---
 echo ""
-echo "=== Building PyTorch3D from source with CUDA support ==="
-echo "FORCE_CUDA=$FORCE_CUDA"
-echo "TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
+echo "=== Step 5/12: InstantSplat + CUDA extensions ==="
+export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 
-# Check if existing PyTorch3D has CUDA kernels (>15MB _C.so)
+# Ensure build tools are available for CUDA extension compilation
+pip install --no-cache-dir setuptools wheel 2>&1 | tail -1
+
+if [ -d /opt/InstantSplat ]; then
+    echo "InstantSplat repo already cloned — skipping clone"
+else
+    echo "Cloning InstantSplat..."
+    git clone --recursive https://github.com/NVlabs/InstantSplat.git /opt/InstantSplat
+fi
+
+# Build CUDA extensions (check if already compiled)
+if python -c "import diff_gaussian_rasterization" 2>/dev/null; then
+    echo "diff-gaussian-rasterization already built — skipping"
+else
+    echo "Building diff-gaussian-rasterization..."
+    cd /opt/InstantSplat/submodules/diff-gaussian-rasterization
+    pip install --no-cache-dir --no-build-isolation .
+fi
+
+if python -c "import simple_knn" 2>/dev/null; then
+    echo "simple-knn already built — skipping"
+else
+    echo "Building simple-knn..."
+    cd /opt/InstantSplat/submodules/simple-knn
+    pip install --no-cache-dir --no-build-isolation .
+fi
+
+if [ -d /opt/InstantSplat/submodules/fused-ssim ]; then
+    if python -c "import fused_ssim" 2>/dev/null; then
+        echo "fused-ssim already built — skipping"
+    else
+        echo "Building fused-ssim..."
+        cd /opt/InstantSplat/submodules/fused-ssim
+        pip install --no-cache-dir --no-build-isolation .
+    fi
+fi
+
+# Build curope extension
+CUROPE_DIR="/opt/InstantSplat/croco/models/curope"
+if [ -d "$CUROPE_DIR" ]; then
+    if ls "$CUROPE_DIR"/*.so &>/dev/null; then
+        echo "curope extension already built — skipping"
+    else
+        echo "Building curope extension..."
+        cd "$CUROPE_DIR"
+        python setup.py build_ext --inplace || true
+    fi
+fi
+
+# Install InstantSplat requirements
+echo "Installing InstantSplat requirements..."
+cd /opt/InstantSplat
+pip install --no-cache-dir -r requirements.txt 2>&1 | tail -3 || true
+
+# Strip .git dirs to save space
+find /opt/InstantSplat -name ".git" -type d -exec rm -rf {} + 2>/dev/null || true
+
+# --- Step 6: Model checkpoints (DUSt3R + MASt3R) ---
+echo ""
+echo "=== Step 6/12: Model checkpoints ==="
+DUST3R_CKPT="/opt/InstantSplat/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
+MAST3R_CKPT="/opt/InstantSplat/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+
+mkdir -p "$(dirname "$DUST3R_CKPT")" "$(dirname "$MAST3R_CKPT")"
+
+if [ -f "$DUST3R_CKPT" ]; then
+    echo "DUSt3R checkpoint already present — skipping"
+else
+    echo "Downloading DUSt3R checkpoint (~2.5GB)..."
+    wget -q -O "$DUST3R_CKPT" \
+        "https://download.europe.naverlabs.com/ComputerVision/DUSt3R/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
+fi
+
+if [ -f "$MAST3R_CKPT" ]; then
+    echo "MASt3R checkpoint already present — skipping"
+else
+    echo "Downloading MASt3R checkpoint (~2.5GB)..."
+    wget -q -O "$MAST3R_CKPT" \
+        "https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+fi
+
+# Symlink for alternate lookup path used by old Dockerfile layout
+MAST3R_ALT="/opt/InstantSplat/submodules/mast3r/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+mkdir -p "$(dirname "$MAST3R_ALT")"
+ln -sf "$MAST3R_CKPT" "$MAST3R_ALT" 2>/dev/null || true
+
+# --- Step 7: ViewCrafter + PyTorch3D ---
+echo ""
+echo "=== Step 7/12: ViewCrafter + PyTorch3D ==="
+
+if [ -d /opt/ViewCrafter ]; then
+    echo "ViewCrafter repo already cloned — skipping clone"
+else
+    echo "Cloning ViewCrafter..."
+    git clone https://github.com/Drexubery/ViewCrafter.git /opt/ViewCrafter
+    rm -rf /opt/ViewCrafter/.git
+fi
+
+echo "Installing ViewCrafter requirements..."
+cd /opt/ViewCrafter
+pip install --no-cache-dir -r requirements.txt 2>&1 | tail -3 || true
+
+# PyTorch3D with CUDA kernels
+echo ""
+echo "Building PyTorch3D from source with CUDA support..."
+echo "FORCE_CUDA=1  TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
+
 EXISTING_SO=$(find /opt/conda/lib/python*/site-packages/pytorch3d -name "_C*.so" 2>/dev/null | head -1)
 NEED_REBUILD=1
 if [ -n "$EXISTING_SO" ]; then
@@ -129,31 +217,27 @@ if [ -n "$EXISTING_SO" ]; then
 fi
 
 if [ "$NEED_REBUILD" -eq 1 ]; then
-    echo "Removing pre-built PyTorch3D (no GPU kernels)..."
     pip uninstall -y pytorch3d 2>/dev/null || true
     rm -rf /opt/conda/lib/python*/site-packages/pytorch3d* 2>/dev/null || true
 
-    echo "Compiling PyTorch3D from source..."
-    echo "This takes ~15-20 minutes on H100..."
+    echo "Compiling PyTorch3D from source (takes ~15-20 min on H100)..."
     FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" \
-        pip install --no-cache-dir --no-build-isolation --verbose \
-        "git+https://github.com/facebookresearch/pytorch3d.git" 2>&1 | \
-        tee /tmp/pytorch3d_build.log | \
-        grep -E "(nvcc|Running|Building|Compiling|error|warning.*cuda|_C)" || true
-    echo ""
+        pip install --no-cache-dir --no-build-isolation \
+        "git+https://github.com/facebookresearch/pytorch3d.git" \
+        > /tmp/pytorch3d_build.log 2>&1 || {
+            echo "PyTorch3D build failed! Last 50 lines:"
+            tail -50 /tmp/pytorch3d_build.log
+            exit 1
+        }
+    echo "Build finished. Checking _C.so..."
 
-    # Verify the compiled _C.so is actually large (CUDA kernels present)
-    echo "=== Checking PyTorch3D _C.so size ==="
     PYTORCH3D_SO=$(find /opt/conda/lib/python*/site-packages/pytorch3d -name "_C*.so" 2>/dev/null | head -1)
     if [ -n "$PYTORCH3D_SO" ]; then
         SO_SIZE=$(stat -c%s "$PYTORCH3D_SO" 2>/dev/null || stat -f%z "$PYTORCH3D_SO" 2>/dev/null)
         SO_SIZE_MB=$((SO_SIZE / 1024 / 1024))
-        echo "_C.so path: $PYTORCH3D_SO"
-        echo "_C.so size: ${SO_SIZE_MB}MB ($SO_SIZE bytes)"
+        echo "_C.so size: ${SO_SIZE_MB}MB"
         if [ "$SO_SIZE_MB" -lt 15 ]; then
             echo "ERROR: _C.so is only ${SO_SIZE_MB}MB — CUDA kernels were NOT compiled!"
-            echo "Expected ~27MB for a proper CUDA build."
-            echo "Last 50 lines of build log:"
             tail -50 /tmp/pytorch3d_build.log
             exit 1
         fi
@@ -164,94 +248,122 @@ if [ "$NEED_REBUILD" -eq 1 ]; then
     fi
 fi
 
-# Basic import test
-python -c "
-import pytorch3d
-print(f\"PyTorch3D {pytorch3d.__version__} installed\")
-from pytorch3d.renderer.points import rasterize_points
-print(\"rasterize_points module loaded OK\")
-"
-
-# --- Patch ViewCrafter for Pillow 10+ ---
+# Download ViewCrafter sparse checkpoint
 echo ""
-echo "=== Patching ViewCrafter for Pillow 10+ (ANTIALIAS -> LANCZOS) ==="
-grep -rl "Image.ANTIALIAS" /opt/ViewCrafter/ 2>/dev/null | while read f; do
-    sed -i "s/Image.ANTIALIAS/Image.LANCZOS/g" "$f"
-    echo "  Patched $f"
-done || echo "  No files needed patching"
-
-# --- Download ViewCrafter sparse checkpoint ---
-echo ""
-echo "=== Downloading ViewCrafter sparse checkpoint ==="
+echo "Downloading ViewCrafter sparse checkpoint..."
 if [ -f "/opt/ViewCrafter/checkpoints/model_sparse.ckpt" ]; then
     echo "Sparse checkpoint already present — skipping"
 else
     python -c "
 from huggingface_hub import hf_hub_download
 import os, shutil
-ckpt_dir = \"/opt/ViewCrafter/checkpoints\"
+ckpt_dir = '/opt/ViewCrafter/checkpoints'
 os.makedirs(ckpt_dir, exist_ok=True)
 try:
-    path = hf_hub_download(repo_id=\"Drexubery/ViewCrafter_25\", filename=\"model.ckpt\",
+    path = hf_hub_download(repo_id='Drexubery/ViewCrafter_25', filename='model.ckpt',
                            local_dir=ckpt_dir, local_dir_use_symlinks=False)
-    sparse_path = os.path.join(ckpt_dir, \"model_sparse.ckpt\")
+    sparse_path = os.path.join(ckpt_dir, 'model_sparse.ckpt')
     if not os.path.exists(sparse_path):
         os.rename(path, sparse_path)
-    print(f\"Sparse checkpoint: {sparse_path} ({os.path.getsize(sparse_path) / 1e9:.1f}GB)\")
+    print(f'Sparse checkpoint: {sparse_path} ({os.path.getsize(sparse_path) / 1e9:.1f}GB)')
 except Exception as e:
-    print(f\"WARNING: Could not download sparse checkpoint: {e}\")
-    print(\"Will fall back to single-view model if sparse mode is used\")
+    print(f'WARNING: Could not download sparse checkpoint: {e}')
+    print('Will fall back to single-view model if sparse mode is used')
 "
 fi
 
-# --- Verify key imports ---
+# Download ViewCrafter 25_512 checkpoint directory (used by walkable pipeline stage 4)
 echo ""
-echo "=== Verifying key imports ==="
+echo "Downloading ViewCrafter 25_512 checkpoint..."
+if [ -d "/opt/ViewCrafter/checkpoints/ViewCrafter_25_512" ]; then
+    echo "ViewCrafter_25_512 checkpoint already present — skipping"
+else
+    python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('Drexubery/ViewCrafter_25_512', local_dir='/opt/ViewCrafter/checkpoints/ViewCrafter_25_512')
+print('ViewCrafter_25_512 checkpoint downloaded')
+" || echo "WARNING: Could not download ViewCrafter_25_512 checkpoint"
+fi
+
+# Patch ANTIALIAS -> LANCZOS for Pillow 10+
+echo ""
+echo "Patching ViewCrafter for Pillow 10+ (ANTIALIAS -> LANCZOS)..."
+grep -rl "Image.ANTIALIAS" /opt/ViewCrafter/ 2>/dev/null | while read f; do
+    sed -i "s/Image.ANTIALIAS/Image.LANCZOS/g" "$f"
+    echo "  Patched $f"
+done || echo "  No files needed patching"
+
+# --- Step 8: Runtime Python packages ---
+echo ""
+echo "=== Step 8/12: Runtime Python packages ==="
+if python -c "import open3d, kornia, transformers" 2>/dev/null; then
+    echo "Runtime Python packages already installed — skipping"
+else
+    echo "Installing runtime Python packages..."
+    pip install --no-cache-dir \
+        icecream open3d trimesh "pyglet<2" evo matplotlib tensorboard imageio gdown \
+        roma opencv-python transformers huggingface_hub \
+        omegaconf pytorch-lightning open-clip-torch kornia decord \
+        imageio-ffmpeg scikit-image moviepy 2>&1 | tail -5
+fi
+
+# --- Step 9: Base Python packages ---
+echo ""
+echo "=== Step 9/12: Base Python packages ==="
+pip install --no-cache-dir "numpy<2" scipy pillow tqdm einops timm boto3 awscli plyfile 2>&1 | tail -3
+
+# --- Step 10: Pipeline scripts ---
+echo ""
+echo "=== Step 10/12: Pipeline scripts ==="
+
+# Try to find scripts from the repo (if run from repo root or SCP'd alongside)
+SCRIPT_DIR=""
+if [ -d "$(dirname "$0")/../docker/gpu" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")/../docker/gpu" && pwd)"
+elif [ -d "/root/pipeline-scripts" ]; then
+    SCRIPT_DIR="/root/pipeline-scripts"
+fi
+
+if [ -n "$SCRIPT_DIR" ]; then
+    echo "Copying pipeline scripts from $SCRIPT_DIR to /opt/..."
+    for script in entrypoint.sh run_pipeline.sh render_descent.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py; do
+        if [ -f "$SCRIPT_DIR/$script" ]; then
+            cp "$SCRIPT_DIR/$script" "/opt/$script"
+            echo "  Copied $script"
+        else
+            echo "  WARNING: $script not found in $SCRIPT_DIR"
+        fi
+    done
+    chmod +x /opt/entrypoint.sh /opt/run_pipeline.sh 2>/dev/null || true
+else
+    echo "WARNING: Pipeline scripts directory not found."
+    echo "  Expected either repo at $(dirname "$0")/../docker/gpu"
+    echo "  or SCP'd scripts at /root/pipeline-scripts/"
+    echo "  Scripts will be fetched from GitHub at runtime instead."
+fi
+
+# --- Step 11: Verification ---
+echo ""
+echo "=== Step 11/12: Verification ==="
+
+echo "Checking key imports..."
 python -c "
-import torch; print(f\"PyTorch {torch.__version__}\")
-import open3d; print(f\"Open3D {open3d.__version__}\")
-import trimesh; print(f\"Trimesh {trimesh.__version__}\")
-import kornia; print(f\"Kornia {kornia.__version__}\")
-import transformers; print(f\"Transformers {transformers.__version__}\")
-print(\"All imports OK\")
-"
-
-echo ""
-echo "=== Cleanup ==="
-pip cache purge 2>/dev/null || true
-rm -rf /root/.cache/pip /tmp/*
-echo "Done!"
-'
-
-SETUP_EXIT=$?
-if [ "$SETUP_EXIT" -ne 0 ]; then
-    echo "ERROR: Setup container failed (exit $SETUP_EXIT)"
-    echo "Check logs above for details."
-    docker rm "$CONTAINER_NAME" 2>/dev/null || true
-    exit 1
-fi
-
-# Commit the container as the same image (overwrite the pulled image)
-echo ""
-echo "Committing container as $GPU_DOCKER_IMAGE..."
-docker commit "$CONTAINER_NAME" "$GPU_DOCKER_IMAGE"
-docker rm "$CONTAINER_NAME"
-
-echo "Committed image size: $(docker images --format '{{.Size}}' "$GPU_DOCKER_IMAGE")"
-
-# --- Step 5: Verify the committed image works with ACTUAL GPU rasterization ---
-echo ""
-echo "=== Step 5/5: Verify committed image with GPU rasterization test ==="
-docker run --rm --gpus all --entrypoint python "$GPU_DOCKER_IMAGE" -c "
-import torch
-print(f'PyTorch {torch.__version__}')
+import torch; print(f'PyTorch {torch.__version__}')
 print(f'CUDA available: {torch.cuda.is_available()}')
 print(f'GPU: {torch.cuda.get_device_name(0)}')
+import open3d; print(f'Open3D {open3d.__version__}')
+import trimesh; print(f'Trimesh {trimesh.__version__}')
+import kornia; print(f'Kornia {kornia.__version__}')
+import transformers; print(f'Transformers {transformers.__version__}')
+print('All imports OK')
+"
 
+echo ""
+echo "Testing PyTorch3D GPU rasterization..."
+python -c "
+import torch
 import pytorch3d
 print(f'PyTorch3D {pytorch3d.__version__}')
-
-# Actual GPU rasterization test - this is the critical check
 from pytorch3d.structures import Pointclouds
 from pytorch3d.renderer import PointsRasterizer, PointsRasterizationSettings, PerspectiveCameras
 pts = torch.randn(1, 100, 3).cuda()
@@ -263,25 +375,25 @@ rasterizer = PointsRasterizer(cameras=cameras, raster_settings=settings)
 fragments = rasterizer(pc)
 print(f'Rasterized: idx shape={fragments.idx.shape}')
 print('PyTorch3D GPU rasterization: PASSED')
-" && echo "Verification PASSED" || {
-    echo "ERROR: Verification FAILED — PyTorch3D GPU rasterization does not work"
-    echo "The compiled library may not be compatible with this GPU/CUDA version."
+" || {
+    echo "ERROR: PyTorch3D GPU rasterization FAILED"
     exit 1
 }
 
-# --- Cleanup ---
+# --- Step 12: Cleanup ---
 echo ""
-echo "=== Cleanup ==="
-docker image prune -f
-apt-get clean
-rm -rf /var/lib/apt/lists/* /tmp/*
+echo "=== Step 12/12: Cleanup ==="
+pip cache purge 2>/dev/null || true
+rm -rf /root/.cache/pip /tmp/* /root/.cache/huggingface
+apt-get clean 2>/dev/null || true
+rm -rf /var/lib/apt/lists/*
 
 # --- Get droplet ID for snapshot command ---
 DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id 2>/dev/null || echo "<DROPLET_ID>")
 
 echo ""
 echo "============================================"
-echo "Setup complete!"
+echo "Setup complete! (native, no Docker)"
 echo "============================================"
 echo ""
 echo "Next steps:"
@@ -290,7 +402,7 @@ echo "       shutdown -h now"
 echo "  2. Create a snapshot from DO console or API:"
 echo "       curl -X POST -H 'Authorization: Bearer \$DO_API_TOKEN' \\"
 echo "         -H 'Content-Type: application/json' \\"
-echo "         -d '{\"type\":\"snapshot\",\"name\":\"splatwalk-gpu-ready\"}' \\"
+echo "         -d '{\"type\":\"snapshot\",\"name\":\"splatwalk-gpu-native-v1\"}' \\"
 echo "         https://api.digitalocean.com/v2/droplets/$DROPLET_ID/actions"
 echo "  3. Update .env: GPU_DROPLET_IMAGE=<snapshot-id>"
 echo "  4. Destroy this droplet"
