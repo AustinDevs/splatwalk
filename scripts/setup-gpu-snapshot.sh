@@ -308,7 +308,7 @@ else
         icecream open3d trimesh "pyglet<2" evo matplotlib tensorboard imageio gdown \
         roma opencv-python transformers huggingface_hub \
         omegaconf pytorch-lightning open-clip-torch kornia decord \
-        imageio-ffmpeg scikit-image moviepy 2>&1 | tail -5
+        imageio-ffmpeg scikit-image moviepy av 2>&1 | tail -5
 fi
 
 # --- Step 9: Base Python packages ---

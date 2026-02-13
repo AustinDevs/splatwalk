@@ -32,6 +32,32 @@ except ImportError:
 if not hasattr(Image, "ANTIALIAS"):
     Image.ANTIALIAS = Image.LANCZOS
 
+# Ensure PyAV is installed (required by torchvision.io.write_video in ViewCrafter)
+try:
+    import av as _av
+except ImportError:
+    print("Installing PyAV (required by ViewCrafter for video output)...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "av"])
+    import av as _av
+
+
+def extract_frames_from_video(video_path, output_dir, prefix="frame"):
+    """Extract individual frames from a video file using PyAV."""
+    import av
+
+    count = 0
+    try:
+        container = av.open(str(video_path))
+        for frame in container.decode(video=0):
+            img = frame.to_image()  # PIL Image
+            dest = os.path.join(output_dir, f"{prefix}_{count:04d}.jpg")
+            img.save(dest, "JPEG", quality=95)
+            count += 1
+        container.close()
+    except Exception as e:
+        print(f"  Warning: Could not extract frames from {video_path}: {e}")
+    return count
+
 
 def find_ply_and_load(model_path):
     """Find and load the latest PLY checkpoint."""
@@ -204,13 +230,36 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
                 cwd=viewcrafter_dir,
             )
             if result.returncode != 0:
-                print(f"  Warning: ViewCrafter failed on pair {i}: {result.stderr[-500:]}")
-                continue
+                print(f"  Warning: ViewCrafter returned non-zero for pair {i}.")
+                print(f"  stderr (last 2000 chars):\n{result.stderr[-2000:]}")
+                # Don't continue — try to extract frames from partial output below
         except subprocess.TimeoutExpired:
             print(f"  Warning: ViewCrafter timed out on pair {i}")
             continue
 
-        # Collect generated frames from output
+        # ViewCrafter saves output as MP4 videos (diffusion.mp4, render.mp4),
+        # NOT as individual frames. Extract frames from the diffusion video.
+        diffusion_videos = sorted(Path(view_output).rglob("diffusion.mp4"))
+        for video in diffusion_videos:
+            n = extract_frames_from_video(
+                video, output_dir, prefix=f"enhanced_{enhanced_count:04d}"
+            )
+            if n > 0:
+                print(f"  Extracted {n} frames from {video.name}")
+                enhanced_count += n
+
+        # Also check render.mp4 as fallback if no diffusion output
+        if not diffusion_videos:
+            render_videos = sorted(Path(view_output).rglob("render.mp4"))
+            for video in render_videos:
+                n = extract_frames_from_video(
+                    video, output_dir, prefix=f"enhanced_{enhanced_count:04d}"
+                )
+                if n > 0:
+                    print(f"  Extracted {n} frames from {video.name} (fallback)")
+                    enhanced_count += n
+
+        # Also collect any loose PNG/JPG frames (in case ViewCrafter version saves them)
         for frame in sorted(Path(view_output).rglob("*.png")) + sorted(
             Path(view_output).rglob("*.jpg")
         ):
