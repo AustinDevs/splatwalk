@@ -343,7 +343,7 @@ def render_with_gsplat(model_path, descent_poses, output_dir, scene_path):
         ).cuda()
         camera.camera_pose = camera_pose
 
-        rendering = render(camera, gaussians, pipe, bg_color)
+        rendering = render(camera, gaussians, pipe, bg_color, camera_pose=camera_pose)
         image = rendering["render"]
 
         # Save as JPEG

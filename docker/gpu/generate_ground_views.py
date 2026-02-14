@@ -344,7 +344,7 @@ def _render_rgb_from_splat(model_path, cameras, output_dir, scene_path):
         ).cuda()
         camera.camera_pose = camera_pose
 
-        rendering = render(camera, gaussians, pipe, bg_color)
+        rendering = render(camera, gaussians, pipe, bg_color, camera_pose=camera_pose)
         image = rendering["render"]
 
         img_np = (image.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
