@@ -421,7 +421,8 @@ print('PyTorch3D GPU rasterization: PASSED')
 echo ""
 echo "=== Step 12/12: Cleanup ==="
 pip cache purge 2>/dev/null || true
-rm -rf /root/.cache/pip /tmp/* /root/.cache/huggingface
+rm -rf /root/.cache/pip /tmp/*
+# NOTE: Do NOT delete /root/.cache/huggingface — it contains FLUX models (~70GB)
 apt-get clean 2>/dev/null || true
 rm -rf /var/lib/apt/lists/*
 

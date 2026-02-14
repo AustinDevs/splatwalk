@@ -22,6 +22,7 @@ const DO_SPACES_REGION = process.env.DO_SPACES_REGION || 'nyc3';
 const DO_SPACES_ENDPOINT = process.env.DO_SPACES_ENDPOINT || 'https://nyc3.digitaloceanspaces.com';
 
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
+const HUGGINGFACE_TOKEN = process.env.HUGGINGFACE_TOKEN || '';
 
 // Pipeline tuning (lower values for smaller GPUs like RTX 4000 Ada 20GB)
 const MAX_N_VIEWS = process.env.MAX_N_VIEWS || '';
@@ -450,6 +451,7 @@ export MAX_N_VIEWS=${MAX_N_VIEWS || '24'}
 export VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE || '10'}
 export TRAIN_ITERATIONS=${TRAIN_ITERATIONS || '7000'}
 export GITHUB_TOKEN=${GHCR_TOKEN || ''}
+export HF_TOKEN=${HUGGINGFACE_TOKEN || ''}
 
 echo "=== PIPELINE START ==="
 /opt/entrypoint.sh 2>&1
