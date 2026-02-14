@@ -313,10 +313,10 @@ def render_with_gsplat(model_path, descent_poses, output_dir, scene_path):
     )
     bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
-    for idx, pose in enumerate(descent_poses):
-        # Create a minimal camera object
-        from scene.cameras import Camera
+    from scene.cameras import Camera
+    from scipy.spatial.transform import Rotation as SciRotation
 
+    for idx, pose in enumerate(descent_poses):
         R = torch.tensor(pose["rotation"], dtype=torch.float32)
         T = torch.tensor(pose["translation"], dtype=torch.float32)
 
@@ -331,6 +331,17 @@ def render_with_gsplat(model_path, descent_poses, output_dir, scene_path):
             image_name=f"descent_{pose['altitude_fraction']:.3f}_{idx:03d}",
             uid=idx,
         )
+
+        # InstantSplat's render() requires camera_pose as a 7-element tensor
+        # [qw, qx, qy, qz, tx, ty, tz] representing the w2c transform.
+        # pose["rotation"] is already the w2c rotation matrix (from COLMAP quaternion).
+        quat = SciRotation.from_matrix(pose["rotation"]).as_quat()  # [x,y,z,w] scipy
+        camera_pose = torch.tensor(
+            [quat[3], quat[0], quat[1], quat[2],  # wxyz
+             pose["translation"][0], pose["translation"][1], pose["translation"][2]],
+            dtype=torch.float32,
+        ).cuda()
+        camera.camera_pose = camera_pose
 
         rendering = render(camera, gaussians, pipe, bg_color)
         image = rendering["render"]

@@ -314,9 +314,10 @@ def _render_rgb_from_splat(model_path, cameras, output_dir, scene_path):
     pipe = Namespace(convert_SHs_python=False, compute_cov3D_python=False, debug=False)
     bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
-    for idx, cam in enumerate(cameras):
-        from scene.cameras import Camera
+    from scene.cameras import Camera
+    from scipy.spatial.transform import Rotation as SciRotation
 
+    for idx, cam in enumerate(cameras):
         R = torch.tensor(cam["rotation"], dtype=torch.float32)
         T = torch.tensor(cam["translation"], dtype=torch.float32)
 
@@ -331,6 +332,17 @@ def _render_rgb_from_splat(model_path, cameras, output_dir, scene_path):
             image_name=f"groundgen_{idx:03d}",
             uid=idx,
         )
+
+        # InstantSplat's render() requires camera_pose as a 7-element tensor
+        # [qw, qx, qy, qz, tx, ty, tz] representing the w2c transform.
+        # cam["rotation"] is already the w2c rotation matrix (from COLMAP quaternion).
+        quat = SciRotation.from_matrix(cam["rotation"]).as_quat()  # [x,y,z,w] scipy
+        camera_pose = torch.tensor(
+            [quat[3], quat[0], quat[1], quat[2],  # wxyz
+             cam["translation"][0], cam["translation"][1], cam["translation"][2]],
+            dtype=torch.float32,
+        ).cuda()
+        camera.camera_pose = camera_pose
 
         rendering = render(camera, gaussians, pipe, bg_color)
         image = rendering["render"]
