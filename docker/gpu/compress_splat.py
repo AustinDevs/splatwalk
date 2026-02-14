@@ -86,29 +86,24 @@ def prune_gaussians(ply_path, output_ply_path, prune_ratio=0.3, confidence_path=
 
 
 def convert_to_spz(ply_path, spz_path):
-    """Convert PLY to SPZ using 3dgsconverter."""
+    """Convert PLY to SPZ using gsconverter (3dgsconverter package)."""
     print(f"Converting to SPZ: {ply_path} -> {spz_path}")
 
-    cmd = [sys.executable, "-m", "dgsconverter", "-i", ply_path, "-o", spz_path, "-f", "spz"]
+    cmd = ["gsconverter", "--input", ply_path, "--output", spz_path, "--target_format", "spz"]
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        spz_size_mb = Path(spz_path).stat().st_size / 1024 / 1024
-        print(f"  SPZ output: {spz_size_mb:.1f} MB")
-        return spz_size_mb
-    except subprocess.CalledProcessError as e:
-        print(f"  3dgsconverter failed: {e.stderr}")
-        raise
+        if result.stdout:
+            print(f"  {result.stdout.strip()}")
     except FileNotFoundError:
-        # Try alternate module name
-        cmd = [sys.executable, "-m", "3dgsconverter", "-i", ply_path, "-o", spz_path, "-f", "spz"]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-            spz_size_mb = Path(spz_path).stat().st_size / 1024 / 1024
-            print(f"  SPZ output: {spz_size_mb:.1f} MB")
-            return spz_size_mb
-        except Exception as e2:
-            print(f"  Alternate module also failed: {e2}")
-            raise
+        # Fall back to python -m
+        cmd = [sys.executable, "-m", "gsconverter", "--input", ply_path, "--output", spz_path, "--target_format", "spz"]
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if result.stdout:
+            print(f"  {result.stdout.strip()}")
+
+    spz_size_mb = Path(spz_path).stat().st_size / 1024 / 1024
+    print(f"  SPZ output: {spz_size_mb:.1f} MB")
+    return spz_size_mb
 
 
 def main():

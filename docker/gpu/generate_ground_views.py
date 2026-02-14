@@ -373,65 +373,6 @@ def _estimate_depth_maps(rgb_dir, depth_dir):
     print(f"  Generated {len(list(Path(depth_dir).glob('*.jpg')))} depth maps")
 
 
-def extract_aerial_crops(scene_images_dir, cameras, poses):
-    """
-    For each ground camera, find the nearest aerial image and crop the region
-    around the camera's XY position.
-    """
-    from PIL import Image as PILImage
-
-    aerial_images = {}
-    for img_file in sorted(Path(scene_images_dir).glob("*")):
-        if img_file.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-            name = img_file.stem.lower()
-            # Skip synthetic images
-            if name.startswith("descent_") or name.startswith("enhanced_") or name.startswith("groundgen_"):
-                continue
-            aerial_images[img_file.stem] = img_file
-
-    if not aerial_images:
-        print("  WARNING: No aerial images found for IP-Adapter crops")
-        return None
-
-    # Map aerial image names to poses for XY lookup
-    aerial_centers = {}
-    for pose in poses:
-        stem = Path(pose["image_name"]).stem
-        if stem in aerial_images:
-            aerial_centers[stem] = pose["center"][:2]
-
-    crops = []
-    for cam in cameras:
-        cam_xy = cam["center"][:2]
-
-        # Find nearest aerial image by XY distance
-        best_name = None
-        best_dist = float("inf")
-        for name, center_xy in aerial_centers.items():
-            dist = np.linalg.norm(cam_xy - center_xy)
-            if dist < best_dist:
-                best_dist = dist
-                best_name = name
-
-        if best_name is None:
-            # Fallback: just use first aerial image
-            best_name = list(aerial_images.keys())[0]
-
-        img = PILImage.open(aerial_images[best_name]).convert("RGB")
-        w, h = img.size
-
-        # Center crop (fallback strategy — projection would need full intrinsics)
-        crop_size = min(w, h, 512)
-        left = (w - crop_size) // 2
-        top = (h - crop_size) // 2
-        crop = img.crop((left, top, left + crop_size, top + crop_size))
-        crop = crop.resize((512, 512), PILImage.LANCZOS)
-        crops.append(crop)
-
-    print(f"  Extracted {len(crops)} aerial crops for IP-Adapter")
-    return crops
-
-
 def caption_aerial_scene(scene_images_dir):
     """Auto-generate a scene prompt from representative aerial images using BLIP."""
     from PIL import Image as PILImage
@@ -478,11 +419,11 @@ def caption_aerial_scene(scene_images_dir):
         )
 
 
-def generate_with_flux(depth_dir, rgb_dir, aerial_crops, prompt, output_dir,
+def generate_with_flux(depth_dir, rgb_dir, prompt, output_dir,
                        denoising_strength=0.55, controlnet_scale=0.8):
     """
-    Generate photorealistic ground views using FLUX.1-dev with ControlNet-depth
-    and IP-Adapter for aerial texture matching.
+    Generate photorealistic ground views using FLUX.1-dev with ControlNet-depth.
+    Uses img2img (blurry render as init) + depth ControlNet (geometry preservation).
     """
     import torch
     from PIL import Image as PILImage
@@ -492,7 +433,7 @@ def generate_with_flux(depth_dir, rgb_dir, aerial_crops, prompt, output_dir,
 
     print("  Loading FLUX.1-dev + ControlNet-depth pipeline...")
     controlnet = FluxControlNetModel.from_pretrained(
-        "Xlabs-AI/flux-controlnet-depth-v3",
+        "XLabs-AI/flux-controlnet-depth-diffusers",
         torch_dtype=torch.bfloat16,
     )
     pipe = FluxControlNetImg2ImgPipeline.from_pretrained(
@@ -502,19 +443,6 @@ def generate_with_flux(depth_dir, rgb_dir, aerial_crops, prompt, output_dir,
     )
     pipe.to("cuda")
 
-    # Load IP-Adapter for aerial texture conditioning
-    has_ip_adapter = False
-    try:
-        pipe.load_ip_adapter(
-            "XLabs-AI/flux-ip-adapter",
-            weight_name="ip_adapter.safetensors",
-        )
-        pipe.set_ip_adapter_scale(0.5)
-        has_ip_adapter = True
-        print("  IP-Adapter loaded successfully")
-    except Exception as e:
-        print(f"  IP-Adapter loading failed ({e}), proceeding without it")
-
     depth_files = sorted(Path(depth_dir).glob("*.jpg"))
     rgb_files = sorted(Path(rgb_dir).glob("*.jpg"))
 
@@ -522,7 +450,7 @@ def generate_with_flux(depth_dir, rgb_dir, aerial_crops, prompt, output_dir,
         depth_map = PILImage.open(depth_file).convert("RGB").resize((1024, 1024), PILImage.LANCZOS)
         blurry_render = PILImage.open(rgb_file).convert("RGB").resize((1024, 1024), PILImage.LANCZOS)
 
-        gen_kwargs = dict(
+        result = pipe(
             prompt=prompt,
             image=blurry_render,
             control_image=depth_map,
@@ -532,13 +460,7 @@ def generate_with_flux(depth_dir, rgb_dir, aerial_crops, prompt, output_dir,
             guidance_scale=3.5,
             height=1024,
             width=1024,
-        )
-
-        # Add IP-Adapter image if available
-        if has_ip_adapter and aerial_crops and idx < len(aerial_crops):
-            gen_kwargs["ip_adapter_image"] = aerial_crops[idx].resize((512, 512), PILImage.LANCZOS)
-
-        result = pipe(**gen_kwargs).images[0]
+        ).images[0]
 
         # Save at 512x512 to match training image size
         result = result.resize((512, 512), PILImage.LANCZOS)
@@ -688,22 +610,18 @@ def main():
         args.model_path, ground_cameras, args.output_dir, args.scene_path
     )
 
-    # 5. Extract aerial crops for IP-Adapter conditioning
-    print("Extracting aerial crops for texture matching...")
-    scene_images_dir = os.path.join(args.scene_path, "images")
-    aerial_crops = extract_aerial_crops(scene_images_dir, ground_cameras, poses)
-
-    # 6. Auto-caption the scene
+    # 5. Auto-caption the scene
     print("Captioning aerial scene...")
+    scene_images_dir = os.path.join(args.scene_path, "images")
     prompt = caption_aerial_scene(scene_images_dir)
 
-    # 7. Generate photorealistic views with FLUX
+    # 6. Generate photorealistic views with FLUX
     print("Generating photorealistic ground views with FLUX.1-dev...")
     notify_slack(f"Stage 3.5: Generating {len(ground_cameras)} ground views with FLUX...",
                  args.slack_webhook_url, args.job_id)
     generated_dir = os.path.join(args.output_dir, "generated")
     generate_with_flux(
-        depth_dir, rgb_dir, aerial_crops, prompt, generated_dir,
+        depth_dir, rgb_dir, prompt, generated_dir,
         denoising_strength=args.denoising_strength,
         controlnet_scale=args.controlnet_scale,
     )

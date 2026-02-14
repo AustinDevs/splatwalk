@@ -315,27 +315,19 @@ import torch
 
 print('Downloading FLUX ControlNet-depth...')
 cn = FluxControlNetModel.from_pretrained(
-    'Xlabs-AI/flux-controlnet-depth-v3', torch_dtype=torch.bfloat16)
+    'XLabs-AI/flux-controlnet-depth-diffusers', torch_dtype=torch.bfloat16)
 
 print('Downloading FLUX.1-dev + pipeline...')
 pipe = FluxControlNetImg2ImgPipeline.from_pretrained(
     'black-forest-labs/FLUX.1-dev', controlnet=cn,
     torch_dtype=torch.bfloat16)
 
-print('Downloading FLUX IP-Adapter...')
-try:
-    pipe.load_ip_adapter(
-        'XLabs-AI/flux-ip-adapter', weight_name='ip_adapter.safetensors')
-    print('IP-Adapter downloaded.')
-except Exception as e:
-    print(f'IP-Adapter download failed (non-fatal): {e}')
-
 print('All FLUX models cached.')
 " || echo "WARNING: FLUX model pre-download failed (models will download at runtime)"
 
-# Install 3dgsconverter for SPZ compression
-echo "Installing 3dgsconverter..."
-pip install --no-cache-dir 3dgsconverter 2>&1 | tail -3 || echo "WARNING: 3dgsconverter install failed"
+# Install gsconverter for SPZ compression (3dgsconverter from GitHub)
+echo "Installing gsconverter..."
+pip install --no-cache-dir "git+https://github.com/francescofugazzi/3dgsconverter.git" 2>&1 | tail -3 || echo "WARNING: gsconverter install failed"
 
 # --- Step 8: Runtime Python packages ---
 echo ""
