@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Splat Compression Pipeline: Prune + SPZ
+Splat Compression Pipeline: Prune + .splat conversion
 
 Replaces the simple PLY-to-.splat conversion with a proper compression pipeline:
   Stage A: Importance-based pruning (remove low-contribution Gaussians)
-  Stage B: SPZ conversion (quantized + compressed format)
+  Stage B: .splat binary conversion (32 bytes/Gaussian, ~3x smaller than PLY)
 
-Expected compression: 200-500MB PLY -> ~60-70% after pruning -> ~10-15% after SPZ = 10-30MB final
+Expected compression: 200-500MB PLY -> ~60-70% after pruning -> ~50% via .splat = 30-100MB final
 
 Usage:
-    python compress_splat.py input.ply output.spz [--prune_ratio 0.3] [--confidence_npy path]
+    python compress_splat.py input.ply output.splat [--prune_ratio 0.3] [--confidence_npy path]
 """
 
 import argparse
@@ -92,58 +92,123 @@ def prune_gaussians(ply_path, output_ply_path, prune_ratio=0.3, confidence_path=
     return kept_count
 
 
-def convert_to_spz(ply_path, spz_path):
-    """Convert PLY to SPZ using gsconverter. Falls back to .ply if SPZ conversion fails."""
-    print(f"Converting to SPZ: {ply_path} -> {spz_path}")
+def convert_to_splat(ply_path, splat_path):
+    """Convert PLY to .splat binary format (antimatter15 format, 32 bytes/Gaussian).
 
-    # Ensure HOME is set (cloud-init may not set it)
-    env = os.environ.copy()
-    env.setdefault("HOME", "/root")
+    Format per Gaussian (32 bytes):
+      float32 x, y, z         (12 bytes - position)
+      float32 s0, s1, s2      (12 bytes - scale, exponentiated)
+      uint8   r, g, b, a      ( 4 bytes - color + opacity)
+      uint8   q0, q1, q2, q3  ( 4 bytes - quaternion, 128-biased)
+    """
+    print(f"Converting to .splat: {ply_path} -> {splat_path}")
 
-    # Try multiple invocation methods for gsconverter
-    # The -f flag specifies target format (required), -i input, -o output
-    attempts = [
-        ["3dgsconverter", "-i", ply_path, "-f", "spz", "-o", spz_path, "--force"],
-        ["gsconverter", "-i", ply_path, "-f", "spz", "-o", spz_path, "--force"],
-        [sys.executable, "-m", "gsconverter", "-i", ply_path, "-f", "spz", "-o", spz_path, "--force"],
-        ["gsconv", "-i", ply_path, "-f", "spz", "-o", spz_path, "--force"],
-    ]
+    ply_data = PlyData.read(ply_path)
+    vertex = ply_data["vertex"]
+    N = len(vertex.data)
+    field_names = set(vertex.data.dtype.names)
 
-    for cmd in attempts:
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
-            if result.returncode == 0:
-                if Path(spz_path).exists():
-                    spz_size_mb = Path(spz_path).stat().st_size / 1024 / 1024
-                    print(f"  SPZ output: {spz_size_mb:.1f} MB")
-                    return spz_size_mb
-            print(f"  gsconverter attempt failed: {' '.join(cmd[:3])}")
-            if result.stderr:
-                print(f"    stderr: {result.stderr.strip()[:300]}")
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            print(f"  gsconverter attempt failed: {e}")
-            continue
+    # Positions: float32 [N, 3]
+    positions = np.stack([
+        np.array(vertex["x"], dtype=np.float32),
+        np.array(vertex["y"], dtype=np.float32),
+        np.array(vertex["z"], dtype=np.float32),
+    ], axis=-1)
 
-    # All SPZ attempts failed — fall back to serving the pruned PLY directly
-    # The viewer (@mkkellogg/gaussian-splats-3d) auto-detects format from content
-    print("  WARNING: All SPZ conversion methods failed, using pruned PLY at output path")
-    import shutil
-    shutil.copy2(ply_path, spz_path)
-    ply_size_mb = Path(spz_path).stat().st_size / 1024 / 1024
-    print(f"  PLY fallback output: {ply_size_mb:.1f} MB (uncompressed)")
-    return ply_size_mb
+    # Scales: exp(log_scale) -> float32 [N, 3]
+    if "scale_0" in field_names:
+        scales = np.exp(np.stack([
+            np.array(vertex["scale_0"], dtype=np.float32),
+            np.array(vertex["scale_1"], dtype=np.float32),
+            np.array(vertex["scale_2"], dtype=np.float32),
+        ], axis=-1))
+    else:
+        scales = np.full((N, 3), 0.01, dtype=np.float32)
+
+    # Colors: SH DC -> RGB [0,255] uint8 [N, 3]
+    SH_C0 = 0.28209479177387814
+    if "f_dc_0" in field_names:
+        colors = np.stack([
+            np.array(vertex["f_dc_0"], dtype=np.float32),
+            np.array(vertex["f_dc_1"], dtype=np.float32),
+            np.array(vertex["f_dc_2"], dtype=np.float32),
+        ], axis=-1)
+        colors = (colors * SH_C0 + 0.5) * 255.0
+    elif "red" in field_names:
+        colors = np.stack([
+            np.array(vertex["red"], dtype=np.float32),
+            np.array(vertex["green"], dtype=np.float32),
+            np.array(vertex["blue"], dtype=np.float32),
+        ], axis=-1)
+        if colors.max() <= 1.0:
+            colors *= 255.0
+    else:
+        colors = np.full((N, 3), 128.0, dtype=np.float32)
+    colors_u8 = colors.clip(0, 255).astype(np.uint8)
+
+    # Opacity: sigmoid(logit) -> [0,255] uint8 [N]
+    if "opacity" in field_names:
+        alpha = (sigmoid(np.array(vertex["opacity"], dtype=np.float32)) * 255.0).clip(0, 255).astype(np.uint8)
+    else:
+        alpha = np.full(N, 255, dtype=np.uint8)
+
+    # RGBA: [N, 4]
+    rgba = np.column_stack([colors_u8, alpha])
+
+    # Rotation quaternion: normalize then map [-1,1] -> [0,255] uint8
+    if "rot_0" in field_names:
+        rots = np.stack([
+            np.array(vertex["rot_0"], dtype=np.float32),
+            np.array(vertex["rot_1"], dtype=np.float32),
+            np.array(vertex["rot_2"], dtype=np.float32),
+            np.array(vertex["rot_3"], dtype=np.float32),
+        ], axis=-1)
+        norms = np.linalg.norm(rots, axis=-1, keepdims=True)
+        norms[norms == 0] = 1
+        rots = rots / norms
+    else:
+        rots = np.zeros((N, 4), dtype=np.float32)
+        rots[:, 0] = 1.0
+    rot_u8 = (rots * 128 + 128).clip(0, 255).astype(np.uint8)
+
+    # Sort by importance (most opaque/large first) for progressive rendering
+    sort_score = -np.exp(
+        np.array(vertex.data["scale_0"] if "scale_0" in field_names else np.zeros(N), dtype=np.float32) +
+        np.array(vertex.data["scale_1"] if "scale_1" in field_names else np.zeros(N), dtype=np.float32) +
+        np.array(vertex.data["scale_2"] if "scale_2" in field_names else np.zeros(N), dtype=np.float32)
+    ) / (1 + np.exp(-np.array(vertex.data["opacity"] if "opacity" in field_names else np.zeros(N), dtype=np.float32)))
+    order = np.argsort(sort_score)
+
+    positions = positions[order]
+    scales = scales[order]
+    rgba = rgba[order]
+    rot_u8 = rot_u8[order]
+
+    # Write interleaved binary: vectorized (fast for millions of Gaussians)
+    buf = np.empty((N, 32), dtype=np.uint8)
+    buf[:, 0:12] = positions.view(np.uint8).reshape(N, 12)
+    buf[:, 12:24] = scales.view(np.uint8).reshape(N, 12)
+    buf[:, 24:28] = rgba
+    buf[:, 28:32] = rot_u8
+
+    with open(splat_path, "wb") as f:
+        f.write(buf.tobytes())
+
+    splat_size_mb = Path(splat_path).stat().st_size / 1024 / 1024
+    print(f"  {N} Gaussians -> {splat_size_mb:.1f} MB (.splat)")
+    return splat_size_mb
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Splat Compression: Prune + SPZ")
+    parser = argparse.ArgumentParser(description="Splat Compression: Prune + .splat conversion")
     parser.add_argument("input_ply", help="Input PLY file path")
-    parser.add_argument("output_spz", help="Output SPZ file path")
+    parser.add_argument("output_splat", help="Output .splat file path")
     parser.add_argument("--prune_ratio", type=float, default=0.3,
                         help="Fraction of Gaussians to prune (0.0-1.0, default 0.3)")
     parser.add_argument("--confidence_npy", default=None,
                         help="Path to per-Gaussian confidence.npy for weighted pruning")
     parser.add_argument("--skip_prune", action="store_true",
-                        help="Skip pruning, only do SPZ conversion")
+                        help="Skip pruning, only do .splat conversion")
     args = parser.parse_args()
 
     if not Path(args.input_ply).exists():
@@ -167,10 +232,10 @@ def main():
                         prune_ratio=args.prune_ratio,
                         confidence_path=args.confidence_npy)
 
-    # Stage B: SPZ Conversion
-    print(f"\n=== Stage B: SPZ Conversion ===")
-    os.makedirs(os.path.dirname(os.path.abspath(args.output_spz)), exist_ok=True)
-    spz_size = convert_to_spz(pruned_ply, args.output_spz)
+    # Stage B: .splat Conversion
+    print(f"\n=== Stage B: .splat Conversion ===")
+    os.makedirs(os.path.dirname(os.path.abspath(args.output_splat)), exist_ok=True)
+    splat_size = convert_to_splat(pruned_ply, args.output_splat)
 
     # Cleanup intermediate file
     if not args.skip_prune and pruned_ply != args.input_ply and os.path.exists(pruned_ply):
@@ -178,15 +243,11 @@ def main():
         print(f"  Cleaned up intermediate: {pruned_ply}")
 
     # Summary
-    output_path = Path(args.output_spz)
-    if output_path.exists():
-        final_size_mb = output_path.stat().st_size / 1024 / 1024
-    else:
-        final_size_mb = spz_size if spz_size else 0
+    final_size_mb = Path(args.output_splat).stat().st_size / 1024 / 1024
     compression_ratio = input_size_mb / max(final_size_mb, 0.01)
     print(f"\n=== Compression Summary ===")
     print(f"  Input:  {input_size_mb:.1f} MB (PLY)")
-    print(f"  Output: {final_size_mb:.1f} MB")
+    print(f"  Output: {final_size_mb:.1f} MB (.splat)")
     print(f"  Ratio:  {compression_ratio:.1f}x ({100 * final_size_mb / input_size_mb:.1f}%)")
 
 

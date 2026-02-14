@@ -436,7 +436,7 @@ convert_and_upload() {
     local ply_path="$1"
     local pipeline_name="$2"
 
-    echo "Compressing PLY to .spz..."
+    echo "Compressing PLY to .splat..."
 
     # Find the PLY file (must be a trained Gaussian checkpoint, not raw input.ply)
     if [ ! -f "$ply_path" ]; then
@@ -448,24 +448,24 @@ convert_and_upload() {
         return 1
     fi
 
-    local spz_path="$OUTPUT_DIR/output.spz"
+    local splat_path="$OUTPUT_DIR/output.splat"
     local confidence_npy="$OUTPUT_DIR/walkable/per_gaussian_confidence.npy"
 
     python /opt/compress_splat.py \
-        "$ply_path" "$spz_path" \
+        "$ply_path" "$splat_path" \
         --prune_ratio 0.3 \
         --confidence_npy "$confidence_npy" || return 1
 
-    if [ ! -f "$spz_path" ]; then
-        echo "Error: SPZ compression failed"
+    if [ ! -f "$splat_path" ]; then
+        echo "Error: .splat compression failed"
         return 1
     fi
 
     echo "Uploading results to Spaces..."
 
     # Upload compressed splat
-    local splat_key="jobs/$JOB_ID/output/$pipeline_name/scene.spz"
-    local splat_url=$(upload_to_spaces "$spz_path" "$splat_key" "application/octet-stream")
+    local splat_key="jobs/$JOB_ID/output/$pipeline_name/scene.splat"
+    local splat_url=$(upload_to_spaces "$splat_path" "$splat_key" "application/octet-stream")
 
     # Upload thumbnail if available
     local thumb_url=""
@@ -517,7 +517,7 @@ case "$PIPELINE_MODE" in
         ;;
     "walkable")
         if run_walkable; then
-            notify_slack "Uploading KSPLAT to Spaces..."
+            notify_slack "Compressing and uploading splat to Spaces..."
             # Find the trained Gaussian point cloud (not input.ply which is raw MASt3R output)
             local_ply=""
             for search_dir in "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/ground_views/model" "$OUTPUT_DIR/enhanced" "$OUTPUT_DIR/descent/final" "$OUTPUT_DIR/instantsplat"; do
