@@ -438,10 +438,9 @@ convert_and_upload() {
 
     echo "Compressing PLY to .spz..."
 
-    # Find the PLY file
+    # Find the PLY file (must be a trained Gaussian checkpoint, not raw input.ply)
     if [ ! -f "$ply_path" ]; then
-        # Try to find it
-        ply_path=$(find "$OUTPUT_DIR" -name "*.ply" -type f | head -1)
+        ply_path=$(find "$OUTPUT_DIR" -path "*/point_cloud/iteration_*/point_cloud.ply" -type f 2>/dev/null | sort -t_ -k2 -n -r | head -1)
     fi
 
     if [ -z "$ply_path" ] || [ ! -f "$ply_path" ]; then
@@ -519,11 +518,15 @@ case "$PIPELINE_MODE" in
     "walkable")
         if run_walkable; then
             notify_slack "Uploading KSPLAT to Spaces..."
-            # Quality gate outputs the final model; find the PLY
-            local_ply="$OUTPUT_DIR/walkable/point_cloud/point_cloud.ply"
-            if [ ! -f "$local_ply" ]; then
-                local_ply=$(find "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/enhanced" "$OUTPUT_DIR/descent/final" "$OUTPUT_DIR/instantsplat" -name "*.ply" -type f 2>/dev/null | head -1)
-            fi
+            # Find the trained Gaussian point cloud (not input.ply which is raw MASt3R output)
+            local_ply=""
+            for search_dir in "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/ground_views/model" "$OUTPUT_DIR/enhanced" "$OUTPUT_DIR/descent/final" "$OUTPUT_DIR/instantsplat"; do
+                candidate=$(find "$search_dir" -path "*/point_cloud/iteration_*/point_cloud.ply" -type f 2>/dev/null | sort -t_ -k2 -n -r | head -1)
+                if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+                    local_ply="$candidate"
+                    break
+                fi
+            done
             if convert_and_upload "$local_ply" "walkable"; then
                 # Append confidence metadata to manifest if available
                 if [ -f "$OUTPUT_DIR/walkable/confidence.json" ]; then

@@ -46,6 +46,13 @@ def prune_gaussians(ply_path, output_ply_path, prune_ratio=0.3, confidence_path=
     input_size_mb = Path(ply_path).stat().st_size / 1024 / 1024
     print(f"  {original_count} Gaussians, {input_size_mb:.1f} MB")
 
+    # Verify this is a Gaussian splat PLY (not a raw point cloud)
+    field_names = [p.name for p in vertex.properties]
+    if "opacity" not in field_names:
+        print(f"  ERROR: PLY has no 'opacity' field. Available fields: {field_names[:20]}")
+        print(f"  This looks like a raw point cloud, not a trained Gaussian splat.")
+        raise ValueError(f"PLY file is not a Gaussian splat (no opacity field): {ply_path}")
+
     # Compute importance score per Gaussian
     opacities = sigmoid(np.array(vertex["opacity"]))
 
