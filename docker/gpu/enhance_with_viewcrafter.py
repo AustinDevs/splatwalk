@@ -332,8 +332,15 @@ def retrain_with_enhanced(scene_path, model_path, output_model_path, iterations=
     n_images = len(list(Path(scene_path).joinpath("images").glob("*.jpg")))
     n_views = min(n_images, 24)
 
-    if output_model_path != model_path and not os.path.exists(output_model_path):
-        shutil.copytree(model_path, output_model_path)
+    # Copy model checkpoint to output directory (needed for train.py to find existing Gaussians)
+    if output_model_path != model_path:
+        src_ckpt = sorted(Path(model_path).glob("point_cloud/iteration_*"))
+        if src_ckpt:
+            for ckpt_dir in src_ckpt:
+                dst_dir = Path(output_model_path) / "point_cloud" / ckpt_dir.name
+                if not dst_dir.exists():
+                    shutil.copytree(str(ckpt_dir), str(dst_dir))
+            print(f"  Copied model checkpoints to {output_model_path}")
 
     cmd = [
         sys.executable,
