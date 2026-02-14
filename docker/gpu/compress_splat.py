@@ -100,7 +100,7 @@ def convert_to_spz(ply_path, spz_path):
     env = os.environ.copy()
     env.setdefault("HOME", "/root")
 
-    cmd = ["gsconverter", "-i", ply_path, "-o", spz_path]
+    cmd = ["gsconverter", "--input", ply_path, "--output", spz_path]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if result.stdout:
@@ -111,7 +111,7 @@ def convert_to_spz(ply_path, spz_path):
             raise subprocess.CalledProcessError(result.returncode, cmd)
     except FileNotFoundError:
         # Fall back to python -m
-        cmd = [sys.executable, "-m", "gsconverter", "-i", ply_path, "-o", spz_path]
+        cmd = [sys.executable, "-m", "gsconverter", "--input", ply_path, "--output", spz_path]
         result = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if result.stdout:
             print(f"  {result.stdout.strip()}")
