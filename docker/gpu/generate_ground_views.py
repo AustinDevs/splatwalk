@@ -441,6 +441,14 @@ def generate_with_flux(depth_dir, rgb_dir, prompt, output_dir,
     from PIL import Image as PILImage
     from diffusers import FluxControlNetImg2ImgPipeline, FluxControlNetModel
 
+    # Monkey-patch: PyTorch 2.4 doesn't support enable_gqa in scaled_dot_product_attention
+    # (added in PyTorch 2.5). Strip it so FLUX attention works on our snapshot.
+    _orig_sdpa = torch.nn.functional.scaled_dot_product_attention
+    def _patched_sdpa(*args, **kwargs):
+        kwargs.pop('enable_gqa', None)
+        return _orig_sdpa(*args, **kwargs)
+    torch.nn.functional.scaled_dot_product_attention = _patched_sdpa
+
     os.makedirs(output_dir, exist_ok=True)
 
     print("  Loading FLUX.1-dev + ControlNet-depth pipeline...")
