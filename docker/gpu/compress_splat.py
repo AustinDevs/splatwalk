@@ -93,36 +93,45 @@ def prune_gaussians(ply_path, output_ply_path, prune_ratio=0.3, confidence_path=
 
 
 def convert_to_spz(ply_path, spz_path):
-    """Convert PLY to SPZ using gsconverter (3dgsconverter package)."""
+    """Convert PLY to SPZ using gsconverter. Falls back to .ply if SPZ conversion fails."""
     print(f"Converting to SPZ: {ply_path} -> {spz_path}")
 
-    # Ensure HOME is set (cloud-init may not set it, gsconverter needs it)
+    # Ensure HOME is set (cloud-init may not set it)
     env = os.environ.copy()
     env.setdefault("HOME", "/root")
 
-    cmd = ["gsconverter", "--input", ply_path, "--output", spz_path]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-        if result.stdout:
-            print(f"  {result.stdout.strip()}")
-        if result.stderr:
-            print(f"  gsconverter stderr: {result.stderr.strip()[:500]}")
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(result.returncode, cmd)
-    except FileNotFoundError:
-        # Fall back to python -m
-        cmd = [sys.executable, "-m", "gsconverter", "--input", ply_path, "--output", spz_path]
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-        if result.stdout:
-            print(f"  {result.stdout.strip()}")
-        if result.stderr:
-            print(f"  gsconverter stderr: {result.stderr.strip()[:500]}")
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(result.returncode, cmd)
+    # Try multiple invocation methods for gsconverter
+    # The -f flag specifies target format (required), -i input, -o output
+    attempts = [
+        ["3dgsconverter", "-i", ply_path, "-f", "spz", "-o", spz_path, "--force"],
+        ["gsconverter", "-i", ply_path, "-f", "spz", "-o", spz_path, "--force"],
+        [sys.executable, "-m", "gsconverter", "-i", ply_path, "-f", "spz", "-o", spz_path, "--force"],
+        ["gsconv", "-i", ply_path, "-f", "spz", "-o", spz_path, "--force"],
+    ]
 
-    spz_size_mb = Path(spz_path).stat().st_size / 1024 / 1024
-    print(f"  SPZ output: {spz_size_mb:.1f} MB")
-    return spz_size_mb
+    for cmd in attempts:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
+            if result.returncode == 0:
+                if Path(spz_path).exists():
+                    spz_size_mb = Path(spz_path).stat().st_size / 1024 / 1024
+                    print(f"  SPZ output: {spz_size_mb:.1f} MB")
+                    return spz_size_mb
+            print(f"  gsconverter attempt failed: {' '.join(cmd[:3])}")
+            if result.stderr:
+                print(f"    stderr: {result.stderr.strip()[:300]}")
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            print(f"  gsconverter attempt failed: {e}")
+            continue
+
+    # All SPZ attempts failed — fall back to serving the pruned PLY directly
+    # The viewer (@mkkellogg/gaussian-splats-3d) auto-detects format from content
+    print("  WARNING: All SPZ conversion methods failed, using pruned PLY at output path")
+    import shutil
+    shutil.copy2(ply_path, spz_path)
+    ply_size_mb = Path(spz_path).stat().st_size / 1024 / 1024
+    print(f"  PLY fallback output: {ply_size_mb:.1f} MB (uncompressed)")
+    return ply_size_mb
 
 
 def main():
@@ -169,11 +178,15 @@ def main():
         print(f"  Cleaned up intermediate: {pruned_ply}")
 
     # Summary
-    final_size_mb = Path(args.output_spz).stat().st_size / 1024 / 1024
+    output_path = Path(args.output_spz)
+    if output_path.exists():
+        final_size_mb = output_path.stat().st_size / 1024 / 1024
+    else:
+        final_size_mb = spz_size if spz_size else 0
     compression_ratio = input_size_mb / max(final_size_mb, 0.01)
     print(f"\n=== Compression Summary ===")
     print(f"  Input:  {input_size_mb:.1f} MB (PLY)")
-    print(f"  Output: {final_size_mb:.1f} MB (SPZ)")
+    print(f"  Output: {final_size_mb:.1f} MB")
     print(f"  Ratio:  {compression_ratio:.1f}x ({100 * final_size_mb / input_size_mb:.1f}%)")
 
 
