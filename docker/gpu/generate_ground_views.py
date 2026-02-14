@@ -509,9 +509,13 @@ def add_images_to_scene(generated_dir, scene_path):
 
 def write_colmap_cameras(cameras, scene_path):
     """
-    Write ground-level camera poses to COLMAP text format,
-    appending to existing images.txt and cameras.txt.
+    Write ground-level camera poses to COLMAP text format.
+    Converts existing binary files to text first, then appends ground cameras,
+    then removes binary files so InstantSplat reads only text format.
     """
+    import struct
+    from scipy.spatial.transform import Rotation
+
     # Find the sparse directory
     sparse_dir = None
     for sd in sorted(Path(scene_path).glob("sparse_*/0")):
@@ -528,40 +532,92 @@ def write_colmap_cameras(cameras, scene_path):
         print("  WARNING: No sparse directory found, skipping COLMAP pose export")
         return
 
-    # Write as text format (append-friendly)
+    images_bin = sparse_dir / "images.bin"
+    cameras_bin = sparse_dir / "cameras.bin"
     images_txt = sparse_dir / "images.txt"
     cameras_txt = sparse_dir / "cameras.txt"
 
-    # Read existing to find max IDs
+    # Step 1: Convert images.bin to images.txt if binary exists
+    existing_entries = []
     max_image_id = 0
-    max_camera_id = 0
-    if images_txt.exists():
-        with open(images_txt, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("#") or not line:
-                    continue
-                parts = line.split()
-                if len(parts) >= 10:
-                    max_image_id = max(max_image_id, int(parts[0]))
-                    max_camera_id = max(max_camera_id, int(parts[8]))
+    camera_id = 1
 
-    # Use camera_id = max_camera_id (reuse existing camera intrinsics)
-    camera_id = max(max_camera_id, 1)
+    if images_bin.exists():
+        with open(str(images_bin), "rb") as f:
+            num_images = struct.unpack("<Q", f.read(8))[0]
+            for _ in range(num_images):
+                image_id = struct.unpack("<I", f.read(4))[0]
+                qw, qx, qy, qz = struct.unpack("<4d", f.read(32))
+                tx, ty, tz = struct.unpack("<3d", f.read(24))
+                cam_id = struct.unpack("<I", f.read(4))[0]
+                name_chars = []
+                while True:
+                    c = f.read(1)
+                    if c == b"\x00":
+                        break
+                    name_chars.append(c.decode())
+                image_name = "".join(name_chars)
+                num_points2d = struct.unpack("<Q", f.read(8))[0]
+                f.read(num_points2d * 24)
 
-    # Append ground cameras to images.txt
-    with open(images_txt, "a") as f:
-        from scipy.spatial.transform import Rotation
+                existing_entries.append(
+                    f"{image_id} {qw} {qx} {qy} {qz} {tx} {ty} {tz} {cam_id} {image_name}\n\n"
+                )
+                max_image_id = max(max_image_id, image_id)
+                camera_id = cam_id
+        print(f"  Converted {len(existing_entries)} cameras from images.bin to text")
+
+    # Step 2: Convert cameras.bin to cameras.txt if binary exists
+    if cameras_bin.exists():
+        camera_entries = []
+        with open(str(cameras_bin), "rb") as f:
+            num_cameras = struct.unpack("<Q", f.read(8))[0]
+            for _ in range(num_cameras):
+                cam_id = struct.unpack("<I", f.read(4))[0]
+                model_id = struct.unpack("<i", f.read(4))[0]
+                width = struct.unpack("<Q", f.read(8))[0]
+                height = struct.unpack("<Q", f.read(8))[0]
+                # Number of params depends on camera model
+                # PINHOLE=1: fx,fy,cx,cy (4 params), SIMPLE_PINHOLE=0: f,cx,cy (3 params)
+                num_params = {0: 3, 1: 4, 2: 4, 3: 5, 4: 4, 5: 5}.get(model_id, 4)
+                params = struct.unpack(f"<{num_params}d", f.read(num_params * 8))
+                model_name = {0: "SIMPLE_PINHOLE", 1: "PINHOLE", 2: "SIMPLE_RADIAL",
+                              3: "RADIAL", 4: "OPENCV", 5: "OPENCV_FISHEYE"}.get(model_id, "PINHOLE")
+                params_str = " ".join(f"{p}" for p in params)
+                camera_entries.append(f"{cam_id} {model_name} {width} {height} {params_str}\n")
+
+        with open(str(cameras_txt), "w") as f:
+            f.write("# Camera list with one line of data per camera:\n")
+            f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+            f.write(f"# Number of cameras: {len(camera_entries)}\n")
+            for entry in camera_entries:
+                f.write(entry)
+        print(f"  Converted {len(camera_entries)} camera models to cameras.txt")
+        cameras_bin.unlink()
+
+    # Step 3: Write all images (existing + ground) to images.txt
+    with open(str(images_txt), "w") as f:
+        f.write("# Image list with two lines of data per image:\n")
+        f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+        f.write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
+        f.write(f"# Number of images: {len(existing_entries) + len(cameras)}\n")
+        for entry in existing_entries:
+            f.write(entry)
         for idx, cam in enumerate(cameras):
             image_id = max_image_id + idx + 1
-            R = Rotation.from_matrix(cam["rotation"])
-            qw, qx, qy, qz = R.as_quat()[[3, 0, 1, 2]]  # scipy gives xyzw, COLMAP wants wxyz
+            R_rot = Rotation.from_matrix(cam["rotation"])
+            qw, qx, qy, qz = R_rot.as_quat()[[3, 0, 1, 2]]
             tx, ty, tz = cam["translation"]
             name = f"groundgen_{idx:03d}.jpg"
             f.write(f"{image_id} {qw} {qx} {qy} {qz} {tx} {ty} {tz} {camera_id} {name}\n")
             f.write("\n")  # Empty line for 2D points
 
-    print(f"  Wrote {len(cameras)} ground camera poses to {images_txt}")
+    # Step 4: Remove binary files so InstantSplat reads text only
+    if images_bin.exists():
+        images_bin.unlink()
+        print("  Removed images.bin (using text format only)")
+
+    print(f"  Wrote {len(existing_entries) + len(cameras)} total camera poses to {images_txt}")
 
 
 def retrain_model(scene_path, model_path, output_model_path, iterations, n_views):
