@@ -95,6 +95,12 @@ def prune_gaussians(ply_path, output_ply_path, prune_ratio=0.3, confidence_path=
 def convert_to_splat(ply_path, splat_path):
     """Convert PLY to .splat binary format (antimatter15 format, 32 bytes/Gaussian).
 
+    Includes aggressive floater removal:
+      - Low opacity (< 10%) Gaussians removed
+      - Extremely elongated Gaussians removed (scale ratio > 50:1)
+      - Giant Gaussians removed (max scale > 99.5th percentile)
+      - Position outliers removed (> 3σ from centroid)
+
     Format per Gaussian (32 bytes):
       float32 x, y, z         (12 bytes - position)
       float32 s0, s1, s2      (12 bytes - scale, exponentiated)
@@ -115,17 +121,68 @@ def convert_to_splat(ply_path, splat_path):
         np.array(vertex["z"], dtype=np.float32),
     ], axis=-1)
 
-    # Scales: exp(log_scale) -> float32 [N, 3]
+    # Scales (log space for filtering, then exponentiate)
     if "scale_0" in field_names:
-        scales = np.exp(np.stack([
+        log_scales = np.stack([
             np.array(vertex["scale_0"], dtype=np.float32),
             np.array(vertex["scale_1"], dtype=np.float32),
             np.array(vertex["scale_2"], dtype=np.float32),
-        ], axis=-1))
+        ], axis=-1)
+        scales = np.exp(log_scales)
     else:
+        log_scales = np.full((N, 3), -4.6, dtype=np.float32)
         scales = np.full((N, 3), 0.01, dtype=np.float32)
 
-    # Colors: SH DC -> RGB [0,255] uint8 [N, 3]
+    # Opacity (float for filtering)
+    if "opacity" in field_names:
+        opacity_logit = np.array(vertex["opacity"], dtype=np.float32)
+        opacity = sigmoid(opacity_logit)
+    else:
+        opacity_logit = np.zeros(N, dtype=np.float32)
+        opacity = np.ones(N, dtype=np.float32)
+
+    # === Floater removal filters ===
+    keep = np.ones(N, dtype=bool)
+
+    # 1. Remove low opacity (< 10%) — nearly invisible noise
+    opacity_mask = opacity >= 0.1
+    print(f"  Filter: opacity >= 0.1: keeping {opacity_mask.sum()} / {N} ({100*opacity_mask.mean():.1f}%)")
+    keep &= opacity_mask
+
+    # 2. Remove giant Gaussians (max scale > 99.5th percentile)
+    max_scale = scales.max(axis=-1)
+    scale_cap = np.percentile(max_scale[keep], 99.5)
+    scale_mask = max_scale <= scale_cap
+    print(f"  Filter: max_scale <= {scale_cap:.4f}: keeping {(keep & scale_mask).sum()} / {keep.sum()}")
+    keep &= scale_mask
+
+    # 3. Remove extremely elongated Gaussians (scale ratio > 50:1)
+    min_scale = scales.min(axis=-1)
+    min_scale[min_scale == 0] = 1e-10
+    elongation = max_scale / min_scale
+    elong_mask = elongation <= 50.0
+    print(f"  Filter: elongation <= 50: keeping {(keep & elong_mask).sum()} / {keep.sum()}")
+    keep &= elong_mask
+
+    # 4. Remove position outliers (> 3σ from centroid)
+    centroid = positions[keep].mean(axis=0)
+    dists = np.linalg.norm(positions - centroid, axis=-1)
+    dist_std = dists[keep].std()
+    pos_mask = dists <= centroid.max() + 3 * dist_std  # generous bound
+    print(f"  Filter: position < 3σ: keeping {(keep & pos_mask).sum()} / {keep.sum()}")
+    keep &= pos_mask
+
+    kept = keep.sum()
+    removed = N - kept
+    print(f"  Total after filtering: {kept} ({100*kept/N:.1f}% of {N}, removed {removed} floaters)")
+
+    # Apply filter
+    positions = positions[keep]
+    scales = scales[keep]
+    opacity = opacity[keep]
+    N = kept
+
+    # Colors: SH DC -> RGB [0,255] uint8 [N_original, 3] then filter
     SH_C0 = 0.28209479177387814
     if "f_dc_0" in field_names:
         colors = np.stack([
@@ -143,16 +200,12 @@ def convert_to_splat(ply_path, splat_path):
         if colors.max() <= 1.0:
             colors *= 255.0
     else:
-        colors = np.full((N, 3), 128.0, dtype=np.float32)
+        colors = np.full((len(vertex.data), 3), 128.0, dtype=np.float32)
+    colors = colors[keep]
     colors_u8 = colors.clip(0, 255).astype(np.uint8)
 
-    # Opacity: sigmoid(logit) -> [0,255] uint8 [N]
-    if "opacity" in field_names:
-        alpha = (sigmoid(np.array(vertex["opacity"], dtype=np.float32)) * 255.0).clip(0, 255).astype(np.uint8)
-    else:
-        alpha = np.full(N, 255, dtype=np.uint8)
-
-    # RGBA: [N, 4]
+    # Alpha: [0,255] uint8
+    alpha = (opacity * 255.0).clip(0, 255).astype(np.uint8)
     rgba = np.column_stack([colors_u8, alpha])
 
     # Rotation quaternion: normalize then map [-1,1] -> [0,255] uint8
@@ -167,16 +220,13 @@ def convert_to_splat(ply_path, splat_path):
         norms[norms == 0] = 1
         rots = rots / norms
     else:
-        rots = np.zeros((N, 4), dtype=np.float32)
+        rots = np.zeros((len(vertex.data), 4), dtype=np.float32)
         rots[:, 0] = 1.0
+    rots = rots[keep]
     rot_u8 = (rots * 128 + 128).clip(0, 255).astype(np.uint8)
 
     # Sort by importance (most opaque/large first) for progressive rendering
-    sort_score = -np.exp(
-        np.array(vertex.data["scale_0"] if "scale_0" in field_names else np.zeros(N), dtype=np.float32) +
-        np.array(vertex.data["scale_1"] if "scale_1" in field_names else np.zeros(N), dtype=np.float32) +
-        np.array(vertex.data["scale_2"] if "scale_2" in field_names else np.zeros(N), dtype=np.float32)
-    ) / (1 + np.exp(-np.array(vertex.data["opacity"] if "opacity" in field_names else np.zeros(N), dtype=np.float32)))
+    sort_score = -(np.prod(scales, axis=-1) * opacity)
     order = np.argsort(sort_score)
 
     positions = positions[order]

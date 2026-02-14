@@ -139,11 +139,15 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Find the PLY file
+    # Find the trained Gaussian PLY (not raw input.ply)
     ply_path = None
-    for candidate in sorted(Path(args.model_path).rglob("*.ply")):
+    for candidate in sorted(Path(args.model_path).rglob("point_cloud/iteration_*/point_cloud.ply")):
         ply_path = str(candidate)
-        break
+    # Fallback to any PLY if specific pattern not found
+    if ply_path is None:
+        for candidate in sorted(Path(args.model_path).rglob("*.ply")):
+            ply_path = str(candidate)
+            break
 
     if ply_path is None:
         print(f"ERROR: No PLY file found in {args.model_path}")
