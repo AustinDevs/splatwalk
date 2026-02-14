@@ -25,7 +25,7 @@ if [ -n "$GITHUB_TOKEN" ]; then
     CURL_ARGS+=(-H "Authorization: token $GITHUB_TOKEN")
 fi
 
-for script in run_pipeline.sh render_descent.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py; do
+for script in run_pipeline.sh render_descent.py generate_ground_views.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py compress_splat.py; do
     if curl "${CURL_ARGS[@]}" "$BASE_URL/$script" -o "/opt/$script" 2>/dev/null; then
         echo "  Updated $script"
     else

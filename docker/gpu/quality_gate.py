@@ -44,7 +44,7 @@ def count_real_vs_synthetic(scene_images_dir):
             continue
         name = img_file.stem.lower()
         # Synthetic images from our pipeline have these prefixes
-        if name.startswith("descent_") or name.startswith("enhanced_"):
+        if name.startswith("descent_") or name.startswith("enhanced_") or name.startswith("groundgen_"):
             synthetic_count += 1
         else:
             real_count += 1

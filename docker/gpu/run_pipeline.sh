@@ -23,7 +23,7 @@ echo "Updating pipeline scripts from GitHub..."
 _CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
 [ -n "$GITHUB_TOKEN" ] && _CURL_ARGS+=(-H "Authorization: token $GITHUB_TOKEN")
 _BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/docker/gpu"
-for _script in render_descent.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py; do
+for _script in render_descent.py generate_ground_views.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py compress_splat.py; do
     if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/opt/$_script" 2>/dev/null; then
         echo "  Updated $_script"
     else
@@ -376,12 +376,33 @@ PREPROCESS_SCRIPT
         }
     notify_slack "Stage 3 complete: descended to ground level"
 
+    # Stage 3.5: ControlNet Ground View Generation
+    notify_slack "Stage 3.5: Generating photorealistic ground views (FLUX ControlNet)..."
+    echo "Stage 3.5: ControlNet ground-level view generation..."
+    python /opt/generate_ground_views.py \
+        --model_path "$OUTPUT_DIR/descent/final" \
+        --scene_path "$scene_dir" \
+        --output_dir "$OUTPUT_DIR/ground_views" \
+        --num_perimeter_views 40 \
+        --num_grid_views 32 \
+        --denoising_strength 0.55 \
+        --controlnet_scale 0.8 \
+        --retrain_iterations 3000 \
+        --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
+        --job_id "${JOB_ID:-}" \
+        || {
+            notify_slack "Failed at Stage 3.5: generate_ground_views.py" "error"
+            return 1
+        }
+    notify_slack "Stage 3.5 complete: ground views generated"
+    local stage3_output="$OUTPUT_DIR/ground_views/model"
+
     # Stage 4: Diffusion Enhancement (ViewCrafter) — optional, non-fatal
     notify_slack "Stage 4: Diffusion enhancement (ViewCrafter)..."
     echo "Stage 4/5: ViewCrafter diffusion enhancement..."
-    local final_model_path="$OUTPUT_DIR/descent/final"
+    local final_model_path="$stage3_output"
     if python /opt/enhance_with_viewcrafter.py \
-        --model_path "$OUTPUT_DIR/descent/final" \
+        --model_path "$stage3_output" \
         --scene_path "$scene_dir" \
         --output_dir "$OUTPUT_DIR/enhanced" \
         --viewcrafter_ckpt "/opt/ViewCrafter/checkpoints/ViewCrafter_25_512" \
@@ -415,7 +436,7 @@ convert_and_upload() {
     local ply_path="$1"
     local pipeline_name="$2"
 
-    echo "Converting PLY to .splat..."
+    echo "Compressing PLY to .spz..."
 
     # Find the PLY file
     if [ ! -f "$ply_path" ]; then
@@ -428,20 +449,24 @@ convert_and_upload() {
         return 1
     fi
 
-    local splat_path="$OUTPUT_DIR/output.splat"
+    local spz_path="$OUTPUT_DIR/output.spz"
+    local confidence_npy="$OUTPUT_DIR/walkable/per_gaussian_confidence.npy"
 
-    python /opt/convert_to_ksplat.py "$ply_path" "$splat_path" || return 1
+    python /opt/compress_splat.py \
+        "$ply_path" "$spz_path" \
+        --prune_ratio 0.3 \
+        --confidence_npy "$confidence_npy" || return 1
 
-    if [ ! -f "$splat_path" ]; then
-        echo "Error: .splat conversion failed"
+    if [ ! -f "$spz_path" ]; then
+        echo "Error: SPZ compression failed"
         return 1
     fi
 
     echo "Uploading results to Spaces..."
 
-    # Upload KSPLAT
-    local splat_key="jobs/$JOB_ID/output/$pipeline_name/scene.splat"
-    local splat_url=$(upload_to_spaces "$splat_path" "$splat_key" "application/octet-stream")
+    # Upload compressed splat
+    local splat_key="jobs/$JOB_ID/output/$pipeline_name/scene.spz"
+    local splat_url=$(upload_to_spaces "$spz_path" "$splat_key" "application/octet-stream")
 
     # Upload thumbnail if available
     local thumb_url=""
@@ -511,7 +536,7 @@ with open('$OUTPUT_DIR/manifest.json', 'w') as f: json.dump(m, f, indent=2)
 "
                     upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/walkable/manifest.json" "application/json"
                 fi
-                notify_slack "Pipeline complete! Splat URL: $SPACES_ENDPOINT/$SPACES_BUCKET/jobs/$JOB_ID/output/walkable/scene.splat" "success"
+                notify_slack "Pipeline complete! Splat uploaded to Spaces" "success"
             else
                 create_manifest "failed" "" "" "Walkable pipeline conversion/upload failed"
                 upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/walkable/manifest.json" "application/json"

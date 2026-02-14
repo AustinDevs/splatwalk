@@ -297,6 +297,46 @@ grep -rl "Image.ANTIALIAS" /opt/ViewCrafter/ 2>/dev/null | while read f; do
     echo "  Patched $f"
 done || echo "  No files needed patching"
 
+# --- Step 7.5: FLUX.1-dev + ControlNet + IP-Adapter for ground view generation ---
+echo ""
+echo "=== Step 7.5/12: FLUX.1-dev + ControlNet models ==="
+if python -c "import diffusers" 2>/dev/null; then
+    echo "diffusers already installed — skipping pip install"
+else
+    echo "Installing diffusers + accelerate..."
+    pip install --no-cache-dir diffusers accelerate safetensors sentencepiece protobuf 2>&1 | tail -3
+fi
+
+# Pre-download FLUX models (~25GB) so they're baked into the snapshot
+echo "Pre-downloading FLUX models (this takes a while)..."
+python -c "
+from diffusers import FluxControlNetImg2ImgPipeline, FluxControlNetModel
+import torch
+
+print('Downloading FLUX ControlNet-depth...')
+cn = FluxControlNetModel.from_pretrained(
+    'Xlabs-AI/flux-controlnet-depth-v3', torch_dtype=torch.bfloat16)
+
+print('Downloading FLUX.1-dev + pipeline...')
+pipe = FluxControlNetImg2ImgPipeline.from_pretrained(
+    'black-forest-labs/FLUX.1-dev', controlnet=cn,
+    torch_dtype=torch.bfloat16)
+
+print('Downloading FLUX IP-Adapter...')
+try:
+    pipe.load_ip_adapter(
+        'XLabs-AI/flux-ip-adapter', weight_name='ip_adapter.safetensors')
+    print('IP-Adapter downloaded.')
+except Exception as e:
+    print(f'IP-Adapter download failed (non-fatal): {e}')
+
+print('All FLUX models cached.')
+" || echo "WARNING: FLUX model pre-download failed (models will download at runtime)"
+
+# Install 3dgsconverter for SPZ compression
+echo "Installing 3dgsconverter..."
+pip install --no-cache-dir 3dgsconverter 2>&1 | tail -3 || echo "WARNING: 3dgsconverter install failed"
+
 # --- Step 8: Runtime Python packages ---
 echo ""
 echo "=== Step 8/12: Runtime Python packages ==="
@@ -330,7 +370,7 @@ fi
 
 if [ -n "$SCRIPT_DIR" ]; then
     echo "Copying pipeline scripts from $SCRIPT_DIR to /opt/..."
-    for script in entrypoint.sh run_pipeline.sh render_descent.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py; do
+    for script in entrypoint.sh run_pipeline.sh render_descent.py generate_ground_views.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py compress_splat.py; do
         if [ -f "$SCRIPT_DIR/$script" ]; then
             cp "$SCRIPT_DIR/$script" "/opt/$script"
             echo "  Copied $script"
@@ -359,6 +399,7 @@ import open3d; print(f'Open3D {open3d.__version__}')
 import trimesh; print(f'Trimesh {trimesh.__version__}')
 import kornia; print(f'Kornia {kornia.__version__}')
 import transformers; print(f'Transformers {transformers.__version__}')
+import diffusers; print(f'Diffusers {diffusers.__version__}')
 print('All imports OK')
 "
 
