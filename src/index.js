@@ -34,6 +34,46 @@ app.use(express.static(join(__dirname, 'public')));
 app.use('/api/jobs', jobsRouter);
 app.use('/', pagesRouter);
 
+// Proxy for splat files (bypasses COEP cross-origin restrictions)
+app.get('/api/splat-proxy', async (req, res) => {
+  const url = req.query.url;
+  if (!url || !url.startsWith('https://')) {
+    return res.status(400).json({ error: 'Missing or invalid url parameter' });
+  }
+  try {
+    const headers = {};
+    if (req.headers.range) headers.Range = req.headers.range;
+    const upstream = await fetch(url, { method: req.method === 'HEAD' ? 'HEAD' : 'GET', headers });
+    res.status(upstream.status);
+    if (upstream.headers.get('content-length')) res.setHeader('Content-Length', upstream.headers.get('content-length'));
+    if (upstream.headers.get('content-range')) res.setHeader('Content-Range', upstream.headers.get('content-range'));
+    if (upstream.headers.get('content-type')) res.setHeader('Content-Type', upstream.headers.get('content-type'));
+    if (req.method === 'HEAD') return res.end();
+    const reader = upstream.body.getReader();
+    const pump = async () => {
+      const { done, value } = await reader.read();
+      if (done) { res.end(); return; }
+      res.write(value);
+      await pump();
+    };
+    await pump();
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+app.head('/api/splat-proxy', async (req, res) => {
+  const url = req.query.url;
+  if (!url || !url.startsWith('https://')) return res.status(400).end();
+  try {
+    const upstream = await fetch(url, { method: 'HEAD' });
+    if (upstream.headers.get('content-length')) res.setHeader('Content-Length', upstream.headers.get('content-length'));
+    res.status(upstream.status).end();
+  } catch (e) {
+    res.status(502).end();
+  }
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
