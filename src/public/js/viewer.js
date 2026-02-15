@@ -15,10 +15,12 @@ let movement = { x: 0, y: 0 };
 let isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 let joystick = null;
 
-// Compute scene bounds by sampling the .splat binary
+// Compute scene bounds by sampling the .splat binary (only works for .splat format)
 async function computeSceneBounds(splatUrl) {
+  // Only works for .splat format (32 bytes/record); skip for .ply files
+  if (!splatUrl.toLowerCase().endsWith('.splat')) return null;
+
   try {
-    // Use same-origin proxy to bypass COEP cross-origin restrictions
     const proxyUrl = `/api/splat-proxy?url=${encodeURIComponent(splatUrl)}`;
 
     const headResp = await fetch(proxyUrl, { method: 'HEAD' });
@@ -85,10 +87,10 @@ function computeCameraFromBounds(bounds) {
   const cameraUp = [0, 0, 0];
   cameraUp[minAxisIdx] = 1;
 
-  // Place camera along the thin axis, offset at a 30° angle from above
-  const distance = maxDim * 1.5;
+  // Place camera along the thin axis, looking down at the scene
+  const distance = maxDim * 2.5;
   const camPos = [...center];
-  camPos[minAxisIdx] += distance * 0.5; // Above the scene along thin axis
+  camPos[minAxisIdx] += distance * 0.8; // Well above the scene along thin axis
 
   // Also offset along the longest ground axis for a 3/4 view
   const groundAxes = [0, 1, 2].filter(i => i !== minAxisIdx);
@@ -119,6 +121,9 @@ async function initViewer(splatUrl) {
       camConfig = computeCameraFromBounds(bounds);
     }
 
+    // Detect format for SH support
+    const isPly = splatUrl.toLowerCase().endsWith('.ply');
+
     viewer = new GaussianSplats3D.Viewer({
       cameraUp: camConfig.up,
       initialCameraPosition: camConfig.position,
@@ -126,6 +131,12 @@ async function initViewer(splatUrl) {
       selfDrivenMode: true,
       useBuiltInControls: !isMobile,
       rootElement: canvas,
+      sphericalHarmonicsDegree: isPly ? 2 : 0,
+      gpuAcceleratedSort: true,
+      antialiased: true,
+      kernel2DSize: 0.3,
+      logLevel: 1,
+      sceneFadeInRateMultiplier: 5.0,
     });
 
     camera = viewer.camera;
@@ -146,12 +157,16 @@ async function initViewer(splatUrl) {
       });
     }
 
+    // Compute movement speed based on scene size
+    const sceneSize = bounds ? Math.max(bounds.size[0], bounds.size[1], bounds.size[2]) : 5;
+    const moveSpeed = sceneSize * 0.05;
+
     // Start animation loop for mobile
     if (isMobile) {
-      initJoystick();
-      animateMovement();
+      initJoystick(moveSpeed);
+      animateMovement(moveSpeed);
     } else {
-      initKeyboardControls();
+      initKeyboardControls(moveSpeed);
     }
   } catch (err) {
     console.error('Failed to load splat:', err);
@@ -159,8 +174,8 @@ async function initViewer(splatUrl) {
   }
 }
 
-function initKeyboardControls() {
-  const speed = 0.1;
+function initKeyboardControls(speed) {
+  speed = speed || 0.25;
 
   document.addEventListener('keydown', function(e) {
     if (!camera) return;
@@ -188,7 +203,7 @@ function initKeyboardControls() {
   });
 }
 
-function initJoystick() {
+function initJoystick(speed) {
   joystick = nipplejs.create({
     zone: joystickZone,
     mode: 'static',
@@ -211,8 +226,8 @@ function initJoystick() {
   });
 }
 
-function animateMovement() {
-  const speed = 0.05;
+function animateMovement(speed) {
+  speed = (speed || 0.25) * 0.1;
 
   function animate() {
     if (camera && (movement.x !== 0 || movement.y !== 0)) {

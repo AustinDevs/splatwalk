@@ -6,14 +6,17 @@ Generates photorealistic ground-level training images using FLUX.1-dev with
 ControlNet-depth conditioning and IP-Adapter aerial texture matching.
 
 Pipeline:
-  1. Generate ground-level camera poses (perimeter walk + interior grid)
-  2. Render blurry RGB + depth maps from existing splat at those poses
-  3. Extract aerial crops nearest each ground camera for IP-Adapter conditioning
-  4. Generate photorealistic views with FLUX.1-dev + ControlNet-depth + IP-Adapter
-  5. Add generated images to training set and retrain splat
+  1. Extract GPS from EXIF + geographic enrichment (species, hardiness zone)
+  2. Generate scene description via Gemini API (falls back to BLIP)
+  3. Generate ground-level camera poses (perimeter walk + interior grid)
+  4. Render blurry RGB + depth maps from existing splat at those poses
+  5. Extract aerial crops nearest each ground camera for IP-Adapter conditioning
+  6. Generate photorealistic views with FLUX.1-dev + ControlNet-depth + IP-Adapter
+  7. Add generated images to training set and retrain splat
 """
 
 import argparse
+import io
 import json
 import os
 import shutil
@@ -51,6 +54,341 @@ def notify_slack(message, webhook_url, job_id, status="info"):
     except Exception:
         pass
 
+
+# ---------------------------------------------------------------------------
+# EXIF GPS extraction
+# ---------------------------------------------------------------------------
+
+def extract_gps_from_images(scene_images_dir):
+    """Extract GPS coordinates from EXIF data of drone images.
+
+    Returns (lat, lon, altitude_m) or (None, None, None) if no GPS found.
+    """
+    from PIL import ExifTags
+
+    GPS_TAGS = {v: k for k, v in ExifTags.GPSTAGS.items()}
+
+    def _dms_to_decimal(dms, ref):
+        """Convert EXIF DMS (degrees, minutes, seconds) to decimal degrees."""
+        degrees = float(dms[0])
+        minutes = float(dms[1])
+        seconds = float(dms[2])
+        decimal = degrees + minutes / 60.0 + seconds / 3600.0
+        if ref in ("S", "W"):
+            decimal = -decimal
+        return decimal
+
+    aerial_files = []
+    for img_file in sorted(Path(scene_images_dir).glob("*")):
+        if img_file.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+            name = img_file.stem.lower()
+            if not (name.startswith("descent_") or name.startswith("enhanced_") or name.startswith("groundgen_")):
+                aerial_files.append(img_file)
+
+    for img_file in aerial_files:
+        try:
+            img = Image.open(img_file)
+            exif_data = img._getexif()
+            if not exif_data:
+                continue
+
+            gps_info = exif_data.get(ExifTags.Base.GPSInfo)
+            if not gps_info:
+                continue
+
+            # Decode GPS tags
+            gps = {}
+            for tag_id, value in gps_info.items():
+                tag_name = ExifTags.GPSTAGS.get(tag_id, tag_id)
+                gps[tag_name] = value
+
+            if "GPSLatitude" not in gps or "GPSLongitude" not in gps:
+                continue
+
+            lat = _dms_to_decimal(gps["GPSLatitude"], gps.get("GPSLatitudeRef", "N"))
+            lon = _dms_to_decimal(gps["GPSLongitude"], gps.get("GPSLongitudeRef", "W"))
+
+            # Extract altitude if available
+            altitude = None
+            if "GPSAltitude" in gps:
+                altitude = float(gps["GPSAltitude"])
+                if gps.get("GPSAltitudeRef", b'\x00') == b'\x01':
+                    altitude = -altitude
+
+            print(f"  EXIF GPS: {lat:.4f}, {lon:.4f}" + (f", alt={altitude:.1f}m" if altitude else ""))
+            return lat, lon, altitude
+
+        except Exception:
+            continue
+
+    print("  No EXIF GPS found in images")
+    return None, None, None
+
+
+# ---------------------------------------------------------------------------
+# Geographic enrichment
+# ---------------------------------------------------------------------------
+
+def get_geographic_context(lat, lon, google_maps_key=None):
+    """Build geographic context string from coordinates using external APIs.
+
+    Returns a context string for Gemini prompt, or empty string on failure.
+    """
+    import urllib.request
+
+    context_parts = []
+    zip_code = None
+
+    # Google Maps Geocoding
+    if google_maps_key:
+        try:
+            url = f"https://maps.googleapis.com/maps/api/geocode/json?latlng={lat},{lon}&key={google_maps_key}"
+            req = urllib.request.Request(url)
+            resp = urllib.request.urlopen(req, timeout=5)
+            data = json.loads(resp.read().decode())
+            if data.get("results"):
+                address = data["results"][0].get("formatted_address", "")
+                if address:
+                    context_parts.append(f"Location: {address}")
+                # Extract ZIP code
+                for component in data["results"][0].get("address_components", []):
+                    if "postal_code" in component.get("types", []):
+                        zip_code = component["long_name"]
+                        break
+        except Exception as e:
+            print(f"  Geocoding failed: {e}")
+
+    # USDA Hardiness Zone (requires ZIP code)
+    if zip_code:
+        try:
+            url = f"https://phzmapi.org/{zip_code}.json"
+            req = urllib.request.Request(url)
+            resp = urllib.request.urlopen(req, timeout=5)
+            data = json.loads(resp.read().decode())
+            zone = data.get("zone", "")
+            if zone:
+                temp_range = data.get("temperature_range", "")
+                zone_str = f"USDA Hardiness Zone: {zone}"
+                if temp_range:
+                    zone_str += f" ({temp_range})"
+                context_parts.append(zone_str)
+        except Exception as e:
+            print(f"  Hardiness zone lookup failed: {e}")
+
+    # Current weather from Open-Meteo
+    try:
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
+        req = urllib.request.Request(url)
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read().decode())
+        weather = data.get("current_weather", {})
+        temp_c = weather.get("temperature")
+        if temp_c is not None:
+            temp_f = temp_c * 9 / 5 + 32
+            context_parts.append(f"Current temperature: {temp_c:.0f}°C ({temp_f:.0f}°F)")
+    except Exception as e:
+        print(f"  Weather lookup failed: {e}")
+
+    context = "\n".join(context_parts)
+    if context:
+        print(f"  Geographic context:\n    " + context.replace("\n", "\n    "))
+    return context
+
+
+def get_ground_elevation(lat, lon):
+    """Get ground elevation in meters from Open-Meteo API."""
+    import urllib.request
+
+    try:
+        url = f"https://api.open-meteo.com/v1/elevation?latitude={lat}&longitude={lon}"
+        req = urllib.request.Request(url)
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read().decode())
+        elev = data.get("elevation")
+        if elev is not None:
+            if isinstance(elev, list):
+                elev = elev[0]
+            return float(elev)
+    except Exception as e:
+        print(f"  Ground elevation lookup failed: {e}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Gemini API captioning (replaces BLIP)
+# ---------------------------------------------------------------------------
+
+def caption_aerial_scene(scene_images_dir, lat=None, lon=None, google_maps_key=None):
+    """Generate a rich scene description using Gemini 2.5 Flash API.
+
+    Falls back to BLIP if Gemini API is unavailable.
+    """
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if not gemini_key:
+        print("  No GEMINI_API_KEY, falling back to BLIP captioning")
+        return _caption_with_blip(scene_images_dir)
+
+    try:
+        from google import genai
+    except ImportError:
+        print("  google-genai not installed, falling back to BLIP captioning")
+        return _caption_with_blip(scene_images_dir)
+
+    # Build geographic context
+    geo_context = ""
+    if lat is not None and lon is not None:
+        geo_context = get_geographic_context(lat, lon, google_maps_key)
+
+    # Select 3 representative aerial images
+    aerial_files = []
+    for img_file in sorted(Path(scene_images_dir).glob("*")):
+        if img_file.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+            name = img_file.stem.lower()
+            if not (name.startswith("descent_") or name.startswith("enhanced_") or name.startswith("groundgen_")):
+                aerial_files.append(img_file)
+
+    if not aerial_files:
+        print("  No aerial images found for captioning")
+        return _caption_with_blip(scene_images_dir)
+
+    sample = aerial_files[:: max(1, len(aerial_files) // 3)][:3]
+
+    # Prepare images for API (convert MPO to RGB JPEG, resize to 1024px max)
+    image_parts = []
+    for img_file in sample:
+        try:
+            img = Image.open(img_file).convert("RGB")
+            # Resize to 1024px max dimension
+            max_dim = max(img.size)
+            if max_dim > 1024:
+                scale = 1024 / max_dim
+                img = img.resize((int(img.size[0] * scale), int(img.size[1] * scale)), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            buf.seek(0)
+            image_parts.append(buf.getvalue())
+        except Exception as e:
+            print(f"  Failed to prepare {img_file.name}: {e}")
+
+    if not image_parts:
+        return _caption_with_blip(scene_images_dir)
+
+    # Build prompt
+    geo_section = f"\nGeographic context:\n{geo_context}\n" if geo_context else ""
+    prompt = f"""You are analyzing aerial drone photographs of a property to generate a detailed description for AI image generation of ground-level photorealistic views.
+{geo_section}
+Analyze these images and provide:
+1. SCENE DESCRIPTION: Trees, grass, ground cover, structures, paths, terrain, water.
+2. FLORA IDENTIFICATION: Specific species based on imagery + geographic location.
+3. FLUX PROMPT: A single dense paragraph for AI image generation — include specific plant species, materials, lighting, atmosphere. Ground-level perspective."""
+
+    try:
+        client = genai.Client(api_key=gemini_key)
+
+        # Build contents: text prompt + images
+        contents = [prompt]
+        for img_bytes in image_parts:
+            contents.append(genai.types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+        )
+
+        text = response.text
+        print(f"  Gemini response ({len(text)} chars)")
+
+        # Extract FLUX PROMPT section
+        flux_prompt = _extract_flux_prompt(text)
+        if flux_prompt:
+            print(f"  FLUX prompt: {flux_prompt[:120]}...")
+            return flux_prompt
+        else:
+            # Use the full response as prompt if we can't extract the section
+            print(f"  Using full Gemini response as prompt")
+            return text[:500]
+
+    except Exception as e:
+        print(f"  Gemini API failed ({e}), falling back to BLIP captioning")
+        return _caption_with_blip(scene_images_dir)
+
+
+def _extract_flux_prompt(text):
+    """Extract the FLUX PROMPT section from Gemini response."""
+    # Look for "FLUX PROMPT:" or "3. FLUX PROMPT:" section
+    markers = ["FLUX PROMPT:", "3. FLUX PROMPT", "**FLUX PROMPT**", "**3. FLUX PROMPT**"]
+    for marker in markers:
+        idx = text.upper().find(marker.upper())
+        if idx != -1:
+            # Extract everything after the marker
+            after = text[idx + len(marker):].strip()
+            # Remove leading colon/asterisks
+            after = after.lstrip(":* \n")
+            # Take until next section header or end
+            lines = []
+            for line in after.split("\n"):
+                stripped = line.strip()
+                # Stop at next numbered section or empty separator
+                if stripped and (stripped[0].isdigit() and "." in stripped[:3]):
+                    break
+                if stripped.startswith("---"):
+                    break
+                lines.append(line)
+            result = " ".join(l.strip() for l in lines if l.strip())
+            # Clean up any remaining markdown
+            result = result.replace("**", "").replace("*", "").strip('"').strip()
+            if len(result) > 50:
+                return result
+    return None
+
+
+def _caption_with_blip(scene_images_dir):
+    """Fallback: Auto-generate a scene prompt using BLIP."""
+    from PIL import Image as PILImage
+
+    try:
+        from transformers import pipeline
+
+        captioner = pipeline("image-to-text", model="Salesforce/blip-image-captioning-base", device=0)
+
+        aerial_files = []
+        for img_file in sorted(Path(scene_images_dir).glob("*")):
+            if img_file.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                name = img_file.stem.lower()
+                if not (name.startswith("descent_") or name.startswith("enhanced_") or name.startswith("groundgen_")):
+                    aerial_files.append(img_file)
+
+        sample = aerial_files[:: max(1, len(aerial_files) // 5)][:5]
+        captions = []
+        for img_file in sample:
+            img = PILImage.open(img_file).convert("RGB")
+            result = captioner(img, max_new_tokens=50)
+            captions.append(result[0]["generated_text"])
+
+        del captioner
+        import torch
+        torch.cuda.empty_cache()
+
+        combined = ", ".join(captions)
+        prompt = (
+            f"photorealistic ground-level view of outdoor property, "
+            f"based on aerial observation: {combined}, "
+            f"natural lighting, high detail, 4k photography"
+        )
+        print(f"  BLIP-captioned prompt: {prompt[:100]}...")
+        return prompt
+
+    except Exception as e:
+        print(f"  BLIP captioning failed ({e}), using generic prompt")
+        return (
+            "photorealistic ground-level view of outdoor property with grass, "
+            "trees, buildings, natural lighting, high detail, 4k photography"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Point cloud and camera loading
+# ---------------------------------------------------------------------------
 
 def load_point_cloud(model_path):
     """Load PLY point cloud and return positions."""
@@ -173,7 +511,11 @@ def _load_poses_txt(images_path):
     return poses
 
 
-def generate_ground_cameras(poses, positions, ground_z):
+# ---------------------------------------------------------------------------
+# Ground camera generation
+# ---------------------------------------------------------------------------
+
+def generate_ground_cameras(poses, positions, ground_z, num_perimeter=20, num_grid=12):
     """
     Generate ground-level camera poses with two strategies:
     1. Perimeter walk: cameras along convex hull looking inward
@@ -202,10 +544,8 @@ def generate_ground_cameras(poses, positions, ground_z):
         hull = ConvexHull(drone_xy)
         hull_points = drone_xy[hull.vertices]
     except Exception:
-        # Fallback: use all drone XY positions
         hull_points = drone_xy
 
-    num_perimeter = min(40, len(hull_points) * 4)
     # Interpolate along hull perimeter
     perimeter_points = []
     for i in range(len(hull_points)):
@@ -215,13 +555,11 @@ def generate_ground_cameras(poses, positions, ground_z):
         for t in np.linspace(0, 1, n_interp, endpoint=False):
             perimeter_points.append(p1 + t * (p2 - p1))
 
-    for idx, pt in enumerate(perimeter_points[:40]):
-        # Look toward scene center
+    for idx, pt in enumerate(perimeter_points[:num_perimeter]):
         look_dir = scene_center_xy - pt
         look_dir = look_dir / (np.linalg.norm(look_dir) + 1e-8)
         yaw = np.arctan2(look_dir[1], look_dir[0])
 
-        # Horizontal look direction (slight downward tilt)
         R = Rotation.from_euler("zyx", [yaw, -5, 0], degrees=True).as_matrix()
         center = np.array([pt[0], pt[1], eye_z])
         t_vec = -R @ center
@@ -238,20 +576,18 @@ def generate_ground_cameras(poses, positions, ground_z):
     xy_max = drone_xy.max(axis=0)
     xy_range = xy_max - xy_min
 
-    # Create grid points
-    n_grid_x = max(2, int(np.sqrt(32 * xy_range[0] / (xy_range[1] + 1e-8))))
-    n_grid_y = max(2, 32 // n_grid_x)
+    n_grid_x = max(2, int(np.sqrt(num_grid * xy_range[0] / (xy_range[1] + 1e-8))))
+    n_grid_y = max(2, num_grid // n_grid_x)
     grid_x = np.linspace(xy_min[0] + 0.1 * xy_range[0], xy_max[0] - 0.1 * xy_range[0], n_grid_x)
     grid_y = np.linspace(xy_min[1] + 0.1 * xy_range[1], xy_max[1] - 0.1 * xy_range[1], n_grid_y)
 
-    cardinal_yaws = [0, np.pi / 2, np.pi, 3 * np.pi / 2]  # N, E, S, W
+    cardinal_yaws = [0, np.pi / 2, np.pi, 3 * np.pi / 2]
     grid_count = 0
 
     for gx in grid_x:
         for gy in grid_y:
-            if grid_count >= 32:
+            if grid_count >= num_grid:
                 break
-            # Pick 2 cardinal directions per grid point
             for yaw in cardinal_yaws[:2]:
                 R = Rotation.from_euler("zyx", [yaw, -5, 0], degrees=True).as_matrix()
                 center = np.array([gx, gy, eye_z])
@@ -264,31 +600,34 @@ def generate_ground_cameras(poses, positions, ground_z):
                     "camera_type": "grid",
                 })
                 grid_count += 1
-                if grid_count >= 32:
+                if grid_count >= num_grid:
                     break
 
+    perimeter_actual = len(perimeter_points[:num_perimeter])
     print(f"  Generated {len(ground_poses)} ground cameras "
-          f"({len(perimeter_points[:40])} perimeter + {grid_count} grid)")
+          f"({perimeter_actual} perimeter + {grid_count} grid)")
     return ground_poses
 
+
+# ---------------------------------------------------------------------------
+# Depth and RGB rendering
+# ---------------------------------------------------------------------------
 
 def render_depth_and_rgb(model_path, cameras, output_dir, scene_path):
     """
     Render blurry RGB and depth maps at each ground camera pose.
     RGB: rendered from current Gaussian splat
-    Depth: estimated via MiDaS/DPT from the blurry render
+    Depth: estimated via Depth-Anything-V2 from the blurry render
     """
     rgb_dir = os.path.join(output_dir, "rgb")
     depth_dir = os.path.join(output_dir, "depth")
     os.makedirs(rgb_dir, exist_ok=True)
     os.makedirs(depth_dir, exist_ok=True)
 
-    # Render RGB from Gaussian splat
     print("  Rendering blurry RGB from splat model...")
     _render_rgb_from_splat(model_path, cameras, rgb_dir, scene_path)
 
-    # Estimate depth from rendered RGB using MiDaS
-    print("  Estimating depth maps with MiDaS...")
+    print("  Estimating depth maps with Depth-Anything-V2...")
     _estimate_depth_maps(rgb_dir, depth_dir)
 
     return rgb_dir, depth_dir
@@ -299,7 +638,7 @@ def _render_rgb_from_splat(model_path, cameras, output_dir, scene_path):
     import torch
     from PIL import Image as PILImage
 
-    sys.path.insert(0, "/opt/InstantSplat")
+    sys.path.insert(0, "/mnt/splatwalk/InstantSplat")
     from gaussian_renderer import render
     from scene import GaussianModel
     from argparse import Namespace
@@ -333,12 +672,9 @@ def _render_rgb_from_splat(model_path, cameras, output_dir, scene_path):
             uid=idx,
         )
 
-        # InstantSplat's render() requires camera_pose as a 7-element tensor
-        # [qw, qx, qy, qz, tx, ty, tz] representing the w2c transform.
-        # cam["rotation"] is already the w2c rotation matrix (from COLMAP quaternion).
         quat = SciRotation.from_matrix(cam["rotation"]).as_quat()  # [x,y,z,w] scipy
         camera_pose = torch.tensor(
-            [quat[3], quat[0], quat[1], quat[2],  # wxyz
+            [quat[3], quat[0], quat[1], quat[2],
              cam["translation"][0], cam["translation"][1], cam["translation"][2]],
             dtype=torch.float32,
         ).cuda()
@@ -351,26 +687,28 @@ def _render_rgb_from_splat(model_path, cameras, output_dir, scene_path):
         img_pil = PILImage.fromarray(img_np)
         img_pil.save(os.path.join(output_dir, f"groundgen_{idx:03d}.jpg"), "JPEG", quality=95)
 
-    # Free GPU memory
     del gaussians
     torch.cuda.empty_cache()
     print(f"  Rendered {len(cameras)} ground-level RGB views")
 
 
 def _estimate_depth_maps(rgb_dir, depth_dir):
-    """Estimate depth maps from RGB images using MiDaS via transformers."""
+    """Estimate depth maps from RGB images using Depth-Anything-V2."""
     import torch
     from PIL import Image as PILImage
     from transformers import pipeline
 
-    depth_estimator = pipeline("depth-estimation", model="Intel/dpt-large", device=0)
+    depth_estimator = pipeline(
+        "depth-estimation",
+        model="depth-anything/Depth-Anything-V2-Large-hf",
+        device=0,
+    )
 
     for img_file in sorted(Path(rgb_dir).glob("*.jpg")):
         img = PILImage.open(img_file).convert("RGB")
         result = depth_estimator(img)
         depth_map = result["depth"]
 
-        # Convert to PIL image (already is for pipeline output)
         if not isinstance(depth_map, PILImage.Image):
             depth_arr = np.array(depth_map)
             depth_norm = ((depth_arr - depth_arr.min()) / (depth_arr.max() - depth_arr.min() + 1e-8) * 255).astype(np.uint8)
@@ -379,70 +717,78 @@ def _estimate_depth_maps(rgb_dir, depth_dir):
         depth_map = depth_map.resize((1024, 1024), PILImage.LANCZOS)
         depth_map.save(os.path.join(depth_dir, img_file.name), "JPEG", quality=95)
 
-    # Free depth model
     del depth_estimator
     torch.cuda.empty_cache()
     print(f"  Generated {len(list(Path(depth_dir).glob('*.jpg')))} depth maps")
 
 
-def caption_aerial_scene(scene_images_dir):
-    """Auto-generate a scene prompt from representative aerial images using BLIP."""
+# ---------------------------------------------------------------------------
+# IP-Adapter: aerial crop extraction
+# ---------------------------------------------------------------------------
+
+def extract_nearest_aerial_crop(camera, poses, scene_images_dir):
+    """For a ground camera, find the nearest aerial image by XY distance
+    and return a center-cropped PIL Image for IP-Adapter reference."""
     from PIL import Image as PILImage
 
+    cam_xy = camera["center"][:2]
+
+    # Find nearest aerial pose by XY distance
+    min_dist = float("inf")
+    nearest_name = None
+    for pose in poses:
+        dist = np.linalg.norm(pose["center"][:2] - cam_xy)
+        if dist < min_dist:
+            min_dist = dist
+            nearest_name = pose["image_name"]
+
+    if nearest_name is None:
+        return None
+
+    img_path = os.path.join(scene_images_dir, nearest_name)
+    if not os.path.exists(img_path):
+        # Try without extension
+        for ext in [".jpg", ".jpeg", ".png"]:
+            candidate = os.path.join(scene_images_dir, Path(nearest_name).stem + ext)
+            if os.path.exists(candidate):
+                img_path = candidate
+                break
+        else:
+            return None
+
     try:
-        from transformers import pipeline
-
-        captioner = pipeline("image-to-text", model="Salesforce/blip-image-captioning-base", device=0)
-
-        aerial_files = []
-        for img_file in sorted(Path(scene_images_dir).glob("*")):
-            if img_file.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-                name = img_file.stem.lower()
-                if not (name.startswith("descent_") or name.startswith("enhanced_") or name.startswith("groundgen_")):
-                    aerial_files.append(img_file)
-
-        # Sample up to 5 representative images
-        sample = aerial_files[:: max(1, len(aerial_files) // 5)][:5]
-        captions = []
-        for img_file in sample:
-            img = PILImage.open(img_file).convert("RGB")
-            result = captioner(img, max_new_tokens=50)
-            captions.append(result[0]["generated_text"])
-
-        del captioner
-        import torch
-        torch.cuda.empty_cache()
-
-        # Combine captions into a prompt
-        combined = ", ".join(captions)
-        prompt = (
-            f"photorealistic ground-level view of outdoor property, "
-            f"based on aerial observation: {combined}, "
-            f"natural lighting, high detail, 4k photography"
-        )
-        print(f"  Auto-captioned prompt: {prompt[:100]}...")
-        return prompt
-
-    except Exception as e:
-        print(f"  BLIP captioning failed ({e}), using generic prompt")
-        return (
-            "photorealistic ground-level view of outdoor property with grass, "
-            "trees, buildings, natural lighting, high detail, 4k photography"
-        )
+        img = PILImage.open(img_path).convert("RGB")
+        # Center crop (most relevant ground texture)
+        w, h = img.size
+        crop_size = min(w, h)
+        left = (w - crop_size) // 2
+        top = (h - crop_size) // 2
+        img = img.crop((left, top, left + crop_size, top + crop_size))
+        img = img.resize((512, 512), PILImage.LANCZOS)
+        return img
+    except Exception:
+        return None
 
 
-def generate_with_flux(depth_dir, rgb_dir, prompt, output_dir,
-                       denoising_strength=0.55, controlnet_scale=0.8):
+# ---------------------------------------------------------------------------
+# FLUX generation with IP-Adapter
+# ---------------------------------------------------------------------------
+
+def generate_with_flux(depth_dir, rgb_dir, prompt, output_dir, poses, scene_images_dir,
+                       ground_cameras, denoising_strength=0.85, controlnet_scale=0.4,
+                       output_size=384):
     """
-    Generate photorealistic ground views using FLUX.1-dev with ControlNet-depth.
-    Uses img2img (blurry render as init) + depth ControlNet (geometry preservation).
+    Generate photorealistic ground views using FLUX.1-dev with ControlNet-depth
+    and XLabs IP-Adapter for aerial texture matching.
+
+    Uses FluxControlNetPipeline (txt2img + ControlNet) which supports IP-Adapter,
+    unlike FluxControlNetImg2ImgPipeline which does not.
     """
     import torch
     from PIL import Image as PILImage
-    from diffusers import FluxControlNetImg2ImgPipeline, FluxControlNetModel
+    from diffusers import FluxControlNetPipeline, FluxControlNetModel
 
     # Monkey-patch: PyTorch 2.4 doesn't support enable_gqa in scaled_dot_product_attention
-    # (added in PyTorch 2.5). Strip it so FLUX attention works on our snapshot.
     _orig_sdpa = torch.nn.functional.scaled_dot_product_attention
     def _patched_sdpa(*args, **kwargs):
         kwargs.pop('enable_gqa', None)
@@ -456,45 +802,80 @@ def generate_with_flux(depth_dir, rgb_dir, prompt, output_dir,
         "XLabs-AI/flux-controlnet-depth-diffusers",
         torch_dtype=torch.bfloat16,
     )
-    pipe = FluxControlNetImg2ImgPipeline.from_pretrained(
+    pipe = FluxControlNetPipeline.from_pretrained(
         "black-forest-labs/FLUX.1-dev",
         controlnet=controlnet,
         torch_dtype=torch.bfloat16,
     )
     pipe.to("cuda")
 
+    # Load XLabs IP-Adapter (works with FluxControlNetPipeline, unlike InstantX)
+    ip_adapter_loaded = False
+    try:
+        print("  Loading XLabs IP-Adapter v2 for aerial texture matching...")
+        pipe.load_ip_adapter(
+            "XLabs-AI/flux-ip-adapter-v2",
+            weight_name="ip_adapter.safetensors",
+            image_encoder_pretrained_model_name_or_path="openai/clip-vit-large-patch14",
+        )
+        pipe.set_ip_adapter_scale(0.6)
+        ip_adapter_loaded = True
+        print("  IP-Adapter loaded (scale=0.6)")
+    except Exception as e:
+        print(f"  IP-Adapter loading failed ({e}), continuing without it")
+
     depth_files = sorted(Path(depth_dir).glob("*.jpg"))
     rgb_files = sorted(Path(rgb_dir).glob("*.jpg"))
 
+    generated_count = 0
     for idx, (depth_file, rgb_file) in enumerate(zip(depth_files, rgb_files)):
-        depth_map = PILImage.open(depth_file).convert("RGB").resize((1024, 1024), PILImage.LANCZOS)
         blurry_render = PILImage.open(rgb_file).convert("RGB").resize((1024, 1024), PILImage.LANCZOS)
 
-        result = pipe(
+        # Skip very dark renders (camera pointing into void)
+        avg_brightness = np.array(blurry_render).mean()
+        if avg_brightness < 20:
+            print(f"  Skipping view {idx} (too dark, brightness={avg_brightness:.1f})")
+            continue
+
+        depth_map = PILImage.open(depth_file).convert("RGB").resize((1024, 1024), PILImage.LANCZOS)
+
+        gen_kwargs = dict(
             prompt=prompt,
-            image=blurry_render,
             control_image=depth_map,
-            strength=denoising_strength,
             controlnet_conditioning_scale=controlnet_scale,
             num_inference_steps=28,
-            guidance_scale=3.5,
+            guidance_scale=4.0,
             height=1024,
             width=1024,
-        ).images[0]
+        )
 
-        # Save at 512x512 to match training image size
-        result = result.resize((512, 512), PILImage.LANCZOS)
-        result.save(os.path.join(output_dir, f"groundgen_{idx:03d}.jpg"), "JPEG", quality=95)
+        # Add IP-Adapter reference from nearest aerial image
+        if ip_adapter_loaded and idx < len(ground_cameras):
+            aerial_crop = extract_nearest_aerial_crop(
+                ground_cameras[idx], poses, scene_images_dir
+            )
+            if aerial_crop is not None:
+                gen_kwargs["ip_adapter_image"] = aerial_crop
 
-        if (idx + 1) % 10 == 0:
-            print(f"  Generated {idx + 1}/{len(depth_files)} views")
+        result = pipe(**gen_kwargs).images[0]
 
-    print(f"  Generated {len(depth_files)} photorealistic ground views")
+        # Save at reduced size (implicitly down-weighted vs real 512x512 aerials)
+        result = result.resize((output_size, output_size), PILImage.LANCZOS)
+        result.save(os.path.join(output_dir, f"groundgen_{generated_count:03d}.jpg"), "JPEG", quality=95)
+        generated_count += 1
 
-    # Free VRAM
+        if generated_count % 10 == 0:
+            print(f"  Generated {generated_count} views (processed {idx + 1}/{len(depth_files)})")
+
+    print(f"  Generated {generated_count} photorealistic ground views ({output_size}x{output_size})")
+
     del pipe, controlnet
     torch.cuda.empty_cache()
 
+
+# ---------------------------------------------------------------------------
+# Scene integration and retraining
+# ---------------------------------------------------------------------------
 
 def add_images_to_scene(generated_dir, scene_path):
     """Copy generated images into the scene's training images directory."""
@@ -516,7 +897,6 @@ def write_colmap_cameras(cameras, scene_path):
     import struct
     from scipy.spatial.transform import Rotation
 
-    # Find the sparse directory
     sparse_dir = None
     for sd in sorted(Path(scene_path).glob("sparse_*/0")):
         if (sd / "images.bin").exists() or (sd / "images.txt").exists():
@@ -537,7 +917,6 @@ def write_colmap_cameras(cameras, scene_path):
     images_txt = sparse_dir / "images.txt"
     cameras_txt = sparse_dir / "cameras.txt"
 
-    # Step 1: Convert images.bin to images.txt if binary exists
     existing_entries = []
     max_image_id = 0
     camera_id = 1
@@ -566,8 +945,25 @@ def write_colmap_cameras(cameras, scene_path):
                 max_image_id = max(max_image_id, image_id)
                 camera_id = cam_id
         print(f"  Converted {len(existing_entries)} cameras from images.bin to text")
+    elif images_txt.exists():
+        # Read existing entries from text format (v4+ uses text-only COLMAP)
+        with open(str(images_txt), "r") as f:
+            lines = f.readlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith("#") or not line:
+                i += 1
+                continue
+            parts = line.split()
+            if len(parts) >= 10:
+                image_id = int(parts[0])
+                max_image_id = max(max_image_id, image_id)
+                camera_id = int(parts[8])
+                existing_entries.append(line + "\n\n")
+            i += 1
+        print(f"  Read {len(existing_entries)} existing cameras from images.txt")
 
-    # Step 2: Convert cameras.bin to cameras.txt if binary exists
     if cameras_bin.exists():
         camera_entries = []
         with open(str(cameras_bin), "rb") as f:
@@ -577,8 +973,6 @@ def write_colmap_cameras(cameras, scene_path):
                 model_id = struct.unpack("<i", f.read(4))[0]
                 width = struct.unpack("<Q", f.read(8))[0]
                 height = struct.unpack("<Q", f.read(8))[0]
-                # Number of params depends on camera model
-                # PINHOLE=1: fx,fy,cx,cy (4 params), SIMPLE_PINHOLE=0: f,cx,cy (3 params)
                 num_params = {0: 3, 1: 4, 2: 4, 3: 5, 4: 4, 5: 5}.get(model_id, 4)
                 params = struct.unpack(f"<{num_params}d", f.read(num_params * 8))
                 model_name = {0: "SIMPLE_PINHOLE", 1: "PINHOLE", 2: "SIMPLE_RADIAL",
@@ -595,54 +989,78 @@ def write_colmap_cameras(cameras, scene_path):
         print(f"  Converted {len(camera_entries)} camera models to cameras.txt")
         cameras_bin.unlink()
 
-    # Step 3: Write all images (existing + ground) to images.txt
+    # Only write COLMAP entries for ground images that actually exist on disk
+    # (generate_with_flux skips dark renders, so not all cameras have images)
+    scene_images_dir = Path(scene_path) / "images"
+    ground_entries = []
+    for idx, cam in enumerate(cameras):
+        name = f"groundgen_{idx:03d}.jpg"
+        if not (scene_images_dir / name).exists():
+            continue
+        image_id = max_image_id + idx + 1
+        R_rot = Rotation.from_matrix(cam["rotation"])
+        qw, qx, qy, qz = R_rot.as_quat()[[3, 0, 1, 2]]
+        tx, ty, tz = cam["translation"]
+        ground_entries.append(
+            f"{image_id} {qw} {qx} {qy} {qz} {tx} {ty} {tz} {camera_id} {name}\n\n"
+        )
+
+    total = len(existing_entries) + len(ground_entries)
     with open(str(images_txt), "w") as f:
         f.write("# Image list with two lines of data per image:\n")
         f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
         f.write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
-        f.write(f"# Number of images: {len(existing_entries) + len(cameras)}\n")
+        f.write(f"# Number of images: {total}\n")
         for entry in existing_entries:
             f.write(entry)
-        for idx, cam in enumerate(cameras):
-            image_id = max_image_id + idx + 1
-            R_rot = Rotation.from_matrix(cam["rotation"])
-            qw, qx, qy, qz = R_rot.as_quat()[[3, 0, 1, 2]]
-            tx, ty, tz = cam["translation"]
-            name = f"groundgen_{idx:03d}.jpg"
-            f.write(f"{image_id} {qw} {qx} {qy} {qz} {tx} {ty} {tz} {camera_id} {name}\n")
-            f.write("\n")  # Empty line for 2D points
+        for entry in ground_entries:
+            f.write(entry)
 
-    # Step 4: Remove binary files so InstantSplat reads text only
     if images_bin.exists():
         images_bin.unlink()
         print("  Removed images.bin (using text format only)")
 
-    print(f"  Wrote {len(existing_entries) + len(cameras)} total camera poses to {images_txt}")
+    print(f"  Wrote {total} total camera poses ({len(existing_entries)} original + "
+          f"{len(ground_entries)} ground) to {images_txt}")
 
 
 def retrain_model(scene_path, model_path, output_model_path, iterations, n_views):
-    """Retrain the Gaussian splat model with ground-level images added."""
+    """Retrain the Gaussian splat model with ground-level images added.
+
+    Uses aggressive densification/pruning to suppress floaters from aerial Gaussians.
+    """
     cmd = [
         sys.executable,
-        "/opt/InstantSplat/train.py",
+        "/mnt/splatwalk/InstantSplat/train.py",
         "--source_path", scene_path,
         "--model_path", output_model_path,
         "--iterations", str(iterations),
         "--n_views", str(n_views),
         "--pp_optimizer",
         "--optim_pose",
+        # Aggressive floater suppression
+        "--densify_from_iter", "200",
+        "--opacity_reset_interval", "1000",
+        "--densify_until_iter", str(iterations),
+        "--densification_interval", "100",
     ]
 
     if output_model_path != model_path and not os.path.exists(output_model_path):
         shutil.copytree(model_path, output_model_path)
 
+    # CRITICAL: Delete old point_cloud checkpoints so train.py starts fresh.
+    # Train.py always starts from COLMAP (not checkpoints), so old ones
+    # just cause confusion and mask retrain failures.
+    pc_dir = os.path.join(output_model_path, "point_cloud")
+    if os.path.exists(pc_dir):
+        shutil.rmtree(pc_dir)
+        print(f"  Cleared old checkpoints from {pc_dir}")
+
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        # Training may succeed but save_pose crashes after (non-contiguous UIDs).
-        # Check if checkpoints were actually saved.
         ckpt_dirs = sorted(Path(output_model_path).glob("point_cloud/iteration_*"))
         if ckpt_dirs:
-            print(f"  Retrain completed (post-training save_pose error ignored, checkpoint at {ckpt_dirs[-1].name})")
+            print(f"  Retrain completed with non-zero exit (save_pose error?), checkpoint at {ckpt_dirs[-1].name}")
         else:
             print(f"  Retrain stderr: {result.stderr[-500:]}")
             raise RuntimeError(f"Retrain failed with code {result.returncode}")
@@ -650,16 +1068,22 @@ def retrain_model(scene_path, model_path, output_model_path, iterations, n_views
         print(f"  Retrained for {iterations} iterations")
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="Stage 3.5: ControlNet Ground View Generation")
     parser.add_argument("--model_path", required=True, help="Path to Stage 3 descent model")
     parser.add_argument("--scene_path", required=True, help="Path to scene directory")
     parser.add_argument("--output_dir", required=True, help="Output directory")
-    parser.add_argument("--num_perimeter_views", type=int, default=40)
-    parser.add_argument("--num_grid_views", type=int, default=32)
-    parser.add_argument("--denoising_strength", type=float, default=0.55)
-    parser.add_argument("--controlnet_scale", type=float, default=0.8)
+    parser.add_argument("--num_perimeter_views", type=int, default=20)
+    parser.add_argument("--num_grid_views", type=int, default=12)
+    parser.add_argument("--denoising_strength", type=float, default=0.85)
+    parser.add_argument("--controlnet_scale", type=float, default=0.4)
+    parser.add_argument("--output_size", type=int, default=384)
     parser.add_argument("--retrain_iterations", type=int, default=3000)
+    parser.add_argument("--coordinates", default="", help="lat,lon override (usually auto-detected from EXIF)")
     parser.add_argument("--slack_webhook_url", default="")
     parser.add_argument("--job_id", default="")
     args = parser.parse_args()
@@ -680,11 +1104,32 @@ def main():
     poses = load_camera_poses(args.scene_path)
     print(f"  Found {len(poses)} camera poses")
 
-    # 3. Generate ground-level camera poses
-    print("Generating ground-level cameras...")
-    ground_cameras = generate_ground_cameras(poses, positions, ground_z)
+    # 3. Extract GPS and geographic context
+    scene_images_dir = os.path.join(args.scene_path, "images")
+    lat, lon = None, None
 
-    # 4. Render blurry RGB + depth maps
+    if args.coordinates:
+        try:
+            lat, lon = [float(x.strip()) for x in args.coordinates.split(",")]
+            print(f"  Using provided coordinates: {lat}, {lon}")
+        except Exception:
+            print(f"  Invalid --coordinates format: {args.coordinates}")
+
+    if lat is None:
+        print("Extracting GPS from EXIF...")
+        lat, lon, _alt = extract_gps_from_images(scene_images_dir)
+
+    google_maps_key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+
+    # 4. Generate ground-level camera poses
+    print("Generating ground-level cameras...")
+    ground_cameras = generate_ground_cameras(
+        poses, positions, ground_z,
+        num_perimeter=args.num_perimeter_views,
+        num_grid=args.num_grid_views,
+    )
+
+    # 5. Render blurry RGB + depth maps
     print("Rendering depth maps and blurry RGB...")
     notify_slack("Stage 3.5: Rendering ground-level depth/RGB...",
                  args.slack_webhook_url, args.job_id)
@@ -692,20 +1137,22 @@ def main():
         args.model_path, ground_cameras, args.output_dir, args.scene_path
     )
 
-    # 5. Auto-caption the scene
+    # 6. Caption the scene with Gemini (falls back to BLIP)
     print("Captioning aerial scene...")
-    scene_images_dir = os.path.join(args.scene_path, "images")
-    prompt = caption_aerial_scene(scene_images_dir)
+    prompt = caption_aerial_scene(scene_images_dir, lat=lat, lon=lon, google_maps_key=google_maps_key)
 
-    # 6. Generate photorealistic views with FLUX
-    print("Generating photorealistic ground views with FLUX.1-dev...")
+    # 7. Generate photorealistic views with FLUX + IP-Adapter
+    print("Generating photorealistic ground views with FLUX.1-dev + IP-Adapter...")
     notify_slack(f"Stage 3.5: Generating {len(ground_cameras)} ground views with FLUX...",
                  args.slack_webhook_url, args.job_id)
     generated_dir = os.path.join(args.output_dir, "generated")
     generate_with_flux(
         depth_dir, rgb_dir, prompt, generated_dir,
+        poses=poses, scene_images_dir=scene_images_dir,
+        ground_cameras=ground_cameras,
         denoising_strength=args.denoising_strength,
         controlnet_scale=args.controlnet_scale,
+        output_size=args.output_size,
     )
 
     # 8. Add generated images to training set

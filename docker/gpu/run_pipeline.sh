@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-export PATH="/opt/conda/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+export PATH="/mnt/splatwalk/conda/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 shopt -s nocaseglob  # case-insensitive globbing (matches .JPG, .jpg, .Jpg, etc.)
 
 # Environment variables expected:
@@ -24,7 +24,7 @@ _CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
 [ -n "$GITHUB_TOKEN" ] && _CURL_ARGS+=(-H "Authorization: token $GITHUB_TOKEN")
 _BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/docker/gpu"
 for _script in render_descent.py generate_ground_views.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py compress_splat.py; do
-    if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/opt/$_script" 2>/dev/null; then
+    if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
         echo "  Updated $_script"
     else
         echo "  Using baked-in $_script (fetch failed)"
@@ -131,7 +131,7 @@ upload_to_spaces() {
 run_viewcrafter() {
     echo "Running ViewCrafter pipeline..."
 
-    cd /opt/ViewCrafter
+    cd /mnt/splatwalk/ViewCrafter
 
     # Generate novel views from input images
     python inference.py \
@@ -142,7 +142,7 @@ run_viewcrafter() {
         || return 1
 
     # Convert frames to 3DGS using DUSt3R
-    cd /opt/dust3r
+    cd /mnt/splatwalk/InstantSplat/dust3r
     python demo.py \
         --images "$OUTPUT_DIR/viewcrafter/frames" \
         --output "$OUTPUT_DIR/viewcrafter/pointcloud.ply" \
@@ -211,7 +211,7 @@ PREPROCESS_SCRIPT
     local num_images=$(ls -1 "$scene_dir/images" | wc -l)
     echo "Prepared $num_images images (all 512x512)"
 
-    cd /opt/InstantSplat
+    cd /mnt/splatwalk/InstantSplat
 
     # Cap views for MASt3R memory (configurable via MAX_N_VIEWS)
     local max_views=${MAX_N_VIEWS:-24}
@@ -254,7 +254,7 @@ PREPROCESS_SCRIPT
 run_combined() {
     echo "Running Combined (MASt3R) pipeline..."
 
-    cd /opt/mast3r
+    cd /mnt/splatwalk/InstantSplat/mast3r
 
     # Run MASt3R for dense reconstruction
     python demo.py \
@@ -268,7 +268,7 @@ run_combined() {
 }
 
 run_walkable() {
-    echo "Running Walkable Splat pipeline (Stages 1-5)..."
+    echo "Running Walkable Splat pipeline (Stages 1-4)..."
     notify_slack "Starting walkable pipeline with $(ls -1 "$INPUT_DIR"/*.jpg "$INPUT_DIR"/*.jpeg "$INPUT_DIR"/*.png 2>/dev/null | wc -l | tr -d ' ') images"
 
     # === STAGES 1-2: Aerial splat (reuses InstantSplat flow) ===
@@ -317,7 +317,7 @@ PREPROCESS_SCRIPT
     local num_images=$(ls -1 "$scene_dir/images" | wc -l)
     echo "Prepared $num_images images (all 512x512)"
 
-    cd /opt/InstantSplat
+    cd /mnt/splatwalk/InstantSplat
 
     # Cap views for MASt3R memory (24 for H100 80GB, 16 for RTX 4000 20GB)
     local max_views=${MAX_N_VIEWS:-24}
@@ -325,11 +325,11 @@ PREPROCESS_SCRIPT
     if [ "$n_views" -gt "$max_views" ]; then
         n_views=$max_views
     fi
-    local train_iters=${TRAIN_ITERATIONS:-7000}
+    local train_iters=${TRAIN_ITERATIONS:-10000}
 
     # Stage 1: Geometry init
     notify_slack "Stage 1: Geometry init (MASt3R, $n_views views)..."
-    echo "Stage 1/5: Running geometry initialization with MASt3R ($n_views views)..."
+    echo "Stage 1/4: Running geometry initialization with MASt3R ($n_views views)..."
     python init_geo.py \
         --source_path "$scene_dir" \
         --model_path "$OUTPUT_DIR/instantsplat" \
@@ -345,7 +345,7 @@ PREPROCESS_SCRIPT
 
     # Stage 2: Train aerial splat
     notify_slack "Stage 2: Training aerial splat ($train_iters iterations)..."
-    echo "Stage 2/5: Training Gaussian Splatting ($train_iters iterations)..."
+    echo "Stage 2/4: Training Gaussian Splatting ($train_iters iterations)..."
     python train.py \
         --source_path "$scene_dir" \
         --model_path "$OUTPUT_DIR/instantsplat" \
@@ -359,17 +359,68 @@ PREPROCESS_SCRIPT
         }
     notify_slack "Stage 2 complete: aerial splat trained"
 
+    # Extract EXIF GPS + altitude for dynamic descent and geographic enrichment
+    echo "Extracting EXIF GPS and altitude from drone images..."
+    DRONE_AGL=0
+    EXIF_COORDS=""
+    eval "$(python3 -c "
+import sys
+from pathlib import Path
+try:
+    from PIL import Image, ExifTags
+    imgs = sorted(Path('$INPUT_DIR').glob('*'))
+    for f in imgs:
+        if f.suffix.lower() not in ('.jpg','.jpeg','.png'): continue
+        img = Image.open(f)
+        exif = img._getexif()
+        if not exif: continue
+        gps = exif.get(ExifTags.Base.GPSInfo)
+        if not gps: continue
+        tags = {}
+        for k,v in gps.items():
+            tags[ExifTags.GPSTAGS.get(k,k)] = v
+        if 'GPSLatitude' not in tags: continue
+        def dms(d,r):
+            v=float(d[0])+float(d[1])/60+float(d[2])/3600
+            return -v if r in ('S','W') else v
+        lat=dms(tags['GPSLatitude'],tags.get('GPSLatitudeRef','N'))
+        lon=dms(tags['GPSLongitude'],tags.get('GPSLongitudeRef','W'))
+        alt=float(tags['GPSAltitude']) if 'GPSAltitude' in tags else 0
+        print(f'EXIF_COORDS=\"{lat:.6f},{lon:.6f}\"')
+        print(f'EXIF_ALT={alt:.1f}')
+        break
+except Exception as e:
+    print(f'# EXIF extraction failed: {e}', file=sys.stderr)
+" 2>&1)" || true
+
+    # Compute drone AGL from EXIF altitude + ground elevation
+    if [ -n "$EXIF_COORDS" ] && [ "${EXIF_ALT:-0}" != "0" ]; then
+        echo "  EXIF coordinates: $EXIF_COORDS, altitude: ${EXIF_ALT}m"
+        IFS=',' read -r EXIF_LAT EXIF_LON <<< "$EXIF_COORDS"
+        GROUND_ELEV=$(curl -s --max-time 5 \
+            "https://api.open-meteo.com/v1/elevation?latitude=${EXIF_LAT}&longitude=${EXIF_LON}" \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);e=d.get('elevation',0);print(e[0] if isinstance(e,list) else e)" 2>/dev/null || echo "0")
+        if [ "$GROUND_ELEV" != "0" ]; then
+            DRONE_AGL=$(python3 -c "print(max(0, ${EXIF_ALT} - ${GROUND_ELEV}))")
+            echo "  Ground elevation: ${GROUND_ELEV}m, Drone AGL: ${DRONE_AGL}m"
+        fi
+    fi
+
     # Stage 3: Iterative Virtual Descent
-    notify_slack "Stage 3: Virtual descent (5 altitude levels)..."
-    echo "Stage 3/5: Iterative virtual descent..."
-    python /opt/render_descent.py \
-        --model_path "$OUTPUT_DIR/instantsplat" \
-        --scene_path "$scene_dir" \
-        --output_dir "$OUTPUT_DIR/descent" \
-        --altitudes "0.75,0.5,0.25,0.1,0.025" \
-        --retrain_iterations 2000 \
-        --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
-        --job_id "${JOB_ID:-}" \
+    notify_slack "Stage 3: Virtual descent (5 altitude levels, aggressive floater suppression)..."
+    echo "Stage 3/4: Iterative virtual descent..."
+    local descent_args=(
+        --model_path "$OUTPUT_DIR/instantsplat"
+        --scene_path "$scene_dir"
+        --output_dir "$OUTPUT_DIR/descent"
+        --altitudes "0.67,0.37,0.18,0.075,0.025"
+        --retrain_iterations 2000
+        --slack_webhook_url "${SLACK_WEBHOOK_URL:-}"
+        --job_id "${JOB_ID:-}"
+    )
+    [ "$DRONE_AGL" != "0" ] && descent_args+=(--drone_agl "$DRONE_AGL")
+
+    python /mnt/splatwalk/scripts/render_descent.py "${descent_args[@]}" \
         || {
             notify_slack "Failed at Stage 3: render_descent.py" "error"
             return 1
@@ -377,19 +428,24 @@ PREPROCESS_SCRIPT
     notify_slack "Stage 3 complete: descended to ground level"
 
     # Stage 3.5: ControlNet Ground View Generation
-    notify_slack "Stage 3.5: Generating photorealistic ground views (FLUX ControlNet)..."
+    notify_slack "Stage 3.5: Generating photorealistic ground views (FLUX ControlNet + IP-Adapter)..."
     echo "Stage 3.5: ControlNet ground-level view generation..."
-    python /opt/generate_ground_views.py \
-        --model_path "$OUTPUT_DIR/descent/final" \
-        --scene_path "$scene_dir" \
-        --output_dir "$OUTPUT_DIR/ground_views" \
-        --num_perimeter_views 40 \
-        --num_grid_views 32 \
-        --denoising_strength 0.55 \
-        --controlnet_scale 0.8 \
-        --retrain_iterations 3000 \
-        --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
-        --job_id "${JOB_ID:-}" \
+    local groundview_args=(
+        --model_path "$OUTPUT_DIR/descent/final"
+        --scene_path "$scene_dir"
+        --output_dir "$OUTPUT_DIR/ground_views"
+        --num_perimeter_views 20
+        --num_grid_views 12
+        --denoising_strength 0.85
+        --controlnet_scale 0.4
+        --output_size 384
+        --retrain_iterations 7000
+        --slack_webhook_url "${SLACK_WEBHOOK_URL:-}"
+        --job_id "${JOB_ID:-}"
+    )
+    [ -n "$EXIF_COORDS" ] && groundview_args+=(--coordinates "$EXIF_COORDS")
+
+    python /mnt/splatwalk/scripts/generate_ground_views.py "${groundview_args[@]}" \
         || {
             notify_slack "Failed at Stage 3.5: generate_ground_views.py" "error"
             return 1
@@ -397,36 +453,21 @@ PREPROCESS_SCRIPT
     notify_slack "Stage 3.5 complete: ground views generated"
     local stage3_output="$OUTPUT_DIR/ground_views/model"
 
-    # Stage 4: Diffusion Enhancement (ViewCrafter) — optional, non-fatal
-    notify_slack "Stage 4: Diffusion enhancement (ViewCrafter)..."
-    echo "Stage 4/5: ViewCrafter diffusion enhancement..."
     local final_model_path="$stage3_output"
-    if python /opt/enhance_with_viewcrafter.py \
-        --model_path "$stage3_output" \
-        --scene_path "$scene_dir" \
-        --output_dir "$OUTPUT_DIR/enhanced" \
-        --viewcrafter_ckpt "/opt/ViewCrafter/checkpoints/ViewCrafter_25_512" \
-        --batch_size "${VIEWCRAFTER_BATCH_SIZE:-10}" 2>&1; then
-        notify_slack "Stage 4 complete: ground views enhanced"
-        final_model_path="$OUTPUT_DIR/enhanced"
-    else
-        notify_slack "Stage 4 skipped: ViewCrafter enhancement failed (non-fatal), using Stage 3 output" "info"
-        echo "WARNING: ViewCrafter enhancement failed, continuing with Stage 3 descent output"
-    fi
 
-    # Stage 5: Quality Gating
-    echo "Stage 5/5: Quality gate confidence scoring..."
-    python /opt/quality_gate.py \
+    # Stage 4: Quality Gating
+    echo "Stage 4/4: Quality gate confidence scoring..."
+    python /mnt/splatwalk/scripts/quality_gate.py \
         --model_path "$final_model_path" \
         --real_images "$scene_dir/images" \
         --output_dir "$OUTPUT_DIR/walkable" \
         || {
-            notify_slack "Stage 5 failed (non-fatal), using model directly" "info"
+            notify_slack "Stage 4 failed (non-fatal), using model directly" "info"
             echo "WARNING: Quality gate failed, copying model directly"
             mkdir -p "$OUTPUT_DIR/walkable"
             cp -r "$final_model_path"/* "$OUTPUT_DIR/walkable/" 2>/dev/null || true
         }
-    notify_slack "Stage 5 complete"
+    notify_slack "Stage 4 complete"
 
     echo "Walkable Splat pipeline completed"
     return 0
@@ -438,9 +479,15 @@ convert_and_upload() {
 
     echo "Compressing PLY to .splat..."
 
-    # Find the PLY file (must be a trained Gaussian checkpoint, not raw input.ply)
+    # Find the PLY file: prefer walkable > ground_views > descent/final models
     if [ ! -f "$ply_path" ]; then
-        ply_path=$(find "$OUTPUT_DIR" -path "*/point_cloud/iteration_*/point_cloud.ply" -type f 2>/dev/null | sort -t_ -k2 -n -r | head -1)
+        for search_dir in "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/ground_views/model" "$OUTPUT_DIR/descent/final"; do
+            ply_path=$(find "$search_dir" -name "point_cloud.ply" -path "*/iteration_*" 2>/dev/null | sort | tail -1)
+            if [ -n "$ply_path" ] && [ -f "$ply_path" ]; then
+                echo "Found PLY in: $search_dir"
+                break
+            fi
+        done
     fi
 
     if [ -z "$ply_path" ] || [ ! -f "$ply_path" ]; then
@@ -451,9 +498,10 @@ convert_and_upload() {
     local splat_path="$OUTPUT_DIR/output.splat"
     local confidence_npy="$OUTPUT_DIR/walkable/per_gaussian_confidence.npy"
 
-    python /opt/compress_splat.py \
+    python /mnt/splatwalk/scripts/compress_splat.py \
         "$ply_path" "$splat_path" \
-        --prune_ratio 0.3 \
+        --prune_ratio 0.20 \
+        --scene_scale 50.0 \
         --confidence_npy "$confidence_npy" || return 1
 
     if [ ! -f "$splat_path" ]; then

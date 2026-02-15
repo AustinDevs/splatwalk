@@ -8,9 +8,12 @@ const DO_SSH_KEY_ID = process.env.DO_SSH_KEY_ID || '';
 const DO_SSH_PRIVATE_KEY_PATH = process.env.DO_SSH_PRIVATE_KEY_PATH || '~/.ssh/splatwalk_gpu';
 
 const GPU_DROPLET_SIZE = process.env.GPU_DROPLET_SIZE || 'g-2vcpu-8gb';
-const GPU_DROPLET_REGION = process.env.GPU_DROPLET_REGION || 'nyc1';
-const GPU_DROPLET_IMAGE = process.env.GPU_DROPLET_IMAGE || 'docker-20-04';
+const GPU_DROPLET_REGION = process.env.GPU_DROPLET_REGION || 'tor1';
+const GPU_DROPLET_IMAGE = process.env.GPU_DROPLET_IMAGE || 'gpu-h100x1-80gb-gen1';
 const GPU_TIMEOUT_MS = parseInt(process.env.GPU_TIMEOUT_MS || '3600000', 10);
+
+// Volume ID for the splatwalk runtime Volume (everything-on-volume architecture)
+const DO_VOLUME_ID = process.env.DO_VOLUME_ID || '';
 
 // GitHub token for fetching pipeline scripts from private repo at runtime
 const GHCR_TOKEN = process.env.GHCR_TOKEN || '';
@@ -23,10 +26,11 @@ const DO_SPACES_ENDPOINT = process.env.DO_SPACES_ENDPOINT || 'https://nyc3.digit
 
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
 const HUGGINGFACE_TOKEN = process.env.HUGGINGFACE_TOKEN || '';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
 
 // Pipeline tuning (lower values for smaller GPUs like RTX 4000 Ada 20GB)
 const MAX_N_VIEWS = process.env.MAX_N_VIEWS || '';
-const VIEWCRAFTER_BATCH_SIZE = process.env.VIEWCRAFTER_BATCH_SIZE || '';
 const TRAIN_ITERATIONS = process.env.TRAIN_ITERATIONS || '';
 
 const DO_API_BASE = 'https://api.digitalocean.com/v2';
@@ -257,9 +261,9 @@ class GPUOrchestrator {
         );
       }
 
-      // Run the pipeline natively (no Docker)
+      // Run the pipeline from Volume
       const runCmd = [
-        'export PATH="/opt/conda/bin:$PATH"',
+        'export PATH="/mnt/splatwalk/conda/bin:$PATH"',
         `export INPUT_DIR=/workspace/${jobId}/input`,
         `export OUTPUT_DIR=/workspace/${jobId}/output`,
         `export PIPELINE_MODE=${pipeline}`,
@@ -271,10 +275,11 @@ class GPUOrchestrator {
         `export SPACES_ENDPOINT=${DO_SPACES_ENDPOINT}`,
         SLACK_WEBHOOK_URL ? `export SLACK_WEBHOOK_URL='${SLACK_WEBHOOK_URL}'` : '',
         MAX_N_VIEWS ? `export MAX_N_VIEWS=${MAX_N_VIEWS}` : '',
-        VIEWCRAFTER_BATCH_SIZE ? `export VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE}` : '',
         TRAIN_ITERATIONS ? `export TRAIN_ITERATIONS=${TRAIN_ITERATIONS}` : '',
         GHCR_TOKEN ? `export GITHUB_TOKEN=${GHCR_TOKEN}` : '',
-        '/opt/entrypoint.sh',
+        GEMINI_API_KEY ? `export GEMINI_API_KEY='${GEMINI_API_KEY}'` : '',
+        GOOGLE_MAPS_API_KEY ? `export GOOGLE_MAPS_API_KEY='${GOOGLE_MAPS_API_KEY}'` : '',
+        '/mnt/splatwalk/scripts/entrypoint.sh',
       ].filter(Boolean).join(' && ');
 
       console.log(`Running pipeline ${pipeline} natively on droplet ${dropletId}`);
@@ -404,7 +409,18 @@ self_destruct() {
   upload_log
   notify_slack "Droplet self-destructing." "info"
   sleep 2  # let Slack message send
+
+  # Detach Volume before destroying droplet
+  umount /mnt/splatwalk 2>/dev/null || true
   DROPLET_ID=\$(curl -s http://169.254.169.254/metadata/v1/id)
+  curl -s -X POST \\
+    -H "Authorization: Bearer ${DO_API_TOKEN}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"type":"detach","droplet_id":'\$DROPLET_ID'}' \\
+    "https://api.digitalocean.com/v2/volumes/${DO_VOLUME_ID}/actions"
+  sleep 10  # let detach complete
+
+  # Destroy droplet
   curl -s -X DELETE \\
     -H "Authorization: Bearer ${DO_API_TOKEN}" \\
     "https://api.digitalocean.com/v2/droplets/\$DROPLET_ID"
@@ -429,14 +445,37 @@ for i in \$(seq 1 30); do
 done
 
 GPU_NAME=\$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "unknown")
-notify_slack "GPU ready: \$GPU_NAME. Downloading input data..."
+notify_slack "GPU ready: \$GPU_NAME. Attaching Volume + downloading input data..."
+
+# --- Attach + mount Volume ---
+DROPLET_ID=\$(curl -s http://169.254.169.254/metadata/v1/id)
+
+curl -s -X POST \\
+  -H "Authorization: Bearer ${DO_API_TOKEN}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"type":"attach","droplet_id":'\$DROPLET_ID'}' \\
+  "https://api.digitalocean.com/v2/volumes/${DO_VOLUME_ID}/actions"
+
+# Wait for Volume to appear as a block device
+for i in \$(seq 1 30); do
+  ls /dev/disk/by-id/scsi-0DO_Volume_splatwalk-* 2>/dev/null && break
+  echo "Waiting for Volume device... (attempt \$i)"
+  sleep 5
+done
+
+mkdir -p /mnt/splatwalk
+mount -o discard,defaults,noatime /dev/disk/by-id/scsi-0DO_Volume_splatwalk-* /mnt/splatwalk
+echo "Volume mounted at /mnt/splatwalk"
+notify_slack "Volume attached and mounted."
 
 ${downloadBlock}
 
 notify_slack "Input data ready. Starting pipeline..."
 
-# --- Run the pipeline natively (no Docker) ---
-export PATH="/opt/conda/bin:\$PATH"
+# --- Run the pipeline from Volume ---
+export PATH="/mnt/splatwalk/conda/bin:\$PATH"
+export HF_HOME=/mnt/splatwalk/models/flux
+export TRANSFORMERS_CACHE=/mnt/splatwalk/models/transformers
 export INPUT_DIR=/workspace/${jobId}/input
 export OUTPUT_DIR=/workspace/${jobId}/output
 export PIPELINE_MODE=${pipeline}
@@ -448,13 +487,19 @@ export SPACES_REGION=${DO_SPACES_REGION}
 export SPACES_ENDPOINT=${DO_SPACES_ENDPOINT}
 export SLACK_WEBHOOK_URL='${SLACK_WEBHOOK_URL}'
 export MAX_N_VIEWS=${MAX_N_VIEWS || '24'}
-export VIEWCRAFTER_BATCH_SIZE=${VIEWCRAFTER_BATCH_SIZE || '10'}
-export TRAIN_ITERATIONS=${TRAIN_ITERATIONS || '7000'}
+export TRAIN_ITERATIONS=${TRAIN_ITERATIONS || '5000'}
 export GITHUB_TOKEN=${GHCR_TOKEN || ''}
 export HF_TOKEN=${HUGGINGFACE_TOKEN || ''}
+export GEMINI_API_KEY='${GEMINI_API_KEY}'
+export GOOGLE_MAPS_API_KEY='${GOOGLE_MAPS_API_KEY}'
+
+# Symlink scripts to /opt for backward compatibility
+ln -sf /mnt/splatwalk/scripts/* /opt/ 2>/dev/null || true
+ln -sf /mnt/splatwalk/InstantSplat /opt/InstantSplat 2>/dev/null || true
+ln -sf /mnt/splatwalk/ViewCrafter /opt/ViewCrafter 2>/dev/null || true
 
 echo "=== PIPELINE START ==="
-/opt/entrypoint.sh 2>&1
+/mnt/splatwalk/scripts/entrypoint.sh 2>&1
 PIPELINE_EXIT=\$?
 echo "=== PIPELINE END (exit \$PIPELINE_EXIT) ==="
 

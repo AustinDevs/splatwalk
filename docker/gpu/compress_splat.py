@@ -5,11 +5,16 @@ Splat Compression Pipeline: Prune + .splat conversion
 Replaces the simple PLY-to-.splat conversion with a proper compression pipeline:
   Stage A: Importance-based pruning (remove low-contribution Gaussians)
   Stage B: .splat binary conversion (32 bytes/Gaussian, ~3x smaller than PLY)
+           Includes floater removal + uniform scene scaling for web viewer compatibility
 
-Expected compression: 200-500MB PLY -> ~60-70% after pruning -> ~50% via .splat = 30-100MB final
+Uses UNIFORM scene scaling: positions AND scales are multiplied by the same factor.
+This preserves the trained proportions between Gaussians, unlike separate scale multipliers
+which distort the overlap relationships that training optimized.
+
+Expected: 1GB PLY -> ~54MB .splat (1.8M Gaussians, 60fps in browser)
 
 Usage:
-    python compress_splat.py input.ply output.splat [--prune_ratio 0.3] [--confidence_npy path]
+    python compress_splat.py input.ply output.splat [--prune_ratio 0.20] [--scene_scale 50.0]
 """
 
 import argparse
@@ -64,6 +69,17 @@ def prune_gaussians(ply_path, output_ply_path, prune_ratio=0.3, confidence_path=
     volume = np.prod(scales, axis=-1)  # proxy for pixel area
     importance = opacities * np.cbrt(volume)  # opacity x size
 
+    # Vegetation-aware importance boost: green Gaussians get 1.3x multiplier
+    SH_C0 = 0.28209479177387814
+    if "f_dc_0" in [p.name for p in vertex.properties]:
+        r = np.array(vertex["f_dc_0"]) * SH_C0 + 0.5
+        g = np.array(vertex["f_dc_1"]) * SH_C0 + 0.5
+        b = np.array(vertex["f_dc_2"]) * SH_C0 + 0.5
+        greenness = np.clip(g - 0.5 * (r + b), 0, 1)
+        importance *= (1.0 + 0.3 * greenness)
+        green_count = (greenness > 0.05).sum()
+        print(f"  Vegetation boost: {green_count} green Gaussians ({100*green_count/original_count:.1f}%)")
+
     # Boost with confidence scores if available
     if confidence_path and os.path.exists(confidence_path):
         confidence = np.load(confidence_path)
@@ -92,22 +108,26 @@ def prune_gaussians(ply_path, output_ply_path, prune_ratio=0.3, confidence_path=
     return kept_count
 
 
-def convert_to_splat(ply_path, splat_path):
+def convert_to_splat(ply_path, splat_path, scene_scale=50.0):
     """Convert PLY to .splat binary format (antimatter15 format, 32 bytes/Gaussian).
 
-    Includes aggressive floater removal:
+    Uses UNIFORM scene scaling: both positions and scales are multiplied by
+    the same factor, preserving the trained proportions between Gaussians.
+
+    Includes floater removal tuned for aerial drone reconstructions:
       - Low opacity (< 10%) Gaussians removed
-      - Extremely elongated Gaussians removed (scale ratio > 50:1)
-      - Giant Gaussians removed (max scale > 99.5th percentile)
+      - Giant Gaussians removed (max scale > 97th percentile)
+      - Elongated Gaussians removed (scale ratio > 25:1) — kills streak floaters
       - Position outliers removed (> 3σ from centroid)
+      - White floaters removed (bright + low saturation + high opacity)
 
     Format per Gaussian (32 bytes):
-      float32 x, y, z         (12 bytes - position)
-      float32 s0, s1, s2      (12 bytes - scale, exponentiated)
+      float32 x, y, z         (12 bytes - position, centered + scaled)
+      float32 s0, s1, s2      (12 bytes - scale, exponentiated + scaled)
       uint8   r, g, b, a      ( 4 bytes - color + opacity)
       uint8   q0, q1, q2, q3  ( 4 bytes - quaternion, 128-biased)
     """
-    print(f"Converting to .splat: {ply_path} -> {splat_path}")
+    print(f"Converting to .splat: {ply_path} -> {splat_path} (scene_scale={scene_scale})")
 
     ply_data = PlyData.read(ply_path)
     vertex = ply_data["vertex"]
@@ -141,36 +161,65 @@ def convert_to_splat(ply_path, splat_path):
         opacity_logit = np.zeros(N, dtype=np.float32)
         opacity = np.ones(N, dtype=np.float32)
 
+    # Colors: SH DC -> RGB [0,1] float
+    SH_C0 = 0.28209479177387814
+    if "f_dc_0" in field_names:
+        colors_rgb = np.stack([
+            np.array(vertex["f_dc_0"], dtype=np.float32),
+            np.array(vertex["f_dc_1"], dtype=np.float32),
+            np.array(vertex["f_dc_2"], dtype=np.float32),
+        ], axis=-1) * SH_C0 + 0.5
+    elif "red" in field_names:
+        colors_rgb = np.stack([
+            np.array(vertex["red"], dtype=np.float32),
+            np.array(vertex["green"], dtype=np.float32),
+            np.array(vertex["blue"], dtype=np.float32),
+        ], axis=-1)
+        if colors_rgb.max() > 1.0:
+            colors_rgb /= 255.0
+    else:
+        colors_rgb = np.full((N, 3), 0.5, dtype=np.float32)
+
     # === Floater removal filters ===
     keep = np.ones(N, dtype=bool)
 
-    # 1. Remove low opacity (< 10%) — nearly invisible noise
-    opacity_mask = opacity >= 0.1
-    print(f"  Filter: opacity >= 0.1: keeping {opacity_mask.sum()} / {N} ({100*opacity_mask.mean():.1f}%)")
+    # 1. Remove low opacity (< 10%)
+    opacity_mask = opacity >= 0.10
+    print(f"  Filter: opacity >= 0.10: keeping {opacity_mask.sum()} / {N} ({100*opacity_mask.mean():.1f}%)")
     keep &= opacity_mask
 
-    # 2. Remove giant Gaussians (max scale > 99.5th percentile)
+    # 2. Remove giant Gaussians (max scale > 97th percentile)
     max_scale = scales.max(axis=-1)
-    scale_cap = np.percentile(max_scale[keep], 99.5)
+    scale_cap = np.percentile(max_scale[keep], 97.0)
     scale_mask = max_scale <= scale_cap
-    print(f"  Filter: max_scale <= {scale_cap:.4f}: keeping {(keep & scale_mask).sum()} / {keep.sum()}")
+    print(f"  Filter: max_scale <= {scale_cap:.6f}: keeping {(keep & scale_mask).sum()} / {keep.sum()}")
     keep &= scale_mask
 
-    # 3. Remove extremely elongated Gaussians (scale ratio > 50:1)
+    # 3. Remove elongated Gaussians (scale ratio > 25:1)
     min_scale = scales.min(axis=-1)
     min_scale[min_scale == 0] = 1e-10
     elongation = max_scale / min_scale
-    elong_mask = elongation <= 50.0
-    print(f"  Filter: elongation <= 50: keeping {(keep & elong_mask).sum()} / {keep.sum()}")
+    elong_mask = elongation <= 25.0
+    print(f"  Filter: elongation <= 25: keeping {(keep & elong_mask).sum()} / {keep.sum()}")
     keep &= elong_mask
 
     # 4. Remove position outliers (> 3σ from centroid)
     centroid = positions[keep].mean(axis=0)
     dists = np.linalg.norm(positions - centroid, axis=-1)
     dist_std = dists[keep].std()
-    pos_mask = dists <= centroid.max() + 3 * dist_std  # generous bound
+    pos_mask = dists <= 3.0 * dist_std
     print(f"  Filter: position < 3σ: keeping {(keep & pos_mask).sum()} / {keep.sum()}")
     keep &= pos_mask
+
+    # 5. Remove white floaters (bright + low saturation + high opacity)
+    brightness = (colors_rgb[:, 0] + colors_rgb[:, 1] + colors_rgb[:, 2]) / 3.0
+    max_rgb = np.maximum(colors_rgb[:, 0], np.maximum(colors_rgb[:, 1], colors_rgb[:, 2]))
+    min_rgb = np.minimum(colors_rgb[:, 0], np.minimum(colors_rgb[:, 1], colors_rgb[:, 2]))
+    saturation = (max_rgb - min_rgb) / np.maximum(max_rgb, 1e-6)
+    white_mask = ~((brightness > 0.8) & (saturation < 0.15) & (opacity > 0.4))
+    white_removed = keep.sum() - (keep & white_mask).sum()
+    print(f"  Filter: white floaters: removed {white_removed}")
+    keep &= white_mask
 
     kept = keep.sum()
     removed = N - kept
@@ -179,30 +228,33 @@ def convert_to_splat(ply_path, splat_path):
     # Apply filter
     positions = positions[keep]
     scales = scales[keep]
-    opacity = opacity[keep]
+    opacity = opacity[keep].copy()
+    colors_rgb = colors_rgb[keep]
     N = kept
 
-    # Colors: SH DC -> RGB [0,255] uint8 [N_original, 3] then filter
-    SH_C0 = 0.28209479177387814
-    if "f_dc_0" in field_names:
-        colors = np.stack([
-            np.array(vertex["f_dc_0"], dtype=np.float32),
-            np.array(vertex["f_dc_1"], dtype=np.float32),
-            np.array(vertex["f_dc_2"], dtype=np.float32),
-        ], axis=-1)
-        colors = (colors * SH_C0 + 0.5) * 255.0
-    elif "red" in field_names:
-        colors = np.stack([
-            np.array(vertex["red"], dtype=np.float32),
-            np.array(vertex["green"], dtype=np.float32),
-            np.array(vertex["blue"], dtype=np.float32),
-        ], axis=-1)
-        if colors.max() <= 1.0:
-            colors *= 255.0
-    else:
-        colors = np.full((len(vertex.data), 3), 128.0, dtype=np.float32)
-    colors = colors[keep]
-    colors_u8 = colors.clip(0, 255).astype(np.uint8)
+    # Uniform scene scaling: positions AND scales by same factor
+    # Centers scene at origin first, then scales uniformly
+    positions = (positions - centroid) * scene_scale
+    scales = scales * scene_scale
+
+    print(f"  Uniform {scene_scale}x scene scale applied (centered at origin)")
+    print(f"  Position range: x=[{positions[:,0].min():.0f},{positions[:,0].max():.0f}] "
+          f"y=[{positions[:,1].min():.0f},{positions[:,1].max():.0f}] "
+          f"z=[{positions[:,2].min():.0f},{positions[:,2].max():.0f}]")
+    print(f"  Scale stats: median={np.median(scales):.5f}, p5={np.percentile(scales,5):.5f}, p95={np.percentile(scales,95):.5f}")
+
+    # Reduce opacity of large Gaussians to prevent wash-out from aerial viewing
+    vol = np.prod(scales, axis=-1)
+    vol_p50 = np.percentile(vol, 50)
+    vol_p95 = np.percentile(vol, 95)
+    large_mask = vol > vol_p50
+    if large_mask.any():
+        vol_normalized = np.clip((vol[large_mask] - vol_p50) / (vol_p95 - vol_p50), 0, 1)
+        opacity[large_mask] *= (1.0 - 0.7 * vol_normalized).astype(np.float32)
+        print(f"  Opacity fade: reduced opacity for {large_mask.sum()} large Gaussians")
+
+    # Colors to uint8
+    colors_u8 = (colors_rgb * 255.0).clip(0, 255).astype(np.uint8)
 
     # Alpha: [0,255] uint8
     alpha = (opacity * 255.0).clip(0, 255).astype(np.uint8)
@@ -229,8 +281,8 @@ def convert_to_splat(ply_path, splat_path):
     sort_score = -(np.prod(scales, axis=-1) * opacity)
     order = np.argsort(sort_score)
 
-    positions = positions[order]
-    scales = scales[order]
+    positions = positions[order].astype(np.float32)
+    scales = scales[order].astype(np.float32)
     rgba = rgba[order]
     rot_u8 = rot_u8[order]
 
@@ -253,10 +305,12 @@ def main():
     parser = argparse.ArgumentParser(description="Splat Compression: Prune + .splat conversion")
     parser.add_argument("input_ply", help="Input PLY file path")
     parser.add_argument("output_splat", help="Output .splat file path")
-    parser.add_argument("--prune_ratio", type=float, default=0.3,
-                        help="Fraction of Gaussians to prune (0.0-1.0, default 0.3)")
+    parser.add_argument("--prune_ratio", type=float, default=0.20,
+                        help="Fraction of Gaussians to prune (0.0-1.0, default 0.20)")
     parser.add_argument("--confidence_npy", default=None,
                         help="Path to per-Gaussian confidence.npy for weighted pruning")
+    parser.add_argument("--scene_scale", type=float, default=50.0,
+                        help="Uniform scene scale for web viewer (default 50.0, applied to positions AND scales)")
     parser.add_argument("--skip_prune", action="store_true",
                         help="Skip pruning, only do .splat conversion")
     args = parser.parse_args()
@@ -285,7 +339,7 @@ def main():
     # Stage B: .splat Conversion
     print(f"\n=== Stage B: .splat Conversion ===")
     os.makedirs(os.path.dirname(os.path.abspath(args.output_splat)), exist_ok=True)
-    splat_size = convert_to_splat(pruned_ply, args.output_splat)
+    splat_size = convert_to_splat(pruned_ply, args.output_splat, scene_scale=args.scene_scale)
 
     # Cleanup intermediate file
     if not args.skip_prune and pruned_ply != args.input_ply and os.path.exists(pruned_ply):

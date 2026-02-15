@@ -290,7 +290,7 @@ def render_with_gsplat(model_path, descent_poses, output_dir, scene_path):
     from PIL import Image
 
     # Import gaussian splatting modules
-    sys.path.insert(0, "/opt/InstantSplat")
+    sys.path.insert(0, "/mnt/splatwalk/InstantSplat")
     from gaussian_renderer import render
     from scene import GaussianModel
     from argparse import Namespace
@@ -362,7 +362,7 @@ def render_with_train_script(model_path, output_dir, scene_path):
     # This produces renders from the trained model's camera poses
     cmd = [
         sys.executable,
-        "/opt/InstantSplat/render.py",
+        "/mnt/splatwalk/InstantSplat/render.py",
         "--source_path", scene_path,
         "--model_path", model_path,
         "--skip_train",
@@ -375,28 +375,66 @@ def render_with_train_script(model_path, output_dir, scene_path):
 
 
 def retrain_model(scene_path, model_path, output_model_path, iterations, n_views):
-    """Retrain the Gaussian splat model with additional descent images."""
+    """Retrain the Gaussian splat model with additional descent images.
+
+    Uses aggressive densification/pruning to suppress floaters that appear
+    when viewing aerial-trained Gaussians from lower altitudes.
+    """
     cmd = [
         sys.executable,
-        "/opt/InstantSplat/train.py",
+        "/mnt/splatwalk/InstantSplat/train.py",
         "--source_path", scene_path,
         "--model_path", output_model_path,
         "--iterations", str(iterations),
         "--n_views", str(n_views),
         "--pp_optimizer",
         "--optim_pose",
+        # Aggressive floater suppression: start densification early,
+        # reset opacity frequently to kill floaters
+        "--densify_from_iter", "200",
+        "--opacity_reset_interval", "1000",
+        "--densify_until_iter", str(iterations),
+        "--densification_interval", "100",
     ]
 
     # Copy the existing model as starting point if different path
     if output_model_path != model_path and not os.path.exists(output_model_path):
         shutil.copytree(model_path, output_model_path)
 
+    # CRITICAL: Delete old point_cloud checkpoints so train.py starts fresh
+    # and we can verify the retrain actually produced output.
+    # Train.py always starts from COLMAP point cloud (not checkpoints),
+    # so old checkpoints just cause confusion.
+    pc_dir = os.path.join(output_model_path, "point_cloud")
+    if os.path.exists(pc_dir):
+        shutil.rmtree(pc_dir)
+        print(f"  Cleared old checkpoints from {pc_dir}")
+
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"  Retrain stderr: {result.stderr[-500:]}")
-        raise RuntimeError(f"Retrain failed with code {result.returncode}")
+        # Check if the retrain actually produced a checkpoint
+        ckpt_dirs = sorted(Path(output_model_path).glob("point_cloud/iteration_*"))
+        if ckpt_dirs:
+            latest = ckpt_dirs[-1].name
+            print(f"  Retrain completed with non-zero exit (save_pose error?), checkpoint at {latest}")
+        else:
+            print(f"  Retrain stderr: {result.stderr[-500:]}")
+            raise RuntimeError(f"Retrain failed with code {result.returncode}")
+    else:
+        print(f"  Retrained for {iterations} iterations")
 
-    print(f"  Retrained for {iterations} iterations")
+
+def calc_descent_fractions(drone_agl_m):
+    """Calculate descent altitude fractions to target specific real-world heights.
+
+    Targets: 45m (high overview), 25m (low overview), 12m (tree canopy),
+             5m (understory), 1.7m (eye-level).
+    Smoother transitions = fewer floater artifacts.
+    Only includes targets below the drone altitude.
+    """
+    targets = [45, 25, 12, 5, 1.7]  # meters AGL
+    fractions = [round(t / drone_agl_m, 3) for t in targets if t < drone_agl_m]
+    return fractions
 
 
 def main():
@@ -406,8 +444,12 @@ def main():
     parser.add_argument("--output_dir", required=True, help="Output directory for descent models")
     parser.add_argument(
         "--altitudes",
-        default="0.75,0.5,0.25,0.1,0.025",
+        default="0.5,0.15,0.025",
         help="Comma-separated altitude fractions (1=drone, 0=ground)",
+    )
+    parser.add_argument(
+        "--drone_agl", type=float, default=0,
+        help="Drone altitude above ground level in meters (0=use hardcoded fractions)",
     )
     parser.add_argument(
         "--retrain_iterations", type=int, default=2000, help="Iterations per altitude level"
@@ -416,7 +458,15 @@ def main():
     parser.add_argument("--job_id", default="", help="Job ID for Slack notifications")
     args = parser.parse_args()
 
-    altitudes = [float(a) for a in args.altitudes.split(",")]
+    # Use dynamic fractions if drone AGL is provided, otherwise use hardcoded
+    if args.drone_agl > 0:
+        altitudes = calc_descent_fractions(args.drone_agl)
+        print(f"Dynamic descent fractions from {args.drone_agl:.1f}m AGL: {altitudes}")
+        if not altitudes:
+            print("  WARNING: No valid fractions (drone too low?), using defaults")
+            altitudes = [float(a) for a in args.altitudes.split(",")]
+    else:
+        altitudes = [float(a) for a in args.altitudes.split(",")]
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"Loading point cloud from {args.model_path}...")

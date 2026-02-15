@@ -82,7 +82,7 @@ def render_low_altitude_views(model_path, scene_path, output_dir, num_views=24):
     # Try to use render.py from InstantSplat
     render_cmd = [
         sys.executable,
-        "/opt/InstantSplat/render.py",
+        "/mnt/splatwalk/InstantSplat/render.py",
         "--source_path", scene_path,
         "--model_path", model_path,
         "--skip_train",
@@ -126,9 +126,9 @@ def run_viewcrafter(input_dir, output_dir, viewcrafter_ckpt, batch_size=10):
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    viewcrafter_dir = "/opt/ViewCrafter"
+    viewcrafter_dir = "/mnt/splatwalk/ViewCrafter"
     if not os.path.isdir(viewcrafter_dir):
-        raise FileNotFoundError("ViewCrafter not installed at /opt/ViewCrafter")
+        raise FileNotFoundError("ViewCrafter not installed at /mnt/splatwalk/ViewCrafter")
 
     # Patch ANTIALIAS -> LANCZOS in ViewCrafter's bundled dust3r (Pillow 10+ removed ANTIALIAS)
     for pyfile in Path(viewcrafter_dir).rglob("*.py"):
@@ -219,8 +219,8 @@ def save_video(data, images_path, folder=None):
 
     # Find DUSt3R checkpoint (ViewCrafter uses DUSt3R for pose estimation + depth)
     dust3r_candidates = [
-        "/opt/InstantSplat/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth",
-        "/opt/InstantSplat/submodules/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth",
+        "/mnt/splatwalk/models/dust3r/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth",
+        "/mnt/splatwalk/InstantSplat/dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth",
         os.path.join(viewcrafter_dir, "checkpoints", "DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"),
     ]
     dust3r_ckpt = next((p for p in dust3r_candidates if os.path.exists(p)), dust3r_candidates[0])
@@ -344,7 +344,7 @@ def retrain_with_enhanced(scene_path, model_path, output_model_path, iterations=
 
     cmd = [
         sys.executable,
-        "/opt/InstantSplat/train.py",
+        "/mnt/splatwalk/InstantSplat/train.py",
         "--source_path", scene_path,
         "--model_path", output_model_path,
         "--iterations", str(iterations),
@@ -375,7 +375,7 @@ def main():
     parser.add_argument("--output_dir", required=True, help="Output directory")
     parser.add_argument(
         "--viewcrafter_ckpt",
-        default="/opt/ViewCrafter/checkpoints/ViewCrafter_25_512",
+        default="/mnt/splatwalk/ViewCrafter/checkpoints/ViewCrafter_25_512",
         help="ViewCrafter checkpoint path",
     )
     parser.add_argument(

@@ -52,3 +52,4 @@ test-results/
 
 # Image datasets (upload to Spaces instead)
 odm_data_*/
+/.playwright-mcp
