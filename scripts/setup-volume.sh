@@ -377,7 +377,7 @@ fi
 
 if [ -n "$SCRIPT_DIR" ]; then
     echo "Copying pipeline scripts from $SCRIPT_DIR to $VOLUME_ROOT/scripts/..."
-    for script in entrypoint.sh run_pipeline.sh render_descent.py generate_ground_views.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py compress_splat.py; do
+    for script in entrypoint.sh run_pipeline.sh render_descent.py generate_ground_views.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py compress_splat.py score_renders.py; do
         if [ -f "$SCRIPT_DIR/$script" ]; then
             cp "$SCRIPT_DIR/$script" "$VOLUME_ROOT/scripts/$script"
             echo "  Copied $script"
