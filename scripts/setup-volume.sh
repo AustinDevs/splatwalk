@@ -81,6 +81,10 @@ else
     rm /tmp/miniconda.sh
 fi
 export PATH="$VOLUME_ROOT/conda/bin:$PATH"
+# Accept Conda TOS (required since Conda 25.x)
+conda config --set auto_accept_channel_notices true 2>/dev/null || true
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
 # Pin Python 3.11 to match PyTorch 2.4 compatibility (3.13 is too new)
 PYVER=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 if [ "$PYVER" != "3.11" ]; then

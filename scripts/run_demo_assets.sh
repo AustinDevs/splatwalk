@@ -177,7 +177,7 @@ if [ ! -x /mnt/splatwalk/conda/bin/python ]; then
     -o /tmp/setup-volume.sh 2>/dev/null \
     || curl -fsSL "__SPACES_ENDPOINT__/__SPACES_BUCKET__/scripts/setup-volume.sh" \
     -o /tmp/setup-volume.sh
-  bash /tmp/setup-volume.sh
+  bash /tmp/setup-volume.sh || { notify_slack "Volume setup FAILED" "error"; exit 1; }
   notify_slack "Volume setup complete!"
 fi
 
