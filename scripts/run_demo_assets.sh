@@ -338,6 +338,7 @@ python train.py \
     --n_views "$N_VIEWS" \
     --pp_optimizer \
     --optim_pose \
+    --test_iterations 10001 \
     || { notify_slack "Failed at Stage 2" "error"; exit 1; }
 
 notify_slack "Stage 2 complete (10K aerial splat trained). Starting zoom descent..."
