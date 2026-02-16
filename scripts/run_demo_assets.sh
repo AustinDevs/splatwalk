@@ -164,9 +164,24 @@ for i in $(seq 1 30); do
 done
 
 mkdir -p /mnt/splatwalk
-mount -o discard,defaults,noatime /dev/disk/by-id/scsi-0DO_Volume_splatwalk-* /mnt/splatwalk
-echo "Volume mounted at /mnt/splatwalk"
-notify_slack "Volume mounted. Downloading dataset..."
+VOLUME_DEV=$(ls /dev/disk/by-id/scsi-0DO_Volume_splatwalk-* 2>/dev/null | head -1)
+mount -o discard,defaults,noatime "$VOLUME_DEV" /mnt/splatwalk
+echo "Volume mounted at /mnt/splatwalk (dev=$VOLUME_DEV)"
+
+# --- Run setup if volume is empty/new ---
+if [ ! -x /mnt/splatwalk/conda/bin/python ]; then
+  notify_slack "Fresh volume detected — running setup (~30 min)..."
+  echo "Fresh volume — downloading and running setup-volume.sh..."
+  curl -fsSL -H "Accept: application/vnd.github.raw" \
+    "https://api.github.com/repos/AustinDevs/splatwalk/contents/scripts/setup-volume.sh" \
+    -o /tmp/setup-volume.sh 2>/dev/null \
+    || curl -fsSL "__SPACES_ENDPOINT__/__SPACES_BUCKET__/scripts/setup-volume.sh" \
+    -o /tmp/setup-volume.sh
+  bash /tmp/setup-volume.sh
+  notify_slack "Volume setup complete!"
+fi
+
+notify_slack "Volume ready. Downloading dataset..."
 
 # --- Download aukerman dataset ---
 mkdir -p /workspace/__JOB_ID__/input
