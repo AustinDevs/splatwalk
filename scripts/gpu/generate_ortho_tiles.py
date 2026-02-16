@@ -10,7 +10,8 @@ Pipeline:
   1. Load geometry (reuse from render_zoom_descent.py)
   2. Load camera intrinsics from COLMAP cameras.bin/txt
   3. Stitch orthomosaic (Level 0) via homography onto ground plane
-  4. Tile & enhance with FLUX ControlNet (Levels 1-2)
+  4. Stitch-first FLUX Img2Img refinement (Levels 1-2): reconstruct full
+     parent image, upscale 2x, enhance tiles with low-strength Img2Img
   5. Bicubic upscale + sharpen (Levels 3-4)
   6. Upload tile pyramid to CDN + generate ortho_manifest.json
 
@@ -164,23 +165,6 @@ def stitch_orthomosaic(poses, intrinsics, scene_images_dir, ground_z, canvas_siz
 
     Returns (ortho_image, world_bounds) where world_bounds is (xy_min, xy_max).
     """
-    from PIL import Image as PILImage
-
-    # Compute scene XY footprint from camera positions
-    centers = np.array([p["center"] for p in poses])
-    xy_min = centers[:, :2].min(axis=0)
-    xy_max = centers[:, :2].max(axis=0)
-    xy_range = xy_max - xy_min
-
-    # Add 20% padding
-    padding = 0.2 * xy_range
-    xy_min -= padding
-    xy_max += padding
-    xy_range = xy_max - xy_min
-
-    # World-to-pixel scale
-    pixels_per_unit = canvas_size / max(xy_range[0], xy_range[1])
-
     # Build intrinsic matrix
     K = np.array([
         [intrinsics["fx"], 0, intrinsics["cx"]],
@@ -198,11 +182,12 @@ def stitch_orthomosaic(poses, intrinsics, scene_images_dir, ground_z, canvas_siz
         [0, img_h],
     ], dtype=np.float64)
 
-    canvas = np.zeros((canvas_size, canvas_size, 3), dtype=np.float64)
-    weight_map = np.zeros((canvas_size, canvas_size), dtype=np.float64)
+    # --- Pass 1: Back-project all image corners onto ground plane to find bounds ---
+    pose_corners = []  # list of (pose, world_corners_4x2) for valid poses
+    all_ground_pts = []
 
     for pose in poses:
-        # Load image
+        # Check image exists
         img_name = pose["image_name"]
         img_path = os.path.join(scene_images_dir, img_name)
         if not os.path.exists(img_path):
@@ -210,27 +195,14 @@ def stitch_orthomosaic(poses, intrinsics, scene_images_dir, ground_z, canvas_siz
         if not os.path.exists(img_path):
             continue
 
-        try:
-            img = cv2.imread(img_path)
-            if img is None:
-                continue
-        except Exception:
-            continue
-
         R_w2c = pose["rotation"]
-        t_w2c = pose["translation"]
         cam_center = pose["center"]
 
-        # Back-project corners to world XY on ground plane
         world_corners = []
         valid = True
         for cx, cy in corners_px:
-            # Ray direction in camera frame
             ray_cam = K_inv @ np.array([cx, cy, 1.0])
-            # Ray direction in world frame
             ray_world = R_w2c.T @ ray_cam
-
-            # Intersect with Z=ground_z plane
             dz = ray_world[2]
             if abs(dz) < 1e-8:
                 valid = False
@@ -245,12 +217,45 @@ def stitch_orthomosaic(poses, intrinsics, scene_images_dir, ground_z, canvas_siz
         if not valid or len(world_corners) != 4:
             continue
 
-        world_corners = np.array(world_corners)
+        wc = np.array(world_corners)
+        pose_corners.append((pose, img_path, wc))
+        all_ground_pts.append(wc)
+
+    if not all_ground_pts:
+        print("  WARNING: No valid poses for stitching")
+        return np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8), (np.zeros(2), np.zeros(2))
+
+    all_ground_pts = np.concatenate(all_ground_pts, axis=0)  # (N*4, 2)
+    xy_min = all_ground_pts.min(axis=0)
+    xy_max = all_ground_pts.max(axis=0)
+    xy_range = xy_max - xy_min
+
+    # Add 5% padding (small since bounds already include full footprints)
+    padding = 0.05 * xy_range
+    xy_min -= padding
+    xy_max += padding
+    xy_range = xy_max - xy_min
+
+    # World-to-pixel scale
+    pixels_per_unit = canvas_size / max(xy_range[0], xy_range[1])
+
+    # --- Pass 2: Warp and blend each image using cached corners ---
+    canvas = np.zeros((canvas_size, canvas_size, 3), dtype=np.float64)
+    weight_map = np.zeros((canvas_size, canvas_size), dtype=np.float64)
+
+    for pose, img_path, world_corners in pose_corners:
+        try:
+            img = cv2.imread(img_path)
+            if img is None:
+                continue
+        except Exception:
+            continue
 
         # World XY to canvas pixel coordinates
+        # Y-axis flip: world Y increases upward, pixel Y increases downward
         canvas_corners = np.array([
             [(wc[0] - xy_min[0]) * pixels_per_unit,
-             (wc[1] - xy_min[1]) * pixels_per_unit]
+             (xy_max[1] - wc[1]) * pixels_per_unit]
             for wc in world_corners
         ], dtype=np.float32)
 
@@ -334,20 +339,50 @@ def save_tiles(tiles, zoom_level, output_dir):
 # FLUX enhancement for tiles
 # ---------------------------------------------------------------------------
 
-def enhance_tiles_with_flux(tiles, zoom_level, output_dir, scene_images_dir,
-                            prompt_base="", skip_flux=False):
-    """Enhance tiles with FLUX ControlNet, producing 4 child tiles per parent.
+def reconstruct_image_from_tiles(tiles, tile_size=512):
+    """Reconstruct a full image from a list of (x, y, tile) tuples."""
+    if not tiles:
+        return np.zeros((tile_size, tile_size, 3), dtype=np.uint8)
+    max_x = max(tx for tx, ty, _ in tiles)
+    max_y = max(ty for tx, ty, _ in tiles)
+    w = (max_x + 1) * tile_size
+    h = (max_y + 1) * tile_size
+    image = np.zeros((h, w, 3), dtype=np.uint8)
+    for tx, ty, tile in tiles:
+        x0 = tx * tile_size
+        y0 = ty * tile_size
+        image[y0:y0 + tile_size, x0:x0 + tile_size] = tile
+    return image
 
-    Each parent 512x512 tile is enhanced to 1024x1024, then split into
-    four 512x512 child tiles for the next zoom level.
+
+def enhance_tiles_with_flux(parent_tiles, zoom_level, output_dir, scene_images_dir,
+                            prompt_base="", skip_flux=False, flux_strength=0.25,
+                            tile_size=512):
+    """Stitch-first FLUX Img2Img enhancement for a zoom level.
+
+    1. Reconstruct full parent image from tiles
+    2. Upscale 2x with Lanczos
+    3. Slice into grid of tile_size patches (with overlap for seamless edges)
+    4. Run FluxImg2ImgPipeline on each patch at low strength
+    5. Stitch enhanced patches back and slice into final tiles
 
     Returns list of (x, y, tile) for the child level.
     """
     if skip_flux:
-        return _upscale_tiles_bicubic(tiles, zoom_level, output_dir)
+        return _upscale_tiles_bicubic(parent_tiles, zoom_level, output_dir)
 
     import torch
     from PIL import Image as PILImage
+
+    # Reconstruct parent-level full image
+    parent_image = reconstruct_image_from_tiles(parent_tiles, tile_size)
+    ph, pw = parent_image.shape[:2]
+    print(f"  Reconstructed parent image: {pw}x{ph}")
+
+    # Upscale 2x with Lanczos
+    new_w, new_h = pw * 2, ph * 2
+    upscaled = cv2.resize(parent_image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    print(f"  Upscaled to {new_w}x{new_h}")
 
     # Monkey-patch: PyTorch 2.4 doesn't support enable_gqa
     _orig_sdpa = torch.nn.functional.scaled_dot_product_attention
@@ -356,110 +391,102 @@ def enhance_tiles_with_flux(tiles, zoom_level, output_dir, scene_images_dir,
         return _orig_sdpa(*args, **kwargs)
     torch.nn.functional.scaled_dot_product_attention = _patched_sdpa
 
-    from diffusers import FluxControlNetPipeline, FluxControlNetModel
+    from diffusers import FluxImg2ImgPipeline
 
-    controlnet = FluxControlNetModel.from_pretrained(
-        "XLabs-AI/flux-controlnet-depth-diffusers",
-        torch_dtype=torch.bfloat16,
-    )
-    pipe = FluxControlNetPipeline.from_pretrained(
+    pipe = FluxImg2ImgPipeline.from_pretrained(
         "black-forest-labs/FLUX.1-dev",
-        controlnet=controlnet,
         torch_dtype=torch.bfloat16,
     )
     pipe.to("cuda")
 
-    # Load IP-Adapter
-    ip_adapter_loaded = False
-    try:
-        pipe.load_ip_adapter(
-            "XLabs-AI/flux-ip-adapter-v2",
-            weight_name="ip_adapter.safetensors",
-            image_encoder_pretrained_model_name_or_path="openai/clip-vit-large-patch14",
-        )
-        pipe.set_ip_adapter_scale(0.5)
-        ip_adapter_loaded = True
-        print("  IP-Adapter loaded (scale=0.5)")
-    except Exception as e:
-        print(f"  IP-Adapter failed ({e}), continuing without")
+    prompt = f"aerial orthophoto, nadir view, {prompt_base}, sharp, photorealistic"
 
-    # Load an aerial reference image for IP-Adapter
-    aerial_ref = None
-    if ip_adapter_loaded:
-        aerials = sorted(Path(scene_images_dir).glob("*.jpg"))
-        if aerials:
-            aerial_ref = PILImage.open(aerials[0]).convert("RGB").resize((512, 512), PILImage.LANCZOS)
+    # Process tiles with overlap for seamless edges
+    overlap = 64
+    nx = math.ceil(new_w / tile_size)
+    ny = math.ceil(new_h / tile_size)
 
-    # Depth estimation
-    depth_estimator = None
-    try:
-        from transformers import pipeline as hf_pipeline
-        depth_estimator = hf_pipeline(
-            "depth-estimation",
-            model="depth-anything/Depth-Anything-V2-Small-hf",
-            device="cuda",
-        )
-    except Exception as e:
-        print(f"  Depth estimator failed ({e}), using grayscale fallback")
+    # Output canvas for enhanced image
+    enhanced = np.zeros((new_h, new_w, 3), dtype=np.float64)
+    weight_map = np.zeros((new_h, new_w), dtype=np.float64)
 
-    prompt = (f"ultra high resolution aerial orthophoto, nadir view, "
-              f"{prompt_base}, sharp detail, photorealistic")
+    total_patches = nx * ny
+    patch_idx = 0
 
-    child_tiles = []
-    for idx, (tx, ty, tile) in enumerate(tiles):
-        tile_pil = PILImage.fromarray(cv2.cvtColor(tile, cv2.COLOR_BGR2RGB))
+    for ty in range(ny):
+        for tx in range(nx):
+            patch_idx += 1
 
-        # Skip very dark tiles
-        if np.array(tile).mean() < 15:
-            # Just bicubic upscale
-            upscaled = cv2.resize(tile, (1024, 1024), interpolation=cv2.INTER_CUBIC)
-            for dy in range(2):
-                for dx in range(2):
-                    child = upscaled[dy*512:(dy+1)*512, dx*512:(dx+1)*512]
-                    child_tiles.append((tx*2 + dx, ty*2 + dy, child))
-            continue
+            # Tile region in the upscaled image
+            x0 = tx * tile_size
+            y0 = ty * tile_size
+            x1 = min(x0 + tile_size, new_w)
+            y1 = min(y0 + tile_size, new_h)
 
-        # Estimate depth
-        if depth_estimator:
-            depth_result = depth_estimator(tile_pil)
-            depth_img = depth_result["depth"]
-            if not isinstance(depth_img, PILImage.Image):
-                depth_img = PILImage.fromarray(np.array(depth_img))
-            depth_img = depth_img.convert("RGB").resize((1024, 1024), PILImage.LANCZOS)
-        else:
-            gray = tile_pil.convert("L").resize((1024, 1024), PILImage.LANCZOS)
-            depth_img = PILImage.merge("RGB", [gray, gray, gray])
+            # Expand with overlap (clamped to image bounds)
+            ex0 = max(x0 - overlap, 0)
+            ey0 = max(y0 - overlap, 0)
+            ex1 = min(x1 + overlap, new_w)
+            ey1 = min(y1 + overlap, new_h)
 
-        gen_kwargs = dict(
-            prompt=prompt,
-            control_image=depth_img,
-            controlnet_conditioning_scale=0.4,
-            num_inference_steps=28,
-            guidance_scale=4.0,
-            height=1024,
-            width=1024,
-        )
-        if ip_adapter_loaded and aerial_ref is not None:
-            gen_kwargs["ip_adapter_image"] = aerial_ref
+            patch = upscaled[ey0:ey1, ex0:ex1]
 
-        result = pipe(**gen_kwargs).images[0]
+            # Skip very dark patches (background)
+            if patch.mean() < 15:
+                # Just use the upscaled data directly
+                enhanced[y0:y1, x0:x1] += upscaled[y0:y1, x0:x1].astype(np.float64)
+                weight_map[y0:y1, x0:x1] += 1.0
+                continue
 
-        # Split 1024x1024 into four 512x512 child tiles
-        result_np = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
-        for dy in range(2):
-            for dx in range(2):
-                child = result_np[dy*512:(dy+1)*512, dx*512:(dx+1)*512]
-                child_tiles.append((tx*2 + dx, ty*2 + dy, child))
+            # Resize patch to 512x512 for FLUX input
+            patch_pil = PILImage.fromarray(cv2.cvtColor(patch, cv2.COLOR_BGR2RGB))
+            patch_pil = patch_pil.resize((512, 512), PILImage.LANCZOS)
 
-        if (idx + 1) % 10 == 0:
-            print(f"  FLUX enhance: {idx + 1}/{len(tiles)} tiles")
+            result = pipe(
+                prompt=prompt,
+                image=patch_pil,
+                strength=flux_strength,
+                num_inference_steps=20,
+                guidance_scale=3.5,
+                height=512,
+                width=512,
+            ).images[0]
 
-    del pipe, controlnet
-    if depth_estimator:
-        del depth_estimator
+            result_np = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
+
+            # Resize result back to the expanded patch size
+            result_resized = cv2.resize(result_np, (ex1 - ex0, ey1 - ey0),
+                                        interpolation=cv2.INTER_LANCZOS4)
+
+            # Compute offset of the core tile within the expanded patch
+            core_x0 = x0 - ex0
+            core_y0 = y0 - ey0
+            core_x1 = core_x0 + (x1 - x0)
+            core_y1 = core_y0 + (y1 - y0)
+
+            # Only use the core region (discard overlap margins)
+            core = result_resized[core_y0:core_y1, core_x0:core_x1]
+            enhanced[y0:y1, x0:x1] += core.astype(np.float64)
+            weight_map[y0:y1, x0:x1] += 1.0
+
+            if patch_idx % 10 == 0 or patch_idx == total_patches:
+                print(f"  FLUX Img2Img: {patch_idx}/{total_patches} patches "
+                      f"(strength={flux_strength})")
+
+    # Normalize
+    valid = weight_map > 0
+    for c in range(3):
+        enhanced[:, :, c][valid] /= weight_map[valid]
+    enhanced = enhanced.clip(0, 255).astype(np.uint8)
+
+    del pipe
     torch.cuda.empty_cache()
 
-    print(f"  FLUX enhanced {len(tiles)} parent tiles -> {len(child_tiles)} child tiles")
+    # Slice final enhanced image into tiles
+    child_tiles = tile_image(enhanced, tile_size)
+
+    print(f"  FLUX enhanced level {zoom_level}: {len(child_tiles)} tiles "
+          f"({new_w}x{new_h})")
     return child_tiles
 
 
@@ -563,6 +590,8 @@ def main():
     parser.add_argument("--canvas_size", type=int, default=2048,
                         help="Base orthomosaic canvas size (default 2048)")
     parser.add_argument("--tile_size", type=int, default=512, help="Tile size (default 512)")
+    parser.add_argument("--flux_strength", type=float, default=0.25,
+                        help="FLUX Img2Img strength (default 0.25, lower=subtler)")
     parser.add_argument("--skip_flux", action="store_true",
                         help="Skip FLUX enhancement (bicubic only)")
     parser.add_argument("--slack_webhook_url", default="")
@@ -632,6 +661,7 @@ def main():
             child_tiles = enhance_tiles_with_flux(
                 current_tiles, level, tiles_dir, scene_images_dir,
                 prompt_base=prompt_base, skip_flux=False,
+                flux_strength=args.flux_strength, tile_size=args.tile_size,
             )
         else:
             # Bicubic upscale + sharpen
