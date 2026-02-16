@@ -76,6 +76,15 @@
   </style>
 </head>
 <body>
+  <script>
+    // Register COEP/COOP service worker for GitHub Pages (no custom headers).
+    // Skip if already isolated (e.g., local dev server sets headers directly).
+    if (!crossOriginIsolated && navigator.serviceWorker) {
+      navigator.serviceWorker.register('coi-serviceworker.js').then(() => {
+        window.location.reload();
+      });
+    }
+  </script>
   <div id="demo-container">
     <div id="splat-container"></div>
 
