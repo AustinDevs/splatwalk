@@ -2,16 +2,16 @@
 set -euo pipefail
 
 # ============================================================================
-# Launch GPU droplet to generate Three-Mode Demo Viewer Assets
+# Launch GPU droplet to generate Top-Down Fly-Over Demo Assets
 #
 # Uses the aukerman dataset to:
 # 1. Run MASt3R init + 10K InstantSplat training (~10 min)
-# 2. Run generate_viewer_assets.py: cubemap renders, depth estimation,
-#    FLUX panorama generation, equirectangular stitching, .splat compression
-# 3. Upload all assets + manifest.json to Spaces CDN
+# 2. Top-down progressive zoom descent: 5 altitude levels with FLUX
+#    enhancement + retraining at each level (~60 min)
+# 3. Compress .splat + upload manifest.json to Spaces CDN
 # 4. Self-destruct
 #
-# Total estimated time: ~45 min on H100 (~$6)
+# Total estimated time: ~90 min on H100 (~$10)
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -214,8 +214,7 @@ echo "Fetching latest pipeline scripts from GitHub..."
 _CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
 [ -n "__GITHUB_TOKEN__" ] && _CURL_ARGS+=(-H "Authorization: token __GITHUB_TOKEN__")
 _BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/scripts/gpu"
-for _script in render_descent.py generate_ground_views.py generate_tiered_views.py \
-               compress_splat.py quality_gate.py generate_viewer_assets.py; do
+for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py; do
     if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
         echo "  Updated $_script (from GitHub)"
     elif curl -fsSL "__SPACES_ENDPOINT__/__SPACES_BUCKET__/scripts/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
@@ -299,7 +298,7 @@ python train.py \
     --optim_pose \
     || { notify_slack "Failed at Stage 2" "error"; exit 1; }
 
-notify_slack "Stage 2 complete (10K aerial splat trained). Generating demo assets..."
+notify_slack "Stage 2 complete (10K aerial splat trained). Starting zoom descent..."
 
 # --- Extract EXIF GPS + altitude ---
 DRONE_AGL=63  # default for aukerman
@@ -341,20 +340,35 @@ except Exception as e:
 
 echo "Drone AGL: ${DRONE_AGL}m"
 
-# --- Generate demo viewer assets ---
-python /mnt/splatwalk/scripts/generate_viewer_assets.py \
+# --- Stage 3: Top-Down Progressive Zoom Descent ---
+notify_slack "Stage 3: Top-down zoom descent (5 altitude levels)..."
+python /mnt/splatwalk/scripts/render_zoom_descent.py \
     --model_path "/workspace/__JOB_ID__/output/instantsplat" \
+    --scene_path "$SCENE_DIR" \
+    --output_dir "/workspace/__JOB_ID__/output/descent" \
+    --altitudes "1.0,0.5,0.25,0.12,0.05" \
+    --drone_agl "$DRONE_AGL" \
+    --retrain_iterations 2000 \
+    --max_images_per_level 64 \
+    --slack_webhook_url "$SLACK_WEBHOOK_URL" \
+    --job_id "__JOB_ID__" \
+    || { notify_slack "render_zoom_descent.py failed" "error"; exit 1; }
+
+notify_slack "Stage 3 complete. Generating demo assets..."
+
+# --- Generate demo viewer assets (top-down fly-over) ---
+python /mnt/splatwalk/scripts/generate_viewer_assets.py \
+    --model_path "/workspace/__JOB_ID__/output/descent/final" \
     --scene_path "$SCENE_DIR" \
     --output_dir "/workspace/__JOB_ID__/output/demo" \
     --job_id "aukerman" \
     --drone_agl "$DRONE_AGL" \
-    --n_positions 6 \
     --prune_ratio 0.20 \
     --scene_scale 50.0 \
     --slack_webhook_url "$SLACK_WEBHOOK_URL" \
     || { notify_slack "generate_viewer_assets.py failed" "error"; exit 1; }
 
-notify_slack "Demo assets complete! View at: https://splatwalk.austindevs.com/demo?manifest=__SPACES_ENDPOINT__/__SPACES_BUCKET__/demo/aukerman/manifest.json" "success"
+notify_slack "Demo assets complete! View at: https://splatwalk.austindevs.com/?manifest=__SPACES_ENDPOINT__/__SPACES_BUCKET__/demo/aukerman/manifest.json" "success"
 
 echo "=== DEMO ASSET GENERATION COMPLETE ==="
 # EXIT trap fires → self_destruct
@@ -428,15 +442,15 @@ echo ""
 echo "The droplet will:"
 echo "  1. Attach Volume + download aukerman dataset"
 echo "  2. Run MASt3R init + 10K InstantSplat training (~10 min)"
-echo "  3. Generate 6x cubemap renders + FLUX panoramas (~25 min)"
-echo "  4. Stitch panoramas + compress .splat (~5 min)"
-echo "  5. Upload to CDN + self-destruct"
+echo "  3. Top-down zoom descent: 5 altitude levels + FLUX (~60 min)"
+echo "  4. Compress .splat + upload to CDN (~5 min)"
+echo "  5. Self-destruct"
 echo ""
 echo "Monitor progress via Slack or check logs:"
 echo "  ${DO_SPACES_ENDPOINT}/${DO_SPACES_BUCKET}/jobs/${JOB_ID}/logs/cloud-init.log"
 echo ""
 echo "When complete, view demo at:"
-echo "  http://localhost:3000/demo?manifest=${DO_SPACES_ENDPOINT}/${DO_SPACES_BUCKET}/demo/aukerman/manifest.json"
+echo "  http://localhost:3000/?manifest=${DO_SPACES_ENDPOINT}/${DO_SPACES_BUCKET}/demo/aukerman/manifest.json"
 echo ""
 
 # --- Wait for droplet to become active ---
@@ -459,4 +473,4 @@ done
 
 echo ""
 echo "Launcher done. Droplet is running autonomously."
-echo "It will self-destruct when finished (~45 min total)."
+echo "It will self-destruct when finished (~90 min total)."

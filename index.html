@@ -3,20 +3,16 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Ground-Level Demo - SplatWalk</title>
+  <title>SplatWalk - Aerial Fly-Over</title>
   <link rel="stylesheet" href="css/styles.css">
   <style>
     html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
 
     #demo-container { position: relative; width: 100%; height: 100%; background: #0f172a; }
 
-    /* Canvas containers */
-    #splat-container, #three-container {
+    #splat-container {
       position: absolute; top: 0; left: 0; width: 100%; height: 100%;
     }
-    #splat-container { display: none; }
-    #three-container { display: block; }
-    #three-container canvas { width: 100% !important; height: 100% !important; }
 
     /* Header */
     .demo-header {
@@ -24,48 +20,35 @@
       display: flex; align-items: center; justify-content: space-between;
       padding: 0.75rem 1rem;
       background: linear-gradient(to bottom, rgba(15,23,42,0.9), transparent);
+      pointer-events: none;
     }
     .demo-header h1 { font-size: 1rem; font-weight: 500; color: #f8fafc; }
-    .demo-header .back-link { color: #94a3b8; font-size: 0.875rem; margin-right: 1rem; }
 
-    /* Mode switcher */
-    .mode-switcher {
-      position: absolute; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
-      z-index: 10; display: flex; gap: 0.25rem;
-      background: rgba(30,41,59,0.9); border-radius: 0.5rem; padding: 0.25rem;
-      backdrop-filter: blur(8px);
+    /* Control buttons */
+    .control-buttons {
+      position: absolute; top: 0.75rem; right: 1rem; z-index: 10;
+      display: flex; gap: 0.5rem;
     }
-    .mode-btn {
-      padding: 0.5rem 1rem; border: none; border-radius: 0.375rem;
-      background: transparent; color: #94a3b8; font-size: 0.8rem;
-      cursor: pointer; transition: all 0.2s; white-space: nowrap;
+    .control-btn {
+      padding: 0.4rem 0.75rem; border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 0.375rem; background: rgba(30,41,59,0.8);
+      color: #94a3b8; font-size: 0.75rem; cursor: pointer;
+      backdrop-filter: blur(4px); transition: all 0.2s;
     }
-    .mode-btn.active { background: #3b82f6; color: white; }
-    .mode-btn:hover:not(.active) { background: rgba(255,255,255,0.1); color: #f8fafc; }
-
-    /* Position selector */
-    .position-selector {
-      position: absolute; left: 1rem; top: 50%; transform: translateY(-50%);
-      z-index: 10; display: flex; flex-direction: column; gap: 0.5rem;
-    }
-    .pos-dot {
-      width: 2.5rem; height: 2.5rem; border-radius: 50%;
-      border: 2px solid rgba(255,255,255,0.3); background: rgba(30,41,59,0.8);
-      color: #94a3b8; font-size: 0.75rem; font-weight: 600;
-      display: flex; align-items: center; justify-content: center;
-      cursor: pointer; transition: all 0.2s; backdrop-filter: blur(4px);
-    }
-    .pos-dot.active { border-color: #3b82f6; background: rgba(59,130,246,0.3); color: white; }
-    .pos-dot:hover:not(.active) { border-color: rgba(255,255,255,0.6); color: #f8fafc; }
+    .control-btn:hover { background: rgba(255,255,255,0.1); color: #f8fafc; }
 
     /* Info panel */
     .info-panel {
-      position: absolute; bottom: 5rem; right: 1rem; z-index: 10;
-      max-width: 280px; padding: 0.75rem 1rem;
-      background: rgba(30,41,59,0.9); border-radius: 0.5rem;
-      backdrop-filter: blur(8px); font-size: 0.75rem; color: #94a3b8; line-height: 1.5;
+      position: absolute; bottom: 1.5rem; left: 50%; transform: translateX(-50%);
+      z-index: 10; max-width: 400px; padding: 0.5rem 1rem;
+      background: rgba(30,41,59,0.85); border-radius: 0.5rem;
+      backdrop-filter: blur(8px); font-size: 0.75rem; color: #94a3b8;
+      line-height: 1.5; text-align: center; white-space: nowrap;
     }
-    .info-panel strong { color: #f8fafc; }
+    .info-panel kbd {
+      background: rgba(255,255,255,0.1); padding: 0.1rem 0.35rem;
+      border-radius: 3px; font-size: 0.7rem; color: #e2e8f0;
+    }
 
     /* Loading overlay */
     .loading-overlay {
@@ -82,62 +65,39 @@
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* Joystick zone */
+    /* Joystick zone (mobile) */
     .joystick-zone {
       position: absolute; bottom: 0; left: 0; width: 200px; height: 200px; z-index: 5;
     }
 
-    /* Control buttons */
-    .control-buttons {
-      position: absolute; top: 0.75rem; right: 1rem; z-index: 10;
-      display: flex; gap: 0.5rem;
-    }
-    .control-btn {
-      padding: 0.4rem 0.75rem; border: 1px solid rgba(255,255,255,0.2);
-      border-radius: 0.375rem; background: rgba(30,41,59,0.8);
-      color: #94a3b8; font-size: 0.75rem; cursor: pointer;
-      backdrop-filter: blur(4px); transition: all 0.2s;
-    }
-    .control-btn:hover { background: rgba(255,255,255,0.1); color: #f8fafc; }
-
     @media (max-width: 640px) {
-      .info-panel { display: none; }
-      .mode-btn { padding: 0.4rem 0.6rem; font-size: 0.7rem; }
-      .pos-dot { width: 2rem; height: 2rem; font-size: 0.65rem; }
+      .info-panel { max-width: 90vw; font-size: 0.65rem; white-space: normal; }
     }
   </style>
 </head>
 <body>
   <div id="demo-container">
     <div id="splat-container"></div>
-    <div id="three-container"></div>
 
     <div class="demo-header">
-      <div style="display:flex;align-items:center;">
-        <h1>Ground-Level Rendering Comparison</h1>
-      </div>
+      <h1>SplatWalk</h1>
     </div>
 
     <div class="control-buttons">
       <button class="control-btn" id="fullscreen-btn">Fullscreen</button>
     </div>
 
-    <div class="mode-switcher" id="mode-switcher">
-      <button class="mode-btn" data-mode="splat">Gaussian Splat</button>
-      <button class="mode-btn active" data-mode="skybox">Panoramic Skybox</button>
-      <button class="mode-btn" data-mode="mesh">Depth Mesh</button>
-    </div>
-
-    <div class="position-selector" id="position-selector"></div>
-
     <div class="info-panel" id="info-panel">
-      <strong>Panoramic Skybox</strong><br>
-      FLUX-generated 360&deg; panorama. Photorealistic but rotation only &mdash; no parallax or depth.
+      <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move
+      &nbsp;&middot;&nbsp;
+      <kbd>Q</kbd><kbd>E</kbd> altitude
+      &nbsp;&middot;&nbsp;
+      Mouse to orbit
     </div>
 
     <div class="loading-overlay" id="loading-overlay">
       <div class="loading-spinner"></div>
-      <div class="loading-text">Loading demo assets...</div>
+      <div class="loading-text">Loading splat...</div>
     </div>
 
     <div class="joystick-zone" id="joystick-zone"></div>
@@ -156,14 +116,12 @@
   {
     "imports": {
       "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-      "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js",
       "@mkkellogg/gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
     }
   }
   </script>
   <script type="module" src="js/ground-demo.js"></script>
   <script>
-    // Show any module loading errors on the page itself
     window.addEventListener('error', function(e) {
       var overlay = document.getElementById('loading-overlay');
       var text = overlay && overlay.querySelector('.loading-text');

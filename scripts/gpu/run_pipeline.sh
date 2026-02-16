@@ -23,7 +23,7 @@ echo "Updating pipeline scripts from GitHub..."
 _CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
 [ -n "$GITHUB_TOKEN" ] && _CURL_ARGS+=(-H "Authorization: token $GITHUB_TOKEN")
 _BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/scripts/gpu"
-for _script in render_descent.py generate_ground_views.py generate_tiered_views.py compress_splat.py quality_gate.py generate_viewer_assets.py; do
+for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py; do
     if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
         echo "  Updated $_script"
     else
@@ -406,54 +406,29 @@ except Exception as e:
         fi
     fi
 
-    # Stage 3: Iterative Virtual Descent
-    notify_slack "Stage 3: Virtual descent (5 altitude levels, aggressive floater suppression)..."
-    echo "Stage 3/4: Iterative virtual descent..."
+    # Stage 3: Top-Down Progressive Zoom Descent
+    notify_slack "Stage 3: Top-down zoom descent (5 altitude levels)..."
+    echo "Stage 3/4: Top-down progressive zoom descent..."
     local descent_args=(
         --model_path "$OUTPUT_DIR/instantsplat"
         --scene_path "$scene_dir"
         --output_dir "$OUTPUT_DIR/descent"
-        --altitudes "0.67,0.37,0.18,0.075,0.025"
+        --altitudes "1.0,0.5,0.25,0.12,0.05"
         --retrain_iterations 2000
+        --max_images_per_level 64
         --slack_webhook_url "${SLACK_WEBHOOK_URL:-}"
         --job_id "${JOB_ID:-}"
     )
     [ "$DRONE_AGL" != "0" ] && descent_args+=(--drone_agl "$DRONE_AGL")
 
-    python /mnt/splatwalk/scripts/render_descent.py "${descent_args[@]}" \
+    python /mnt/splatwalk/scripts/render_zoom_descent.py "${descent_args[@]}" \
         || {
-            notify_slack "Failed at Stage 3: render_descent.py" "error"
+            notify_slack "Failed at Stage 3: render_zoom_descent.py" "error"
             return 1
         }
-    notify_slack "Stage 3 complete: descended to ground level"
+    notify_slack "Stage 3 complete: zoom descent finished"
 
-    # Stage 3.5: ControlNet Ground View Generation
-    notify_slack "Stage 3.5: Generating photorealistic ground views (FLUX ControlNet + IP-Adapter)..."
-    echo "Stage 3.5: ControlNet ground-level view generation..."
-    local groundview_args=(
-        --model_path "$OUTPUT_DIR/descent/final"
-        --scene_path "$scene_dir"
-        --output_dir "$OUTPUT_DIR/ground_views"
-        --num_perimeter_views 20
-        --num_grid_views 12
-        --denoising_strength 0.85
-        --controlnet_scale 0.4
-        --output_size 384
-        --retrain_iterations 7000
-        --slack_webhook_url "${SLACK_WEBHOOK_URL:-}"
-        --job_id "${JOB_ID:-}"
-    )
-    [ -n "$EXIF_COORDS" ] && groundview_args+=(--coordinates "$EXIF_COORDS")
-
-    python /mnt/splatwalk/scripts/generate_ground_views.py "${groundview_args[@]}" \
-        || {
-            notify_slack "Failed at Stage 3.5: generate_ground_views.py" "error"
-            return 1
-        }
-    notify_slack "Stage 3.5 complete: ground views generated"
-    local stage3_output="$OUTPUT_DIR/ground_views/model"
-
-    local final_model_path="$stage3_output"
+    local final_model_path="$OUTPUT_DIR/descent/final"
 
     # Stage 4: Quality Gating
     echo "Stage 4/4: Quality gate confidence scoring..."
@@ -481,7 +456,7 @@ convert_and_upload() {
 
     # Find the PLY file: prefer walkable > ground_views > descent/final models
     if [ ! -f "$ply_path" ]; then
-        for search_dir in "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/ground_views/model" "$OUTPUT_DIR/descent/final"; do
+        for search_dir in "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/descent/final"; do
             ply_path=$(find "$search_dir" -name "point_cloud.ply" -path "*/iteration_*" 2>/dev/null | sort | tail -1)
             if [ -n "$ply_path" ] && [ -f "$ply_path" ]; then
                 echo "Found PLY in: $search_dir"
@@ -568,7 +543,7 @@ case "$PIPELINE_MODE" in
             notify_slack "Compressing and uploading splat to Spaces..."
             # Find the trained Gaussian point cloud (not input.ply which is raw MASt3R output)
             local_ply=""
-            for search_dir in "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/ground_views/model" "$OUTPUT_DIR/enhanced" "$OUTPUT_DIR/descent/final" "$OUTPUT_DIR/instantsplat"; do
+            for search_dir in "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/descent/final" "$OUTPUT_DIR/instantsplat"; do
                 candidate=$(find "$search_dir" -path "*/point_cloud/iteration_*/point_cloud.ply" -type f 2>/dev/null | sort -t_ -k2 -n -r | head -1)
                 if [ -n "$candidate" ] && [ -f "$candidate" ]; then
                     local_ply="$candidate"
