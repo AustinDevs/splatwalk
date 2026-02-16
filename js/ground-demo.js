@@ -318,6 +318,18 @@ async function init() {
       return;
     }
 
+    // Wire up "2D Map" button if ortho manifest is available
+    if (manifest.ortho_manifest_url) {
+      var orthoBtn = document.getElementById('ortho-btn');
+      if (orthoBtn) {
+        orthoBtn.style.display = '';
+        orthoBtn.addEventListener('click', function () {
+          window.location.href = 'ortho.html?manifest=' +
+            encodeURIComponent(manifest.ortho_manifest_url);
+        });
+      }
+    }
+
     showLoading('Initializing splat viewer...');
     await initSplat();
 

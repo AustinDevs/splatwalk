@@ -23,7 +23,7 @@ echo "Updating pipeline scripts from GitHub..."
 _CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
 [ -n "$GITHUB_TOKEN" ] && _CURL_ARGS+=(-H "Authorization: token $GITHUB_TOKEN")
 _BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/scripts/gpu"
-for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py; do
+for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py generate_ortho_tiles.py; do
     if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
         echo "  Updated $_script"
     else
@@ -405,6 +405,17 @@ except Exception as e:
             echo "  Ground elevation: ${GROUND_ELEV}m, Drone AGL: ${DRONE_AGL}m"
         fi
     fi
+
+    # Ortho tile generation (non-fatal, runs before zoom descent)
+    notify_slack "Ortho: generating 2D tile pyramid..."
+    python /mnt/splatwalk/scripts/generate_ortho_tiles.py \
+        --scene_path "$scene_dir" \
+        --model_path "$OUTPUT_DIR/instantsplat" \
+        --output_dir "$OUTPUT_DIR/ortho" \
+        --job_id "$JOB_ID" \
+        --drone_agl "${DRONE_AGL:-63}" \
+        --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
+        || notify_slack "Ortho generation failed (non-fatal)"
 
     # Stage 3: Top-Down Progressive Zoom Descent
     notify_slack "Stage 3: Top-down zoom descent (5 altitude levels)..."

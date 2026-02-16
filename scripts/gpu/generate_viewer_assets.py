@@ -258,6 +258,20 @@ def main():
 
     upload_to_cdn(manifest_path, f"{remote_prefix}/manifest.json")
 
+    # Cross-link: check if ortho manifest exists and add reference
+    ortho_manifest_path = os.path.join(os.path.dirname(args.output_dir), "ortho", "ortho_manifest.json")
+    if os.path.exists(ortho_manifest_path):
+        endpoint = os.environ.get("SPACES_ENDPOINT", "")
+        bucket = os.environ.get("SPACES_BUCKET", "")
+        if endpoint and bucket:
+            manifest["ortho_manifest_url"] = f"{endpoint}/{bucket}/demo/{args.job_id}/ortho_manifest.json"
+        else:
+            manifest["ortho_manifest_url"] = f"file://{os.path.abspath(ortho_manifest_path)}"
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        upload_to_cdn(manifest_path, f"{remote_prefix}/manifest.json")
+        print(f"  Cross-linked ortho manifest: {manifest['ortho_manifest_url']}")
+
     notify_slack(
         f"Demo assets complete! {splat_size_mb:.1f}MB splat, "
         f"scene {bounds['size'][0]:.0f}x{bounds['size'][1]:.0f} units",
