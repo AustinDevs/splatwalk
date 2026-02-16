@@ -127,16 +127,16 @@ def compute_scene_bounds(model_path, scene_scale=50.0):
     positions_scaled = (positions - centroid) * scene_scale
 
     ground_z_raw = float(np.percentile(positions[:, 2], 5))
-    ground_z_scaled = (ground_z_raw - centroid[2]) * scene_scale
+    ground_z_scaled = float((ground_z_raw - centroid[2]) * scene_scale)
 
     bounds = {
-        "min": positions_scaled.min(axis=0).tolist(),
-        "max": positions_scaled.max(axis=0).tolist(),
+        "min": [float(v) for v in positions_scaled.min(axis=0)],
+        "max": [float(v) for v in positions_scaled.max(axis=0)],
         "center": [0.0, 0.0, 0.0],  # centered at origin by compress_splat
-        "size": (positions_scaled.max(axis=0) - positions_scaled.min(axis=0)).tolist(),
+        "size": [float(v) for v in (positions_scaled.max(axis=0) - positions_scaled.min(axis=0))],
         "ground_z": ground_z_scaled,
-        "centroid_raw": centroid.tolist(),
-        "scene_scale": scene_scale,
+        "centroid_raw": [float(v) for v in centroid],
+        "scene_scale": float(scene_scale),
     }
 
     print(f"  Scene bounds (scaled {scene_scale}x):")
@@ -229,7 +229,7 @@ def main():
     # Start at ~3m above scene center (in scaled coordinates)
     # 3m real -> 3m / drone_agl * scene_height_scaled
     scene_height = bounds["max"][2] - bounds["min"][2]
-    viewing_altitude = bounds["ground_z"] + scene_height * 0.15  # slightly above ground in scaled space
+    viewing_altitude = float(bounds["ground_z"] + scene_height * 0.15)  # slightly above ground in scaled space
 
     manifest = {
         "splat_url": splat_url,
