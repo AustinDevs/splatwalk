@@ -165,7 +165,7 @@ async function initSplat() {
     useBuiltInControls: !isMobile,
     rootElement: splatContainer,
     sphericalHarmonicsDegree: 0,
-    gpuAcceleratedSort: true,
+    gpuAcceleratedSort: false,
     antialiased: true,
     kernel2DSize: 0.3,
     logLevel: 1,

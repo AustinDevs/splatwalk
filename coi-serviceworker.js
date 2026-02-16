@@ -13,6 +13,10 @@ self.addEventListener('fetch', (e) => {
 
   e.respondWith(
     fetch(e.request).then((response) => {
+      // Opaque responses (cross-origin no-cors) have status 0 which is
+      // invalid for the Response constructor — return them unchanged.
+      if (response.status === 0) return response;
+
       const headers = new Headers(response.headers);
       headers.set('Cross-Origin-Embedder-Policy', 'credentialless');
       headers.set('Cross-Origin-Opener-Policy', 'same-origin');
