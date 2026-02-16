@@ -47,28 +47,27 @@
     var maxZoom = manifest.max_zoom || 4;
     var maxEnhanced = manifest.max_enhanced_zoom || 2;
 
-    // L.CRS.Simple: 1 pixel = 1 unit. Bounds in pixel coordinates.
-    // Leaflet uses [lat, lng] = [y, x], so bounds are [[0, 0], [height, width]]
-    var bounds = L.latLngBounds(
-      L.latLng(0, 0),
-      L.latLng(imgHeight, imgWidth)
-    );
-
+    // Create map first so we can use unproject()
     map = L.map('map', {
       crs: L.CRS.Simple,
       minZoom: minZoom,
       maxZoom: maxZoom,
       zoomSnap: 1,
       zoomDelta: 1,
-      maxBounds: bounds.pad(0.25),
-      maxBoundsViscosity: 0.8,
       attributionControl: false,
     });
 
-    // Fit to bounds initially
+    // Convert pixel coordinates at max zoom to CRS.Simple latlng.
+    // unproject([x, y], zoom) maps pixel coords to map coords.
+    var southWest = map.unproject([0, imgHeight], maxZoom);
+    var northEast = map.unproject([imgWidth, 0], maxZoom);
+    var bounds = L.latLngBounds(southWest, northEast);
+
+    map.setMaxBounds(bounds.pad(0.25));
+    map.options.maxBoundsViscosity = 0.8;
     map.fitBounds(bounds);
 
-    // Tile layer
+    // Tile layer — use tms:true since our tiles are stored with Y=0 at top
     var tileUrl = manifest.tile_url_template;
     L.tileLayer(tileUrl, {
       tileSize: tileSize,
@@ -76,6 +75,8 @@
       maxZoom: maxZoom,
       bounds: bounds,
       noWrap: true,
+      tms: true,
+      crossOrigin: '',
       errorTileUrl: '',
     }).addTo(map);
 
