@@ -225,11 +225,10 @@ def main():
     splat_url = upload_to_cdn(splat_path, f"{remote_prefix}/scene.splat")
 
     # --- 4. Generate manifest ---
-    # Camera defaults for the web viewer
-    # Start at ~3m above scene center (in scaled coordinates)
-    # 3m real -> 3m / drone_agl * scene_height_scaled
+    # Camera defaults for the web viewer (Z-up scene from COLMAP)
+    # Position camera above the scene max Z, looking down at ground
     scene_height = bounds["max"][2] - bounds["min"][2]
-    viewing_altitude = float(bounds["ground_z"] + scene_height * 0.15)  # slightly above ground in scaled space
+    viewing_altitude = float(bounds["max"][2] + scene_height * 0.5)
 
     manifest = {
         "splat_url": splat_url,

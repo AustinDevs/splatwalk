@@ -116,51 +116,43 @@ async function initSplat() {
 
   const splatUrl = manifest.splat_url;
 
-  // Determine initial camera position
+  // Determine initial camera position from scene bounds
+  // Scene uses Z-up (from COLMAP). For top-down: camera above max Z, looking down.
   let camPos, camLookAt, camUp;
 
-  if (manifest.camera_defaults) {
-    // New top-down manifest format
-    const defaults = manifest.camera_defaults;
-    camPos = defaults.position;
-    camLookAt = defaults.look_at;
-    camUp = defaults.up || [0, 1, 0];
-  } else {
-    // Fallback: compute from scene bounds or use defaults
-    let bounds = manifest.scene_bounds || null;
-    if (!bounds) {
-      console.log('[splat] computing bounds from .splat file...');
-      const computed = await Promise.race([
-        computeSceneBounds(splatUrl),
-        new Promise(function (resolve) { setTimeout(function () { resolve(null); }, 5000); }),
-      ]);
-      if (computed) {
-        bounds = {
-          center: computed.center,
-          size: computed.size,
-          min: computed.min,
-          max: computed.max,
-          ground_z: computed.min[2],
-        };
-      }
+  let bounds = manifest.scene_bounds || null;
+  if (!bounds) {
+    console.log('[splat] computing bounds from .splat file...');
+    const computed = await Promise.race([
+      computeSceneBounds(splatUrl),
+      new Promise(function (resolve) { setTimeout(function () { resolve(null); }, 5000); }),
+    ]);
+    if (computed) {
+      bounds = {
+        center: computed.center,
+        size: computed.size,
+        min: computed.min,
+        max: computed.max,
+        ground_z: computed.min[2],
+      };
     }
+  }
 
-    if (bounds) {
-      // Position camera above scene center, looking down
-      const sceneHeight = bounds.size ? bounds.size[2] : 10;
-      camPos = [
-        bounds.center[0],
-        bounds.center[1],
-        bounds.center[2] + sceneHeight * 0.3,
-      ];
-      camLookAt = [bounds.center[0], bounds.center[1], bounds.ground_z || bounds.min[2]];
-      camUp = [0, 1, 0];
-    } else {
-      // Last resort defaults
-      camPos = [0, 0, 5];
-      camLookAt = [0, 0, 0];
-      camUp = [0, 1, 0];
-    }
+  if (bounds) {
+    // Position camera above the scene, looking straight down
+    const sceneHeight = bounds.size ? bounds.size[2] : 10;
+    const maxZ = bounds.max ? bounds.max[2] : sceneHeight;
+    const cx = bounds.center ? bounds.center[0] : 0;
+    const cy = bounds.center ? bounds.center[1] : 0;
+    // Start well above the top of the scene
+    camPos = [cx, cy, maxZ + sceneHeight * 0.5];
+    camLookAt = [cx, cy, bounds.ground_z || 0];
+    // For looking down -Z, up must be perpendicular to Z axis
+    camUp = [0, 1, 0];
+  } else {
+    camPos = [0, 0, 50];
+    camLookAt = [0, 0, 0];
+    camUp = [0, 1, 0];
   }
 
   console.log('[splat] camera position:', camPos, 'lookAt:', camLookAt);
@@ -189,9 +181,9 @@ async function initSplat() {
   splatViewer.start();
 
   // Set movement speed based on scene size
-  const bounds = manifest.scene_bounds;
-  const sceneSize = bounds
-    ? Math.max(bounds.size[0], bounds.size[1], bounds.size[2])
+  const sceneBounds = manifest.scene_bounds;
+  const sceneSize = sceneBounds
+    ? Math.max(sceneBounds.size[0], sceneBounds.size[1], sceneBounds.size[2])
     : 10;
   moveSpeed = sceneSize * 0.03;
   altitudeSpeed = sceneSize * 0.02;
