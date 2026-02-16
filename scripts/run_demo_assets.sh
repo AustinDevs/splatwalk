@@ -78,10 +78,14 @@ fi
 CLOUD_INIT=$(cat <<'CLOUD_INIT_EOF'
 #!/bin/bash
 exec > /var/log/splatwalk-job.log 2>&1
+set -x  # verbose for debugging
 
 echo "=== SplatWalk Demo Asset Runner ==="
 echo "Job: __JOB_ID__"
 echo "Started: $(date -u)"
+
+# Conda TOS env var (belt and suspenders — also set in setup-volume.sh)
+export CONDA_AUTO_ACCEPT_CHANNEL_NOTICES=true
 
 # --- Slack helper ---
 notify_slack() {
@@ -115,22 +119,31 @@ upload_log() {
 }
 
 # --- Self-destruct trap ---
+PIPELINE_SUCCESS=false
 self_destruct() {
-  echo "Self-destructing droplet..."
+  echo "EXIT trap fired (success=$PIPELINE_SUCCESS)..."
   upload_log
-  notify_slack "Droplet self-destructing." "info"
-  sleep 2
-  umount /mnt/splatwalk 2>/dev/null || true
-  DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
-  curl -s -X POST \
-    -H "Authorization: Bearer __DO_API_TOKEN__" \
-    -H "Content-Type: application/json" \
-    -d '{"type":"detach","droplet_id":'$DROPLET_ID'}' \
-    "https://api.digitalocean.com/v2/volumes/__DO_VOLUME_ID__/actions"
-  sleep 10
-  curl -s -X DELETE \
-    -H "Authorization: Bearer __DO_API_TOKEN__" \
-    "https://api.digitalocean.com/v2/droplets/$DROPLET_ID"
+  if [ "$PIPELINE_SUCCESS" = "true" ]; then
+    echo "Pipeline succeeded — self-destructing..."
+    notify_slack "Pipeline complete. Self-destructing." "success"
+    sleep 2
+    umount /mnt/splatwalk 2>/dev/null || true
+    DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
+    curl -s -X POST \
+      -H "Authorization: Bearer __DO_API_TOKEN__" \
+      -H "Content-Type: application/json" \
+      -d '{"type":"detach","droplet_id":'$DROPLET_ID'}' \
+      "https://api.digitalocean.com/v2/volumes/__DO_VOLUME_ID__/actions"
+    sleep 10
+    curl -s -X DELETE \
+      -H "Authorization: Bearer __DO_API_TOKEN__" \
+      "https://api.digitalocean.com/v2/droplets/$DROPLET_ID"
+  else
+    echo "Pipeline FAILED — keeping droplet alive for SSH debugging."
+    echo "SSH in: ssh root@$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)"
+    echo "Logs: cat /var/log/splatwalk-job.log"
+    notify_slack "FAILED — droplet kept alive for debugging. SSH to check logs." "error"
+  fi
 }
 trap self_destruct EXIT
 
@@ -165,8 +178,22 @@ done
 
 mkdir -p /mnt/splatwalk
 VOLUME_DEV=$(ls /dev/disk/by-id/scsi-0DO_Volume_splatwalk-* 2>/dev/null | head -1)
-mount -o discard,defaults,noatime "$VOLUME_DEV" /mnt/splatwalk
+if [ -z "$VOLUME_DEV" ]; then
+  echo "ERROR: Volume device not found after 30 attempts"
+  notify_slack "Volume device never appeared" "error"
+  exit 1
+fi
+echo "Volume device found: $VOLUME_DEV"
+mount -o discard,defaults,noatime "$VOLUME_DEV" /mnt/splatwalk || {
+  echo "ERROR: mount failed, trying mkfs first..."
+  mkfs.ext4 -F "$VOLUME_DEV"
+  mount -o discard,defaults,noatime "$VOLUME_DEV" /mnt/splatwalk || {
+    notify_slack "Volume mount FAILED even after mkfs" "error"
+    exit 1
+  }
+}
 echo "Volume mounted at /mnt/splatwalk (dev=$VOLUME_DEV)"
+df -h /mnt/splatwalk
 
 # --- Run setup if volume is empty/new ---
 if [ ! -x /mnt/splatwalk/conda/bin/python ]; then
@@ -386,6 +413,7 @@ python /mnt/splatwalk/scripts/generate_viewer_assets.py \
 notify_slack "Demo assets complete! View at: https://splatwalk.austindevs.com/?manifest=__SPACES_ENDPOINT__/__SPACES_BUCKET__/demo/aukerman/manifest.json" "success"
 
 echo "=== DEMO ASSET GENERATION COMPLETE ==="
+PIPELINE_SUCCESS=true
 # EXIT trap fires → self_destruct
 CLOUD_INIT_EOF
 )
