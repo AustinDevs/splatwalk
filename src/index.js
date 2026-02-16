@@ -74,6 +74,18 @@ app.head('/api/splat-proxy', async (req, res) => {
   }
 });
 
+// Test manifest for /demo when CDN assets aren't available yet
+app.get('/api/demo-manifest', (req, res) => {
+  res.json({
+    splat_url: '/test-scene.splat',
+    positions: [
+      { id: 'pos_0', world_xyz: [0.0, 1.76, 1.16], panorama_url: '/test-panorama.jpg', depth_panorama_url: '/test-depth.jpg' },
+      { id: 'pos_1', world_xyz: [-0.8, 1.76, 1.16], panorama_url: '/test-panorama.jpg', depth_panorama_url: '/test-depth.jpg' },
+      { id: 'pos_2', world_xyz: [0.8, 1.76, 1.16], panorama_url: '/test-panorama.jpg', depth_panorama_url: '/test-depth.jpg' },
+    ],
+  });
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });

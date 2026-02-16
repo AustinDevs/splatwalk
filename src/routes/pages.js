@@ -62,6 +62,12 @@ pagesRouter.get('/view', (req, res) => {
   res.render('viewer', { job, results });
 });
 
+// Ground-level rendering comparison demo
+pagesRouter.get('/demo', (req, res) => {
+  const manifestUrl = req.query.manifest || '/api/demo-manifest';
+  res.render('demo', { manifestUrl });
+});
+
 // Viewer page (by job ID)
 pagesRouter.get('/view/:id', (req, res) => {
   const job = jobManager.getJob(req.params.id);
