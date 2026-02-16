@@ -196,7 +196,7 @@ echo "Volume mounted at /mnt/splatwalk (dev=$VOLUME_DEV)"
 df -h /mnt/splatwalk
 
 # --- Run setup if volume is empty/new ---
-if [ ! -x /mnt/splatwalk/conda/bin/python ]; then
+if ! /mnt/splatwalk/conda/bin/python --version > /dev/null 2>&1; then
   notify_slack "Fresh volume detected — running setup (~30 min)..."
   echo "Fresh volume — downloading and running setup-volume.sh..."
   curl -fsSL -H "Accept: application/vnd.github.raw" \

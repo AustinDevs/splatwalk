@@ -208,7 +208,7 @@ echo ""
 echo "Building PyTorch3D from source with CUDA support..."
 echo "FORCE_CUDA=1  TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
 
-EXISTING_SO=$(find "$VOLUME_ROOT/conda/lib/python"*/site-packages/pytorch3d -name "_C*.so" 2>/dev/null | head -1)
+EXISTING_SO=$(find "$VOLUME_ROOT/conda/lib/python"*/site-packages/pytorch3d -name "_C*.so" 2>/dev/null | head -1 || true)
 NEED_REBUILD=1
 if [ -n "$EXISTING_SO" ]; then
     SO_SIZE=$(stat -c%s "$EXISTING_SO" 2>/dev/null || stat -f%z "$EXISTING_SO" 2>/dev/null || echo 0)
