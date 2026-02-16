@@ -53,13 +53,21 @@ const INFO_TEXT = {
 };
 
 // ---------------------------------------------------------------------------
+// URL helper
+// ---------------------------------------------------------------------------
+
+function resolveUrl(url) {
+  if (!url || url === '') return '';
+  return url;
+}
+
+// ---------------------------------------------------------------------------
 // Load manifest
 // ---------------------------------------------------------------------------
 
 async function loadManifest() {
-  // Proxy external URLs through splat-proxy to avoid CORS issues
   const url = window.MANIFEST_URL;
-  const fetchUrl = url.startsWith('http') ? '/api/splat-proxy?url=' + encodeURIComponent(url) : url;
+  const fetchUrl = resolveUrl(url);
   const resp = await fetch(fetchUrl);
   if (!resp.ok) throw new Error('Manifest not found (' + resp.status + '). Assets may not be generated yet.');
   manifest = await resp.json();
@@ -88,8 +96,7 @@ async function loadManifest() {
 async function computeSceneBounds(splatUrl) {
   if (!splatUrl.toLowerCase().endsWith('.splat')) return null;
   try {
-    // Use proxy for external URLs, direct fetch for local
-    const fetchBase = splatUrl.startsWith('http') ? '/api/splat-proxy?url=' + encodeURIComponent(splatUrl) : splatUrl;
+    const fetchBase = resolveUrl(splatUrl);
     const headResp = await fetch(fetchBase, { method: 'HEAD' });
     const totalBytes = parseInt(headResp.headers.get('content-length') || '0');
     if (!totalBytes) return null;
@@ -189,7 +196,7 @@ async function initSplat() {
   console.log('[demo] viewer created, loading splat scene...');
 
   // Don't await — let splats stream in while we show the UI
-  splatViewer.addSplatScene(splatUrl, { progressiveLoad: true })
+  splatViewer.addSplatScene(resolveUrl(splatUrl), { progressiveLoad: true })
     .then(function () { console.log('[demo] splat scene fully loaded'); })
     .catch(function (err) { console.warn('[demo] splat scene load error:', err); });
   splatViewer.start();
@@ -314,14 +321,8 @@ function initThree() {
 // Texture loading (with proxy + cache)
 // ---------------------------------------------------------------------------
 
-function proxyUrl(url) {
-  if (!url || url === '') return '';
-  if (url.startsWith('http')) return '/api/splat-proxy?url=' + encodeURIComponent(url);
-  return url;
-}
-
 async function loadTexture(url) {
-  const resolved = proxyUrl(url);
+  const resolved = resolveUrl(url);
   if (!resolved) return null;
   return new Promise(function (resolve, reject) {
     new THREE.TextureLoader().load(resolved, resolve, undefined, reject);

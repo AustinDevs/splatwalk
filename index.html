@@ -1,7 +1,10 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <%- include('partials/head', { title: 'Ground-Level Demo' }) %>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ground-Level Demo - SplatWalk</title>
+  <link rel="stylesheet" href="/css/styles.css">
   <style>
     html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
 
@@ -111,7 +114,6 @@
 
     <div class="demo-header">
       <div style="display:flex;align-items:center;">
-        <a href="/" class="back-link">&larr; Back</a>
         <h1>Ground-Level Rendering Comparison</h1>
       </div>
     </div>
@@ -143,7 +145,12 @@
 
   <script src="https://cdn.jsdelivr.net/npm/nipplejs@0.10.2/dist/nipplejs.min.js"></script>
   <script>
-    window.MANIFEST_URL = '<%= manifestUrl %>';
+    // Read manifest URL from ?manifest= query param, default to aukerman demo
+    (function() {
+      var params = new URLSearchParams(window.location.search);
+      window.MANIFEST_URL = params.get('manifest')
+        || 'https://nyc3.digitaloceanspaces.com/splatwalk/demo/aukerman/manifest.json';
+    })();
   </script>
   <script type="importmap">
   {

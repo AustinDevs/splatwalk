@@ -1,33 +1,8 @@
 {
   "name": "splatwalk",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "type": "module",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
-  },
-  "dependencies": {
-    "@aws-sdk/client-s3": "^3.490.0",
-    "@mkkellogg/gaussian-splats-3d": "^0.4.7",
-    "better-sqlite3": "^11.0.0",
-    "better-sse": "^0.13.0",
-    "cors": "^2.8.5",
-    "dotenv": "^16.3.1",
-    "ejs": "^3.1.9",
-    "express": "^4.18.2",
-    "node-ssh": "^13.2.0",
-    "playwright": "^1.41.0",
-    "uuid": "^9.0.1"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "better-sqlite3",
-      "cpu-features",
-      "ssh2"
-    ]
+    "dev": "npx serve ."
   }
 }

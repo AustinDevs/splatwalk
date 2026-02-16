@@ -369,15 +369,15 @@ mkdir -p "$VOLUME_ROOT/scripts"
 
 # Try to find scripts from the repo (if run from repo root or SCP'd alongside)
 SCRIPT_DIR=""
-if [ -d "$(dirname "$0")/../docker/gpu" ]; then
-    SCRIPT_DIR="$(cd "$(dirname "$0")/../docker/gpu" && pwd)"
+if [ -d "$(dirname "$0")/gpu" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")/gpu" && pwd)"
 elif [ -d "/root/pipeline-scripts" ]; then
     SCRIPT_DIR="/root/pipeline-scripts"
 fi
 
 if [ -n "$SCRIPT_DIR" ]; then
     echo "Copying pipeline scripts from $SCRIPT_DIR to $VOLUME_ROOT/scripts/..."
-    for script in entrypoint.sh run_pipeline.sh render_descent.py generate_ground_views.py enhance_with_viewcrafter.py quality_gate.py convert_to_ksplat.py compress_splat.py; do
+    for script in run_pipeline.sh render_descent.py generate_ground_views.py generate_tiered_views.py compress_splat.py quality_gate.py generate_viewer_assets.py; do
         if [ -f "$SCRIPT_DIR/$script" ]; then
             cp "$SCRIPT_DIR/$script" "$VOLUME_ROOT/scripts/$script"
             echo "  Copied $script"
@@ -385,10 +385,10 @@ if [ -n "$SCRIPT_DIR" ]; then
             echo "  WARNING: $script not found in $SCRIPT_DIR"
         fi
     done
-    chmod +x "$VOLUME_ROOT/scripts/entrypoint.sh" "$VOLUME_ROOT/scripts/run_pipeline.sh" 2>/dev/null || true
+    chmod +x "$VOLUME_ROOT/scripts/run_pipeline.sh" 2>/dev/null || true
 else
     echo "WARNING: Pipeline scripts directory not found."
-    echo "  Expected either repo at $(dirname "$0")/../docker/gpu"
+    echo "  Expected either repo at $(dirname "$0")/gpu"
     echo "  or SCP'd scripts at /root/pipeline-scripts/"
     echo "  Scripts will be fetched from GitHub at runtime instead."
 fi
