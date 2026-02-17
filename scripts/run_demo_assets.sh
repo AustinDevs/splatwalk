@@ -437,6 +437,7 @@ python /mnt/splatwalk/scripts/render_zoom_descent.py \
     --max_images_per_level 64 \
     --slack_webhook_url "$SLACK_WEBHOOK_URL" \
     --job_id "__JOB_ID__" \
+    --odm_orthophoto "$ODM_ORTHO_TIF" \
     || { notify_slack "render_zoom_descent.py failed" "error"; exit 1; }
 
 notify_slack "Stage 3 complete. Generating demo assets..."

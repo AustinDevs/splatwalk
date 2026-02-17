@@ -462,6 +462,7 @@ except Exception as e:
         --job_id "${JOB_ID:-}"
     )
     [ "$DRONE_AGL" != "0" ] && descent_args+=(--drone_agl "$DRONE_AGL")
+    [ -f "$ODM_ORTHO_TIF" ] && descent_args+=(--odm_orthophoto "$ODM_ORTHO_TIF")
 
     python /mnt/splatwalk/scripts/render_zoom_descent.py "${descent_args[@]}" \
         || {

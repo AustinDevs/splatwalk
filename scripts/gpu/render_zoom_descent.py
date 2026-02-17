@@ -65,6 +65,65 @@ def notify_slack(message, webhook_url, job_id, status="info"):
         pass
 
 
+def upload_to_cdn(local_path, remote_key):
+    """Upload a file to DO Spaces CDN. Returns the public URL."""
+    endpoint = os.environ.get("SPACES_ENDPOINT", "")
+    bucket = os.environ.get("SPACES_BUCKET", "")
+    if not endpoint or not bucket:
+        return f"file://{os.path.abspath(local_path)}"
+    cmd = [
+        "aws", "s3", "cp", local_path,
+        f"s3://{bucket}/{remote_key}",
+        "--endpoint-url", endpoint,
+        "--acl", "public-read",
+        "--content-type", "image/jpeg",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return f"file://{os.path.abspath(local_path)}"
+    return f"{endpoint}/{bucket}/{remote_key}"
+
+
+def notify_slack_with_image(message, image_path, webhook_url, job_id, status="info"):
+    """Send Slack message with an image preview uploaded to CDN."""
+    if not webhook_url:
+        return
+    import urllib.request
+
+    remote_key = f"jobs/{job_id}/descent/previews/{os.path.basename(image_path)}"
+    image_url = upload_to_cdn(image_path, remote_key)
+
+    if image_url.startswith("file://"):
+        notify_slack(message, webhook_url, job_id, status)
+        return
+
+    emoji = {"info": "\U0001f504", "success": "\u2705", "error": "\u274c"}.get(status, "\U0001f504")
+    payload = json.dumps({
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"{emoji} *[{job_id[:8]}] descent* \u2014 {message}",
+                },
+            },
+            {
+                "type": "image",
+                "image_url": image_url,
+                "alt_text": message,
+            },
+        ]
+    })
+    try:
+        req = urllib.request.Request(
+            webhook_url, data=payload.encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        notify_slack(message, webhook_url, job_id, status)
+
+
 def load_point_cloud(model_path):
     """Load the PLY point cloud and return positions as numpy array."""
     # Search for trained Gaussian splat checkpoints (prefer highest iteration)
@@ -675,6 +734,92 @@ def caption_scene(scene_images_dir):
 
 
 # ---------------------------------------------------------------------------
+# Mosaic stitching for quality check
+# ---------------------------------------------------------------------------
+
+def stitch_level_mosaic(render_dir, cameras, odm_orthophoto_path=None):
+    """Stitch rendered tiles into a single mosaic from camera grid positions.
+
+    Returns (mosaic_path, ssim_score). ssim_score is None if no ODM reference.
+    """
+    from PIL import Image as PILImage
+
+    render_files = sorted(Path(render_dir).glob("*.jpg"))
+    if not render_files or not cameras:
+        return None, None
+
+    # Get camera XY positions
+    centers = np.array([c["center"][:2] for c in cameras[:len(render_files)]])
+    xy_min = centers.min(axis=0)
+    xy_max = centers.max(axis=0)
+    xy_range = xy_max - xy_min
+
+    # Determine grid dimensions from unique positions
+    unique_x = np.unique(np.round(centers[:, 0], 6))
+    unique_y = np.unique(np.round(centers[:, 1], 6))
+    n_x = max(1, len(unique_x))
+    n_y = max(1, len(unique_y))
+
+    # Scale tiles so mosaic fits in 2048x2048 max
+    tile_size = min(512, 2048 // max(n_x, n_y))
+    mosaic_w = n_x * tile_size
+    mosaic_h = n_y * tile_size
+
+    mosaic = PILImage.new("RGB", (mosaic_w, mosaic_h), (0, 0, 0))
+
+    for cam, render_file in zip(cameras[:len(render_files)], render_files):
+        cx, cy = cam["center"][0], cam["center"][1]
+
+        # Map to grid position
+        if xy_range[0] > 1e-6:
+            gx = int(round((cx - xy_min[0]) / xy_range[0] * (n_x - 1)))
+        else:
+            gx = 0
+        if xy_range[1] > 1e-6:
+            gy = int(round((cy - xy_min[1]) / xy_range[1] * (n_y - 1)))
+        else:
+            gy = 0
+
+        gx = max(0, min(gx, n_x - 1))
+        gy = max(0, min(gy, n_y - 1))
+
+        tile = PILImage.open(render_file).resize(
+            (tile_size, tile_size), PILImage.LANCZOS
+        )
+        mosaic.paste(tile, (gx * tile_size, gy * tile_size))
+
+    # Save mosaic
+    mosaic_path = os.path.join(render_dir, "..", "mosaic.jpg")
+    mosaic_path = os.path.abspath(mosaic_path)
+    mosaic.save(mosaic_path, "JPEG", quality=90)
+    print(f"  Stitched mosaic: {mosaic_w}x{mosaic_h} ({n_x}x{n_y} grid)")
+
+    # Compare against ODM orthophoto if available
+    ssim_score = None
+    if odm_orthophoto_path and os.path.exists(odm_orthophoto_path):
+        try:
+            import cv2
+            from skimage.metrics import structural_similarity as ssim
+
+            # Load ODM orthophoto and resize to match mosaic
+            odm_img = cv2.imread(odm_orthophoto_path)
+            if odm_img is not None:
+                odm_resized = cv2.resize(odm_img, (mosaic_w, mosaic_h),
+                                         interpolation=cv2.INTER_AREA)
+                mosaic_cv = cv2.cvtColor(np.array(mosaic), cv2.COLOR_RGB2BGR)
+
+                # Compute SSIM
+                ssim_score = ssim(odm_resized, mosaic_cv, channel_axis=2)
+                print(f"  SSIM vs ODM orthophoto: {ssim_score:.3f}")
+        except ImportError:
+            print("  skimage not available, skipping SSIM")
+        except Exception as e:
+            print(f"  SSIM computation failed: {e}")
+
+    return mosaic_path, ssim_score
+
+
+# ---------------------------------------------------------------------------
 # FOV schedule
 # ---------------------------------------------------------------------------
 
@@ -723,6 +868,8 @@ def main():
     )
     parser.add_argument("--slack_webhook_url", default="", help="Slack webhook URL")
     parser.add_argument("--job_id", default="", help="Job ID for Slack notifications")
+    parser.add_argument("--odm_orthophoto", default="",
+                        help="Path to ODM orthophoto for SSIM comparison at each level")
     args = parser.parse_args()
 
     altitudes = [float(a) for a in args.altitudes.split(",")]
@@ -782,6 +929,19 @@ def main():
         level_dir = os.path.join(args.output_dir, f"level_{level_idx}_{altitude:.3f}")
         render_dir = os.path.join(level_dir, "renders")
         render_from_splat(current_model_path, cameras, render_dir, args.scene_path)
+
+        # Stitch rendered tiles into mosaic + send to Slack
+        mosaic_path, ssim_score = stitch_level_mosaic(
+            render_dir, cameras,
+            odm_orthophoto_path=args.odm_orthophoto if args.odm_orthophoto else None,
+        )
+        if mosaic_path:
+            ssim_str = f" | SSIM={ssim_score:.3f}" if ssim_score is not None else ""
+            notify_slack_with_image(
+                f"Level {level_idx+1}/{len(altitudes)} renders (~{real_alt:.0f}m AGL, "
+                f"{len(cameras)} views{ssim_str})",
+                mosaic_path, args.slack_webhook_url, args.job_id,
+            )
 
         # FLUX enhancement (skip at drone altitude — already have real images)
         if not args.skip_flux and altitude < 0.9:
