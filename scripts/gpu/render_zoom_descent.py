@@ -131,6 +131,67 @@ def notify_slack_with_image(message, image_path, webhook_url, job_id, status="in
         notify_slack(message, webhook_url, job_id, status)
 
 
+def verify_mosaic_with_gemini(mosaic_path, level_name, webhook_url, job_id):
+    """Send descent mosaic to Gemini Vision for quality check."""
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if not gemini_key:
+        print(f"  Gemini verify skipped (no API key)")
+        return
+
+    try:
+        import base64
+        import urllib.request
+        from PIL import Image as PILImage
+
+        img = PILImage.open(mosaic_path).convert("RGB")
+        img.thumbnail((512, 512))
+
+        import io
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+
+        prompt = (
+            "This is a stitched mosaic of rendered views from a Gaussian Splat at "
+            f"{level_name}. Does it look like a coherent aerial view of terrain? "
+            "Check for: black gaps, washed-out regions, splat artifacts, missing "
+            "detail, blurry areas. Reply PASS or FAIL followed by a one-sentence reason."
+        )
+
+        payload = json.dumps({
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                ]
+            }]
+        })
+
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.5-flash:generateContent?key={gemini_key}"
+        )
+        req = urllib.request.Request(
+            url, data=payload.encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=30)
+        data = json.loads(resp.read())
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        passed = text.upper().startswith("PASS")
+        status = "success" if passed else "error"
+        print(f"  Gemini verify [{level_name}]: {text}")
+
+        emoji = "\u2705" if passed else "\u26a0\ufe0f"
+        notify_slack(
+            f"{emoji} Gemini verify [{level_name}]: {text}",
+            webhook_url, job_id, status,
+        )
+    except Exception as e:
+        print(f"  Gemini verify failed ({e}), continuing")
+
+
 def load_point_cloud(model_path):
     """Load the PLY point cloud and return positions as numpy array."""
     # Search for trained Gaussian splat checkpoints (prefer highest iteration)
@@ -758,6 +819,11 @@ def main():
                 f"Level {level_idx+1}/{len(altitudes)} renders (~{real_alt:.0f}m AGL, "
                 f"{len(cameras)} views{ssim_str})",
                 mosaic_path, args.slack_webhook_url, args.job_id,
+            )
+            verify_mosaic_with_gemini(
+                mosaic_path,
+                f"Level {level_idx+1} (~{real_alt:.0f}m AGL)",
+                args.slack_webhook_url, args.job_id,
             )
 
         # Add renders to training set
