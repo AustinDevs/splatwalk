@@ -66,22 +66,32 @@ def notify_slack(message, webhook_url, job_id, status="info"):
 
 
 def upload_to_cdn(local_path, remote_key):
-    """Upload a file to DO Spaces CDN. Returns the public URL."""
+    """Upload a file to DO Spaces CDN via boto3. Returns the public URL."""
     endpoint = os.environ.get("SPACES_ENDPOINT", "")
     bucket = os.environ.get("SPACES_BUCKET", "")
-    if not endpoint or not bucket:
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+    if not endpoint or not bucket or not access_key:
         return f"file://{os.path.abspath(local_path)}"
-    cmd = [
-        "aws", "s3", "cp", local_path,
-        f"s3://{bucket}/{remote_key}",
-        "--endpoint-url", endpoint,
-        "--acl", "public-read",
-        "--content-type", "image/jpeg",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+    try:
+        import boto3
+        session = boto3.session.Session()
+        client = session.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=os.environ.get("AWS_DEFAULT_REGION", "nyc3"),
+        )
+        content_type = "image/jpeg" if local_path.endswith(".jpg") else "application/octet-stream"
+        client.upload_file(
+            local_path, bucket, remote_key,
+            ExtraArgs={"ACL": "public-read", "ContentType": content_type},
+        )
+        return f"{endpoint}/{bucket}/{remote_key}"
+    except Exception as e:
+        print(f"  CDN upload failed: {e}")
         return f"file://{os.path.abspath(local_path)}"
-    return f"{endpoint}/{bucket}/{remote_key}"
 
 
 def notify_slack_with_image(message, image_path, webhook_url, job_id, status="info"):
