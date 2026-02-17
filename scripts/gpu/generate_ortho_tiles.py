@@ -118,9 +118,13 @@ def enhance_tiles_with_realesrgan(parent_tiles, zoom_level, tile_size=512):
         num_in_ch=3, num_out_ch=3, num_feat=64,
         num_block=23, num_grow_ch=32, scale=2,
     )
+    # Look for model weights on volume, then current dir
+    model_path = "/mnt/splatwalk/models/RealESRGAN_x2plus.pth"
+    if not os.path.exists(model_path):
+        model_path = "RealESRGAN_x2plus.pth"
     upsampler = RealESRGANer(
         scale=2,
-        model_path="RealESRGAN_x2plus.pth",
+        model_path=model_path,
         model=model,
         tile=512,
         tile_pad=32,

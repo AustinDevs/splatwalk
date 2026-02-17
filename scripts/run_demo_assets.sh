@@ -208,6 +208,24 @@ if ! /mnt/splatwalk/conda/bin/python --version > /dev/null 2>&1; then
   notify_slack "Volume setup complete!"
 fi
 
+# --- Ensure Real-ESRGAN is installed (handles existing volumes without it) ---
+export PATH="/mnt/splatwalk/conda/bin:$PATH"
+if ! /mnt/splatwalk/conda/bin/python -c "import realesrgan" 2>/dev/null; then
+  notify_slack "Installing Real-ESRGAN on existing volume..."
+  /mnt/splatwalk/conda/bin/pip install --no-cache-dir realesrgan 2>&1 | tail -3
+  # Download model weights
+  /mnt/splatwalk/conda/bin/python -c "
+import os, urllib.request
+model_path = '/mnt/splatwalk/models/RealESRGAN_x2plus.pth'
+if not os.path.exists(model_path):
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    urllib.request.urlretrieve(
+        'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth',
+        model_path)
+    print(f'Downloaded RealESRGAN_x2plus.pth ({os.path.getsize(model_path)/1e6:.1f}MB)')
+"
+fi
+
 notify_slack "Volume ready. Downloading dataset..."
 
 # --- Download aukerman dataset ---
