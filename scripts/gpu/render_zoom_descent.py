@@ -2,8 +2,7 @@
 """
 Stage 3: Top-Down Progressive Zoom Descent
 
-Replaces the old render_descent.py which tried to slerp cameras toward the horizon.
-This version keeps ALL cameras looking straight down (nadir) and progressively
+Keeps ALL cameras looking straight down (nadir) and progressively
 zooms from drone altitude to ~3m AGL, generating a high-res overhead splat.
 
 Algorithm:
@@ -13,17 +12,15 @@ Algorithm:
      a. Generate nadir camera grid tiling the scene footprint at that altitude
      b. Narrow FOV as altitude decreases (simulates zoom / tighter crop)
      c. Render from current splat at those poses
-     d. Run FLUX ControlNet on each render: depth as structure, nearest aerial
-        crop as IP-Adapter reference
-     e. Add FLUX outputs to training image set
-     f. Retrain splat for N iterations with densification enabled
+     d. Add renders to training image set
+     e. Retrain splat for N iterations with densification enabled
   4. Final model ready for compression
 
-Key difference from render_descent.py:
+Key design:
   - Cameras ALWAYS look straight down (no slerp toward horizon)
   - Camera grid tiles the scene footprint (not just reusing drone positions)
   - FOV narrows at lower altitudes (zoom effect)
-  - FLUX generates top-down terrain crops (much easier than inventing horizons)
+  - Pure render + retrain loop — no generative enhancement (deterministic)
 """
 
 import argparse
@@ -464,190 +461,6 @@ def _render_fallback(model_path, output_dir, scene_path):
 
 
 # ---------------------------------------------------------------------------
-# FLUX ControlNet enhancement
-# ---------------------------------------------------------------------------
-
-def enhance_with_flux(render_dir, cameras, poses, scene_images_dir,
-                      altitude_fraction, drone_agl, prompt_base=""):
-    """Run FLUX ControlNet + IP-Adapter on rendered nadir views.
-
-    Generates higher-detail top-down terrain crops using:
-      - Depth map from splat render as ControlNet structure
-      - Nearest aerial drone image as IP-Adapter style reference
-      - Altitude-aware prompt for terrain detail level
-    """
-    import torch
-    from PIL import Image as PILImage
-
-    render_files = sorted(Path(render_dir).glob("*.jpg"))
-    if not render_files:
-        print("  No renders to enhance")
-        return
-
-    # Estimate depth maps first
-    depth_dir = render_dir + "_depth"
-    os.makedirs(depth_dir, exist_ok=True)
-    _estimate_depth_maps(render_dir, depth_dir)
-
-    # Build altitude-aware prompt
-    real_alt = altitude_fraction * drone_agl if drone_agl > 0 else altitude_fraction * 60
-    prompt = (f"high resolution aerial orthophoto of terrain from {real_alt:.0f}m altitude, "
-              f"nadir top-down view, {prompt_base}, "
-              f"sharp detail, photorealistic, no horizon visible")
-
-    # Load FLUX pipeline
-    print(f"  Loading FLUX ControlNet for altitude level {altitude_fraction:.3f}...")
-
-    # Monkey-patch: PyTorch 2.4 doesn't support enable_gqa
-    _orig_sdpa = torch.nn.functional.scaled_dot_product_attention
-    def _patched_sdpa(*args, **kwargs):
-        kwargs.pop("enable_gqa", None)
-        return _orig_sdpa(*args, **kwargs)
-    torch.nn.functional.scaled_dot_product_attention = _patched_sdpa
-
-    from diffusers import FluxControlNetPipeline, FluxControlNetModel
-
-    controlnet = FluxControlNetModel.from_pretrained(
-        "XLabs-AI/flux-controlnet-depth-diffusers",
-        torch_dtype=torch.bfloat16,
-    )
-    pipe = FluxControlNetPipeline.from_pretrained(
-        "black-forest-labs/FLUX.1-dev",
-        controlnet=controlnet,
-        torch_dtype=torch.bfloat16,
-    )
-    pipe.to("cuda")
-
-    # Load IP-Adapter
-    ip_adapter_loaded = False
-    try:
-        pipe.load_ip_adapter(
-            "XLabs-AI/flux-ip-adapter-v2",
-            weight_name="ip_adapter.safetensors",
-            image_encoder_pretrained_model_name_or_path="openai/clip-vit-large-patch14",
-        )
-        pipe.set_ip_adapter_scale(0.6)
-        ip_adapter_loaded = True
-        print("  IP-Adapter loaded (scale=0.6)")
-    except Exception as e:
-        print(f"  IP-Adapter failed ({e}), continuing without it")
-
-    flux_dir = render_dir + "_flux"
-    os.makedirs(flux_dir, exist_ok=True)
-
-    depth_files = sorted(Path(depth_dir).glob("*.jpg"))
-
-    for idx, (render_file, depth_file) in enumerate(zip(render_files, depth_files)):
-        blurry_render = PILImage.open(render_file).convert("RGB")
-
-        # Skip very dark renders
-        avg_brightness = np.array(blurry_render).mean()
-        if avg_brightness < 15:
-            print(f"  Skipping view {idx} (too dark, brightness={avg_brightness:.1f})")
-            continue
-
-        depth_map = PILImage.open(depth_file).convert("RGB").resize(
-            (1024, 1024), PILImage.LANCZOS
-        )
-
-        gen_kwargs = dict(
-            prompt=prompt,
-            control_image=depth_map,
-            controlnet_conditioning_scale=0.4,
-            num_inference_steps=28,
-            guidance_scale=4.0,
-            height=1024,
-            width=1024,
-        )
-
-        # IP-Adapter reference from nearest aerial image
-        if ip_adapter_loaded and idx < len(cameras):
-            aerial_crop = _find_nearest_aerial_crop(
-                cameras[idx], poses, scene_images_dir
-            )
-            if aerial_crop is not None:
-                gen_kwargs["ip_adapter_image"] = aerial_crop
-
-        result = pipe(**gen_kwargs).images[0]
-        result = result.resize((512, 512), PILImage.LANCZOS)
-        out_name = render_file.stem.replace("zoom_", "flux_") + ".jpg"
-        result.save(os.path.join(flux_dir, out_name), "JPEG", quality=95)
-
-        if (idx + 1) % 10 == 0:
-            print(f"  FLUX: {idx + 1}/{len(render_files)} views enhanced")
-
-    print(f"  FLUX enhanced {len(list(Path(flux_dir).glob('*.jpg')))} views")
-
-    del pipe, controlnet
-    torch.cuda.empty_cache()
-
-    return flux_dir
-
-
-def _estimate_depth_maps(rgb_dir, depth_dir):
-    """Estimate depth maps using Depth-Anything-V2."""
-    import torch
-    from PIL import Image as PILImage
-
-    try:
-        from transformers import pipeline as hf_pipeline
-        depth_estimator = hf_pipeline(
-            "depth-estimation",
-            model="depth-anything/Depth-Anything-V2-Small-hf",
-            device="cuda",
-        )
-    except Exception as e:
-        print(f"  Depth estimation failed to load ({e}), using grayscale fallback")
-        for img_file in sorted(Path(rgb_dir).glob("*.jpg")):
-            img = PILImage.open(img_file).convert("L")
-            img.save(os.path.join(depth_dir, img_file.name), "JPEG")
-        return
-
-    for img_file in sorted(Path(rgb_dir).glob("*.jpg")):
-        img = PILImage.open(img_file).convert("RGB")
-        result = depth_estimator(img)
-        depth = result["depth"]
-        if not isinstance(depth, PILImage.Image):
-            depth = PILImage.fromarray(np.array(depth))
-        depth = depth.convert("RGB").resize(img.size, PILImage.LANCZOS)
-        depth.save(os.path.join(depth_dir, img_file.name), "JPEG", quality=90)
-
-    del depth_estimator
-    torch.cuda.empty_cache()
-    print(f"  Estimated {len(list(Path(depth_dir).glob('*.jpg')))} depth maps")
-
-
-def _find_nearest_aerial_crop(camera, poses, scene_images_dir):
-    """Find the nearest original aerial image to use as IP-Adapter reference."""
-    from PIL import Image as PILImage
-
-    cam_xy = camera["center"][:2]
-    min_dist = float("inf")
-    nearest_pose = None
-
-    for pose in poses:
-        d = np.linalg.norm(pose["center"][:2] - cam_xy)
-        if d < min_dist:
-            min_dist = d
-            nearest_pose = pose
-
-    if nearest_pose is None:
-        return None
-
-    img_path = os.path.join(scene_images_dir, nearest_pose["image_name"])
-    if not os.path.exists(img_path):
-        # Try lowercase
-        img_path = os.path.join(scene_images_dir, nearest_pose["image_name"].lower())
-    if not os.path.exists(img_path):
-        return None
-
-    try:
-        return PILImage.open(img_path).convert("RGB").resize((512, 512), PILImage.LANCZOS)
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
 # Retraining
 # ---------------------------------------------------------------------------
 
@@ -698,7 +511,7 @@ def retrain_model(scene_path, model_path, output_model_path, iterations, n_views
 # ---------------------------------------------------------------------------
 
 def caption_scene(scene_images_dir):
-    """Generate a scene description using Gemini for FLUX prompts."""
+    """Generate a scene description using Gemini."""
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     if not gemini_key:
         return "grass, trees, pavement, residential area"
@@ -872,10 +685,6 @@ def main():
         "--max_images_per_level", type=int, default=64,
         help="Max images to generate per altitude level",
     )
-    parser.add_argument(
-        "--skip_flux", action="store_true",
-        help="Skip FLUX enhancement (render-only mode for testing)",
-    )
     parser.add_argument("--slack_webhook_url", default="", help="Slack webhook URL")
     parser.add_argument("--job_id", default="", help="Job ID for Slack notifications")
     parser.add_argument("--odm_orthophoto", default="",
@@ -903,9 +712,7 @@ def main():
     poses = load_camera_poses(args.scene_path)
     print(f"  Found {len(poses)} camera poses")
 
-    # Caption scene for FLUX prompts
     scene_images_dir = os.path.join(args.scene_path, "images")
-    prompt_base = caption_scene(scene_images_dir)
 
     current_model_path = args.model_path
     n_views = min(len(poses), 24)
@@ -953,23 +760,12 @@ def main():
                 mosaic_path, args.slack_webhook_url, args.job_id,
             )
 
-        # FLUX enhancement (skip at drone altitude — already have real images)
-        if not args.skip_flux and altitude < 0.9:
-            flux_dir = enhance_with_flux(
-                render_dir, cameras, poses, scene_images_dir,
-                altitude, args.drone_agl, prompt_base,
-            )
-
-            # Add FLUX-enhanced images to training set
-            if flux_dir and os.path.exists(flux_dir):
-                for img_file in Path(flux_dir).glob("*.jpg"):
-                    shutil.copy2(str(img_file), os.path.join(scene_images_dir, img_file.name))
-                print(f"  Added {len(list(Path(flux_dir).glob('*.jpg')))} FLUX images to training set")
-        else:
-            # Add renders to training set (for drone altitude or skip_flux mode)
-            for img_file in Path(render_dir).glob("*.jpg"):
-                shutil.copy2(str(img_file), os.path.join(scene_images_dir, img_file.name))
-            print(f"  Added {len(list(Path(render_dir).glob('*.jpg')))} render images to training set")
+        # Add renders to training set
+        added = 0
+        for img_file in Path(render_dir).glob("*.jpg"):
+            shutil.copy2(str(img_file), os.path.join(scene_images_dir, img_file.name))
+            added += 1
+        print(f"  Added {added} render images to training set")
 
         # Retrain
         updated_n_views = len(list(Path(scene_images_dir).glob("*.jpg")))

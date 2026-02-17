@@ -6,12 +6,12 @@ set -euo pipefail
 #
 # Uses the aukerman dataset to:
 # 1. Run MASt3R init + 10K InstantSplat training (~10 min)
-# 2. Top-down progressive zoom descent: 5 altitude levels with FLUX
-#    enhancement + retraining at each level (~60 min)
+# 2. Top-down progressive zoom descent: 5 altitude levels with
+#    render + retrain at each level (~20 min)
 # 3. Compress .splat + upload manifest.json to Spaces CDN
 # 4. Self-destruct
 #
-# Total estimated time: ~90 min on H100 (~$10)
+# Total estimated time: ~40-50 min on RTX 4000 Ada (~$0.50)
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -234,7 +234,6 @@ notify_slack "Dataset ready ($NUM_IMAGES images). Starting pipeline..."
 
 # --- Set up environment ---
 export PATH="/mnt/splatwalk/conda/bin:$PATH"
-export HF_HOME=/mnt/splatwalk/models/flux
 export TRANSFORMERS_CACHE=/mnt/splatwalk/models/transformers
 export HF_TOKEN=__HF_TOKEN__
 export GEMINI_API_KEY='__GEMINI_API_KEY__'
@@ -368,7 +367,7 @@ python train.py \
     --test_iterations 10001 \
     || { notify_slack "Failed at Stage 2" "error"; exit 1; }
 
-notify_slack "Stage 2 complete (10K aerial splat trained). Starting zoom descent..."
+notify_slack "Stage 2 complete (10K aerial splat trained). Starting render+retrain descent..."
 
 # --- Extract EXIF GPS + altitude ---
 DRONE_AGL=63  # default for aukerman
@@ -529,7 +528,7 @@ echo ""
 echo "The droplet will:"
 echo "  1. Attach Volume + download aukerman dataset"
 echo "  2. Run MASt3R init + 10K InstantSplat training (~10 min)"
-echo "  3. Top-down zoom descent: 5 altitude levels + FLUX (~60 min)"
+echo "  3. Top-down zoom descent: 5 altitude levels render+retrain (~20 min)"
 echo "  4. Compress .splat + upload to CDN (~5 min)"
 echo "  5. Self-destruct"
 echo ""
@@ -560,4 +559,4 @@ done
 
 echo ""
 echo "Launcher done. Droplet is running autonomously."
-echo "It will self-destruct when finished (~90 min total)."
+echo "It will self-destruct when finished (~40-50 min total)."

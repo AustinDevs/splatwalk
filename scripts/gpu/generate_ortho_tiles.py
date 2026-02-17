@@ -3,14 +3,13 @@
 Generate 2D Orthomosaic Deep-Zoom Tile Pyramid
 
 Takes an ODM orthophoto (GeoTIFF), tiles it as Level 0, then progressively
-enhances tiles with FLUX to create multiple zoom levels.
+enhances tiles with Real-ESRGAN to create multiple zoom levels.
 Uploads tile pyramid to CDN in {z}/{x}/{y}.jpg format for Leaflet viewer.
 
 Pipeline:
   1. Load ODM orthophoto as Level 0
-  2. FLUX Img2Img refinement (Levels 1-2): upscale 2x, enhance tiles
-  3. Bicubic upscale + sharpen (Levels 3-4)
-  4. Upload tile pyramid to CDN + generate ortho_manifest.json
+  2. Real-ESRGAN 2x upscale at each zoom level (deterministic, no hallucination)
+  3. Upload tile pyramid to CDN + generate ortho_manifest.json
 
 Usage:
     python generate_ortho_tiles.py \
@@ -79,7 +78,7 @@ def save_tiles(tiles, zoom_level, output_dir):
 
 
 # ---------------------------------------------------------------------------
-# FLUX enhancement for tiles
+# Real-ESRGAN enhancement for tiles
 # ---------------------------------------------------------------------------
 
 def reconstruct_image_from_tiles(tiles, tile_size=512):
@@ -98,157 +97,47 @@ def reconstruct_image_from_tiles(tiles, tile_size=512):
     return image
 
 
-def enhance_tiles_with_flux(parent_tiles, zoom_level, output_dir, scene_images_dir,
-                            prompt_base="", skip_flux=False, flux_strength=0.25,
-                            tile_size=512):
-    """Stitch-first FLUX Img2Img enhancement for a zoom level.
+def enhance_tiles_with_realesrgan(parent_tiles, zoom_level, tile_size=512):
+    """Real-ESRGAN 2x upscale. Deterministic, no hallucination, ~200ms per image.
 
     1. Reconstruct full parent image from tiles
-    2. Upscale 2x with Lanczos
-    3. Slice into grid of tile_size patches (with overlap for seamless edges)
-    4. Run FluxImg2ImgPipeline on each patch at low strength
-    5. Stitch enhanced patches back and slice into final tiles
+    2. Run Real-ESRGAN 2x upscale (tile-based for memory efficiency)
+    3. Slice result into child tiles
 
     Returns list of (x, y, tile) for the child level.
     """
-    if skip_flux:
-        return _upscale_tiles_bicubic(parent_tiles, zoom_level, output_dir)
-
     import torch
-    from PIL import Image as PILImage
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+    from realesrgan import RealESRGANer
 
-    # Reconstruct parent-level full image
     parent_image = reconstruct_image_from_tiles(parent_tiles, tile_size)
     ph, pw = parent_image.shape[:2]
     print(f"  Reconstructed parent image: {pw}x{ph}")
 
-    # Upscale 2x with Lanczos
-    new_w, new_h = pw * 2, ph * 2
-    upscaled = cv2.resize(parent_image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    print(f"  Upscaled to {new_w}x{new_h}")
-
-    # Monkey-patch: PyTorch 2.4 doesn't support enable_gqa
-    _orig_sdpa = torch.nn.functional.scaled_dot_product_attention
-    def _patched_sdpa(*args, **kwargs):
-        kwargs.pop("enable_gqa", None)
-        return _orig_sdpa(*args, **kwargs)
-    torch.nn.functional.scaled_dot_product_attention = _patched_sdpa
-
-    from diffusers import FluxImg2ImgPipeline
-
-    pipe = FluxImg2ImgPipeline.from_pretrained(
-        "black-forest-labs/FLUX.1-dev",
-        torch_dtype=torch.bfloat16,
+    model = RRDBNet(
+        num_in_ch=3, num_out_ch=3, num_feat=64,
+        num_block=23, num_grow_ch=32, scale=2,
     )
-    pipe.to("cuda")
+    upsampler = RealESRGANer(
+        scale=2,
+        model_path="RealESRGAN_x2plus.pth",
+        model=model,
+        tile=512,
+        tile_pad=32,
+        pre_pad=0,
+        half=True,
+        gpu_id=0,
+    )
 
-    prompt = f"aerial orthophoto, nadir view, {prompt_base}, sharp, photorealistic"
+    output, _ = upsampler.enhance(parent_image, outscale=2)
+    new_h, new_w = output.shape[:2]
+    print(f"  Real-ESRGAN upscaled to {new_w}x{new_h}")
 
-    # Process tiles with overlap for seamless edges
-    overlap = 64
-    nx = math.ceil(new_w / tile_size)
-    ny = math.ceil(new_h / tile_size)
-
-    # Output canvas for enhanced image
-    enhanced = np.zeros((new_h, new_w, 3), dtype=np.float64)
-    weight_map = np.zeros((new_h, new_w), dtype=np.float64)
-
-    total_patches = nx * ny
-    patch_idx = 0
-
-    for ty in range(ny):
-        for tx in range(nx):
-            patch_idx += 1
-
-            # Tile region in the upscaled image
-            x0 = tx * tile_size
-            y0 = ty * tile_size
-            x1 = min(x0 + tile_size, new_w)
-            y1 = min(y0 + tile_size, new_h)
-
-            # Expand with overlap (clamped to image bounds)
-            ex0 = max(x0 - overlap, 0)
-            ey0 = max(y0 - overlap, 0)
-            ex1 = min(x1 + overlap, new_w)
-            ey1 = min(y1 + overlap, new_h)
-
-            patch = upscaled[ey0:ey1, ex0:ex1]
-
-            # Skip very dark patches (background)
-            if patch.mean() < 15:
-                # Just use the upscaled data directly
-                enhanced[y0:y1, x0:x1] += upscaled[y0:y1, x0:x1].astype(np.float64)
-                weight_map[y0:y1, x0:x1] += 1.0
-                continue
-
-            # Resize patch to 512x512 for FLUX input
-            patch_pil = PILImage.fromarray(cv2.cvtColor(patch, cv2.COLOR_BGR2RGB))
-            patch_pil = patch_pil.resize((512, 512), PILImage.LANCZOS)
-
-            result = pipe(
-                prompt=prompt,
-                image=patch_pil,
-                strength=flux_strength,
-                num_inference_steps=20,
-                guidance_scale=3.5,
-                height=512,
-                width=512,
-            ).images[0]
-
-            result_np = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
-
-            # Resize result back to the expanded patch size
-            result_resized = cv2.resize(result_np, (ex1 - ex0, ey1 - ey0),
-                                        interpolation=cv2.INTER_LANCZOS4)
-
-            # Compute offset of the core tile within the expanded patch
-            core_x0 = x0 - ex0
-            core_y0 = y0 - ey0
-            core_x1 = core_x0 + (x1 - x0)
-            core_y1 = core_y0 + (y1 - y0)
-
-            # Only use the core region (discard overlap margins)
-            core = result_resized[core_y0:core_y1, core_x0:core_x1]
-            enhanced[y0:y1, x0:x1] += core.astype(np.float64)
-            weight_map[y0:y1, x0:x1] += 1.0
-
-            if patch_idx % 10 == 0 or patch_idx == total_patches:
-                print(f"  FLUX Img2Img: {patch_idx}/{total_patches} patches "
-                      f"(strength={flux_strength})")
-
-    # Normalize
-    valid = weight_map > 0
-    for c in range(3):
-        enhanced[:, :, c][valid] /= weight_map[valid]
-    enhanced = enhanced.clip(0, 255).astype(np.uint8)
-
-    del pipe
+    del upsampler
     torch.cuda.empty_cache()
 
-    # Slice final enhanced image into tiles
-    child_tiles = tile_image(enhanced, tile_size)
-
-    print(f"  FLUX enhanced level {zoom_level}: {len(child_tiles)} tiles "
-          f"({new_w}x{new_h})")
-    return child_tiles
-
-
-def _upscale_tiles_bicubic(tiles, zoom_level, output_dir):
-    """Bicubic upscale: each parent tile becomes 4 child tiles."""
-    child_tiles = []
-    for tx, ty, tile in tiles:
-        upscaled = cv2.resize(tile, (1024, 1024), interpolation=cv2.INTER_CUBIC)
-        # Unsharp mask for sharpening
-        blurred = cv2.GaussianBlur(upscaled, (0, 0), 3)
-        upscaled = cv2.addWeighted(upscaled, 1.5, blurred, -0.5, 0)
-        upscaled = np.clip(upscaled, 0, 255).astype(np.uint8)
-
-        for dy in range(2):
-            for dx in range(2):
-                child = upscaled[dy*512:(dy+1)*512, dx*512:(dx+1)*512]
-                child_tiles.append((tx*2 + dx, ty*2 + dy, child))
-
-    print(f"  Bicubic upscaled {len(tiles)} -> {len(child_tiles)} tiles")
+    child_tiles = tile_image(output, tile_size)
+    print(f"  Level {zoom_level}: {len(child_tiles)} tiles ({new_w}x{new_h})")
     return child_tiles
 
 
@@ -448,20 +337,14 @@ def main():
     parser.add_argument("--odm_orthophoto", required=True,
                         help="Path to ODM orthophoto GeoTIFF")
     parser.add_argument("--scene_path", default="",
-                        help="Scene dir with images/ (for FLUX captioning)")
+                        help="Scene dir with images/ (for captioning)")
     parser.add_argument("--output_dir", required=True, help="Output directory for tiles")
     parser.add_argument("--job_id", default="aukerman", help="Job ID for CDN paths")
-    parser.add_argument("--max_enhance_level", type=int, default=2,
-                        help="Max zoom level to FLUX-enhance (default 2)")
     parser.add_argument("--total_levels", type=int, default=5,
                         help="Total zoom levels 0-N (default 5)")
     parser.add_argument("--canvas_size", type=int, default=2048,
                         help="Base orthomosaic canvas size (default 2048)")
     parser.add_argument("--tile_size", type=int, default=512, help="Tile size (default 512)")
-    parser.add_argument("--flux_strength", type=float, default=0.25,
-                        help="FLUX Img2Img strength (default 0.25, lower=subtler)")
-    parser.add_argument("--skip_flux", action="store_true",
-                        help="Skip FLUX enhancement (bicubic only)")
     parser.add_argument("--slack_webhook_url", default="")
     args = parser.parse_args()
 
@@ -472,7 +355,7 @@ def main():
 
     print("=== Orthomosaic Deep-Zoom Tile Generator ===")
     print(f"ODM orthophoto: {args.odm_orthophoto}")
-    print(f"Levels: 0-{args.total_levels - 1} (FLUX through level {args.max_enhance_level})")
+    print(f"Levels: 0-{args.total_levels - 1} (Real-ESRGAN 2x upscale per level)")
 
     notify_slack("Ortho: starting tile generation...",
                  args.slack_webhook_url, args.job_id)
@@ -526,7 +409,7 @@ def main():
     current_tiles = tile_image(ortho, args.tile_size)
     save_tiles(current_tiles, 0, tiles_dir)
 
-    # Caption scene for FLUX prompts
+    # Caption scene for manifest metadata
     scene_images_dir = os.path.join(args.scene_path, "images") if args.scene_path else ""
     if scene_images_dir and os.path.isdir(scene_images_dir):
         prompt_base = caption_scene(scene_images_dir)
@@ -539,17 +422,11 @@ def main():
         image_dim *= 2
         print(f"\nStep 2.{level}: Zoom level {level} ({image_dim}x{image_dim})...")
 
-        if level <= args.max_enhance_level and not args.skip_flux:
-            notify_slack(f"Ortho: FLUX enhancing level {level} ({len(current_tiles)} tiles)...",
-                         args.slack_webhook_url, args.job_id)
-            child_tiles = enhance_tiles_with_flux(
-                current_tiles, level, tiles_dir, scene_images_dir,
-                prompt_base=prompt_base, skip_flux=False,
-                flux_strength=args.flux_strength, tile_size=args.tile_size,
-            )
-        else:
-            # Bicubic upscale + sharpen
-            child_tiles = _upscale_tiles_bicubic(current_tiles, level, tiles_dir)
+        notify_slack(f"Ortho: Real-ESRGAN upscaling level {level} ({len(current_tiles)} tiles)...",
+                     args.slack_webhook_url, args.job_id)
+        child_tiles = enhance_tiles_with_realesrgan(
+            current_tiles, level, tile_size=args.tile_size,
+        )
 
         save_tiles(child_tiles, level, tiles_dir)
 
@@ -600,7 +477,7 @@ def main():
         "tile_size": args.tile_size,
         "min_zoom": 0,
         "max_zoom": args.total_levels - 1,
-        "max_enhanced_zoom": min(args.max_enhance_level, args.total_levels - 1),
+        "upscale_method": "realesrgan_x2plus",
         "image_width": final_dim,
         "image_height": final_dim,
         "scene_caption": prompt_base,
@@ -620,15 +497,14 @@ def main():
         upload_to_cdn(manifest_path, f"demo/{args.job_id}/ortho_manifest.json")
 
     notify_slack(
-        f"Ortho complete! {total_tiles} tiles, {args.total_levels} levels, "
-        f"FLUX through level {args.max_enhance_level}",
+        f"Ortho complete! {total_tiles} tiles, {args.total_levels} levels (Real-ESRGAN)",
         args.slack_webhook_url, args.job_id, "success",
     )
 
     print(f"\n=== Orthomosaic tile generation complete ===")
     print(f"  Total tiles: {total_tiles}")
     print(f"  Levels: 0-{args.total_levels - 1}")
-    print(f"  FLUX enhanced: 0-{args.max_enhance_level}")
+    print(f"  Upscale: Real-ESRGAN x2plus")
     print(f"  Final resolution: {final_dim}x{final_dim}")
     print(f"  Manifest: {manifest_path}")
 

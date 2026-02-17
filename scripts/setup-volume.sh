@@ -120,15 +120,11 @@ pip install --no-cache-dir \
 # Base Python packages
 pip install --no-cache-dir "numpy<2" scipy pillow tqdm einops timm boto3 awscli plyfile 2>&1 | tail -3
 
-# Diffusers + FLUX deps
-if python -c "import diffusers" 2>/dev/null; then
-    echo "diffusers already installed — skipping"
-else
-    echo "Installing diffusers + accelerate..."
-    pip install --no-cache-dir diffusers accelerate safetensors sentencepiece protobuf 2>&1 | tail -3
-fi
+# Real-ESRGAN (deterministic 2x upscale for ortho tiles)
+echo "Installing Real-ESRGAN..."
+pip install --no-cache-dir realesrgan 2>&1 | tail -3
 
-# Gemini API SDK (for Gemini-based captioning — replaces BLIP)
+# Gemini API SDK (for Gemini-based captioning)
 echo "Installing google-genai SDK..."
 pip install --no-cache-dir google-genai 2>&1 | tail -1
 
@@ -266,7 +262,7 @@ done || echo "  No files needed patching"
 echo ""
 echo "=== Step 6/9: Model weights ==="
 
-mkdir -p "$VOLUME_ROOT/models/dust3r" "$VOLUME_ROOT/models/mast3r" "$VOLUME_ROOT/models/flux"
+mkdir -p "$VOLUME_ROOT/models/dust3r" "$VOLUME_ROOT/models/mast3r"
 
 DUST3R_CKPT="$VOLUME_ROOT/models/dust3r/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
 MAST3R_CKPT="$VOLUME_ROOT/models/mast3r/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
@@ -323,46 +319,20 @@ except Exception as e:
 " || true
 fi
 
-# Pre-download FLUX models
-echo "Pre-downloading FLUX models (this takes a while)..."
-export HF_HOME="$VOLUME_ROOT/models/flux"
+# Pre-download Real-ESRGAN model weights
+echo "Pre-downloading Real-ESRGAN x2plus model..."
 python -c "
-from diffusers import FluxControlNetPipeline, FluxControlNetModel
-import torch
-
-print('Downloading FLUX ControlNet-depth...')
-cn = FluxControlNetModel.from_pretrained(
-    'XLabs-AI/flux-controlnet-depth-diffusers', torch_dtype=torch.bfloat16)
-
-print('Downloading FLUX.1-dev + pipeline...')
-pipe = FluxControlNetPipeline.from_pretrained(
-    'black-forest-labs/FLUX.1-dev', controlnet=cn,
-    torch_dtype=torch.bfloat16)
-
-print('All FLUX models cached.')
-" || echo "WARNING: FLUX model pre-download failed (models will download at runtime)"
-
-# Pre-download Depth-Anything-V2 (replaces MiDaS for depth estimation)
-echo "Pre-downloading Depth-Anything-V2..."
-python -c "
-from transformers import pipeline as tf_pipeline
-print('Downloading Depth-Anything-V2-Large...')
-p = tf_pipeline('depth-estimation', model='depth-anything/Depth-Anything-V2-Large-hf')
-del p
-print('Depth-Anything-V2 cached.')
-" || echo "WARNING: Depth-Anything-V2 pre-download failed (will download at runtime)"
-
-# Pre-download XLabs IP-Adapter v2 + CLIP encoder for FLUX (aerial texture matching)
-echo "Pre-downloading XLabs FLUX IP-Adapter v2 + CLIP encoder..."
-python -c "
-from huggingface_hub import hf_hub_download
-print('Downloading XLabs IP-Adapter v2...')
-hf_hub_download('XLabs-AI/flux-ip-adapter-v2', 'ip_adapter.safetensors')
-print('Downloading CLIP ViT-L/14 image encoder...')
-from transformers import CLIPVisionModelWithProjection
-CLIPVisionModelWithProjection.from_pretrained('openai/clip-vit-large-patch14')
-print('IP-Adapter + CLIP cached.')
-" || echo "WARNING: IP-Adapter pre-download failed (will download at runtime)"
+import os, urllib.request
+model_dir = '$VOLUME_ROOT/models'
+model_path = os.path.join(model_dir, 'RealESRGAN_x2plus.pth')
+if not os.path.exists(model_path):
+    url = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth'
+    print(f'Downloading {url}...')
+    urllib.request.urlretrieve(url, model_path)
+    print(f'Saved to {model_path} ({os.path.getsize(model_path) / 1e6:.1f}MB)')
+else:
+    print(f'Real-ESRGAN model already present ({os.path.getsize(model_path) / 1e6:.1f}MB)')
+" || echo "WARNING: Real-ESRGAN model download failed (will download at runtime)"
 
 # --- Step 7: Pipeline scripts ---
 echo ""
@@ -427,7 +397,7 @@ import open3d; print(f'Open3D {open3d.__version__}')
 import trimesh; print(f'Trimesh {trimesh.__version__}')
 import kornia; print(f'Kornia {kornia.__version__}')
 import transformers; print(f'Transformers {transformers.__version__}')
-import diffusers; print(f'Diffusers {diffusers.__version__}')
+import realesrgan; print('Real-ESRGAN OK')
 print('All imports OK')
 "
 
