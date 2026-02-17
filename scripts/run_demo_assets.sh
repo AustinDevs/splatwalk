@@ -278,8 +278,12 @@ fi
 ODM_TAR="/mnt/splatwalk/odm-docker.tar.gz"
 ODM_OUTPUT="/workspace/__JOB_ID__/output/odm"
 if [ ! -f "$ODM_TAR" ]; then
-    notify_slack "FATAL: ODM Docker image not cached on volume" "error"
-    exit 1
+    notify_slack "ODM: Docker image not cached — pulling and saving to volume (~5GB)..."
+    docker pull opendronemap/odm:latest \
+        || { notify_slack "FATAL: failed to pull ODM Docker image" "error"; exit 1; }
+    docker save opendronemap/odm:latest | gzip > "$ODM_TAR" \
+        || { notify_slack "FATAL: failed to save ODM Docker image to volume" "error"; exit 1; }
+    notify_slack "ODM Docker image cached on volume ($(du -h "$ODM_TAR" | cut -f1))"
 fi
 notify_slack "ODM: generating orthomosaic from original images..."
 docker load -i "$ODM_TAR" 2>/dev/null

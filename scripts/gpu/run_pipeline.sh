@@ -411,8 +411,12 @@ except Exception as e:
     local ODM_TAR="/mnt/splatwalk/odm-docker.tar.gz"
     local ODM_ORTHO_TIF="$ODM_OUTPUT/odm_orthophoto/odm_orthophoto.tif"
     if [ ! -f "$ODM_TAR" ]; then
-        notify_slack "FATAL: ODM Docker image not cached on volume" "error"
-        return 1
+        notify_slack "ODM: Docker image not cached — pulling and saving to volume (~5GB)..."
+        docker pull opendronemap/odm:latest \
+            || { notify_slack "FATAL: failed to pull ODM Docker image" "error"; return 1; }
+        docker save opendronemap/odm:latest | gzip > "$ODM_TAR" \
+            || { notify_slack "FATAL: failed to save ODM Docker image to volume" "error"; return 1; }
+        notify_slack "ODM Docker image cached on volume ($(du -h "$ODM_TAR" | cut -f1))"
     fi
     notify_slack "ODM: loading Docker image + generating orthomosaic..."
     docker load -i "$ODM_TAR" 2>/dev/null
