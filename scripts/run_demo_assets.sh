@@ -274,6 +274,29 @@ if [ -d "$INPUT_DIR/images" ]; then
     find "$INPUT_DIR/images" -type f \( -name "*.jpg" -o -name "*.JPG" -o -name "*.jpeg" -o -name "*.png" \) -exec mv {} "$INPUT_DIR/" \;
 fi
 
+# --- ODM Orthomosaic (full-res, all images — fatal on failure) ---
+ODM_TAR="/mnt/splatwalk/odm-docker.tar.gz"
+ODM_OUTPUT="/workspace/__JOB_ID__/output/odm"
+if [ ! -f "$ODM_TAR" ]; then
+    notify_slack "FATAL: ODM Docker image not cached on volume" "error"
+    exit 1
+fi
+notify_slack "ODM: generating orthomosaic from original images..."
+docker load -i "$ODM_TAR" 2>/dev/null
+mkdir -p "$ODM_OUTPUT"
+docker run --rm \
+    -v "$INPUT_DIR:/datasets/project/images" \
+    -v "$ODM_OUTPUT:/datasets/project" \
+    opendronemap/odm \
+    --project-path /datasets project \
+    --fast-orthophoto \
+    --orthophoto-resolution 5 \
+    --skip-3dmodel \
+    --max-concurrency 4 \
+    2>&1 | tail -20 \
+    || { notify_slack "FATAL: ODM orthomosaic failed" "error"; exit 1; }
+notify_slack "ODM orthomosaic complete"
+
 # --- Preprocess images to 512x512 ---
 SCENE_DIR=/workspace/__JOB_ID__/output/scene
 mkdir -p "$SCENE_DIR/images"
@@ -383,16 +406,20 @@ except Exception as e:
 
 echo "Drone AGL: ${DRONE_AGL}m"
 
-# --- Ortho tile generation (non-fatal, before zoom descent) ---
-notify_slack "Ortho: generating 2D tile pyramid..."
+# --- Ortho tile generation (requires ODM orthophoto — fatal on failure) ---
+ODM_ORTHO_TIF="$ODM_OUTPUT/odm_orthophoto/odm_orthophoto.tif"
+if [ ! -f "$ODM_ORTHO_TIF" ]; then
+    notify_slack "FATAL: ODM orthophoto not found at $ODM_ORTHO_TIF" "error"
+    exit 1
+fi
+notify_slack "Ortho: generating 2D tile pyramid from ODM orthophoto..."
 python /mnt/splatwalk/scripts/generate_ortho_tiles.py \
+    --odm_orthophoto "$ODM_ORTHO_TIF" \
     --scene_path "$SCENE_DIR" \
-    --model_path "/workspace/__JOB_ID__/output/instantsplat" \
     --output_dir "/workspace/__JOB_ID__/output/ortho" \
     --job_id "aukerman" \
-    --drone_agl "$DRONE_AGL" \
     --slack_webhook_url "$SLACK_WEBHOOK_URL" \
-    || notify_slack "Ortho generation failed (non-fatal)"
+    || { notify_slack "FATAL: Ortho tile generation failed" "error"; exit 1; }
 
 # --- Stage 3: Top-Down Progressive Zoom Descent ---
 notify_slack "Stage 3: Top-down zoom descent (5 altitude levels)..."

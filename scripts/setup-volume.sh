@@ -46,7 +46,7 @@ echo "============================================"
 
 # --- Step 1: Verify GPU ---
 echo ""
-echo "=== Step 1/8: Verify GPU ==="
+echo "=== Step 1/9: Verify GPU ==="
 if ! nvidia-smi; then
     echo "ERROR: No NVIDIA GPU detected. This script must run on a GPU droplet."
     exit 1
@@ -56,7 +56,7 @@ echo "GPU: $GPU_NAME"
 
 # --- Step 2: System packages ---
 echo ""
-echo "=== Step 2/8: System packages ==="
+echo "=== Step 2/9: System packages ==="
 if command -v ffmpeg &>/dev/null && command -v git &>/dev/null && dpkg -s build-essential &>/dev/null 2>&1; then
     echo "System packages already installed — skipping"
 else
@@ -71,7 +71,7 @@ fi
 
 # --- Step 3: Miniconda + Python 3.11 ---
 echo ""
-echo "=== Step 3/8: Miniconda + Python 3.11 ==="
+echo "=== Step 3/9: Miniconda + Python 3.11 ==="
 if [ -x "$VOLUME_ROOT/conda/bin/python" ]; then
     echo "Miniconda already installed on Volume"
 else
@@ -94,7 +94,7 @@ echo "Python: $(python --version 2>&1)"
 
 # --- Step 4: PyTorch + CUDA + all Python deps ---
 echo ""
-echo "=== Step 4/8: PyTorch + CUDA + Python packages ==="
+echo "=== Step 4/9: PyTorch + CUDA + Python packages ==="
 export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 
 if python -c "import torch; assert torch.cuda.is_available(); print(f'PyTorch {torch.__version__} CUDA OK')" 2>/dev/null; then
@@ -134,7 +134,7 @@ pip install --no-cache-dir google-genai 2>&1 | tail -1
 
 # --- Step 5: InstantSplat + CUDA extensions ---
 echo ""
-echo "=== Step 5/8: InstantSplat + CUDA extensions ==="
+echo "=== Step 5/9: InstantSplat + CUDA extensions ==="
 
 if [ -d "$VOLUME_ROOT/InstantSplat" ]; then
     echo "InstantSplat repo already cloned — skipping clone"
@@ -264,7 +264,7 @@ done || echo "  No files needed patching"
 
 # --- Step 6: Model weights ---
 echo ""
-echo "=== Step 6/8: Model weights ==="
+echo "=== Step 6/9: Model weights ==="
 
 mkdir -p "$VOLUME_ROOT/models/dust3r" "$VOLUME_ROOT/models/mast3r" "$VOLUME_ROOT/models/flux"
 
@@ -366,7 +366,7 @@ print('IP-Adapter + CLIP cached.')
 
 # --- Step 7: Pipeline scripts ---
 echo ""
-echo "=== Step 7/8: Pipeline scripts ==="
+echo "=== Step 7/9: Pipeline scripts ==="
 
 mkdir -p "$VOLUME_ROOT/scripts"
 
@@ -396,9 +396,27 @@ else
     echo "  Scripts will be fetched from GitHub at runtime instead."
 fi
 
-# --- Step 8: Verification ---
+# --- Step 8: ODM Docker image (for orthomosaic generation) ---
 echo ""
-echo "=== Step 8/8: Verification ==="
+echo "=== Step 8/9: ODM Docker image ==="
+ODM_TAR="$VOLUME_ROOT/odm-docker.tar.gz"
+if [ -f "$ODM_TAR" ]; then
+    echo "ODM Docker image already cached on Volume ($(du -h "$ODM_TAR" | cut -f1))"
+else
+    if command -v docker &>/dev/null; then
+        echo "Pulling and caching ODM Docker image..."
+        docker pull opendronemap/odm:latest
+        docker save opendronemap/odm:latest | gzip > "$ODM_TAR"
+        echo "Saved ODM image ($(du -h "$ODM_TAR" | cut -f1))"
+    else
+        echo "Docker not available — skipping ODM image cache"
+        echo "  Install Docker and re-run to enable ODM orthomosaic generation"
+    fi
+fi
+
+# --- Step 9: Verification ---
+echo ""
+echo "=== Step 9/9: Verification ==="
 
 echo "Checking key imports..."
 python -c "

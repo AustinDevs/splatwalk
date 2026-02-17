@@ -406,16 +406,43 @@ except Exception as e:
         fi
     fi
 
-    # Ortho tile generation (non-fatal, runs before zoom descent)
-    notify_slack "Ortho: generating 2D tile pyramid..."
+    # ODM Orthomosaic (full-res, all images → seamless Level 0 — fatal on failure)
+    local ODM_OUTPUT="$OUTPUT_DIR/odm"
+    local ODM_TAR="/mnt/splatwalk/odm-docker.tar.gz"
+    local ODM_ORTHO_TIF="$ODM_OUTPUT/odm_orthophoto/odm_orthophoto.tif"
+    if [ ! -f "$ODM_TAR" ]; then
+        notify_slack "FATAL: ODM Docker image not cached on volume" "error"
+        return 1
+    fi
+    notify_slack "ODM: loading Docker image + generating orthomosaic..."
+    docker load -i "$ODM_TAR" 2>/dev/null
+    mkdir -p "$ODM_OUTPUT"
+    docker run --rm \
+        -v "$INPUT_DIR:/datasets/project/images" \
+        -v "$ODM_OUTPUT:/datasets/project" \
+        opendronemap/odm \
+        --project-path /datasets project \
+        --fast-orthophoto \
+        --orthophoto-resolution 5 \
+        --skip-3dmodel \
+        --max-concurrency 4 \
+        2>&1 | tail -20 \
+        || { notify_slack "FATAL: ODM orthomosaic failed" "error"; return 1; }
+    notify_slack "ODM orthomosaic complete"
+
+    # Ortho tile generation (requires ODM orthophoto — fatal on failure)
+    if [ ! -f "$ODM_ORTHO_TIF" ]; then
+        notify_slack "FATAL: ODM orthophoto not found at $ODM_ORTHO_TIF" "error"
+        return 1
+    fi
+    notify_slack "Ortho: generating 2D tile pyramid from ODM orthophoto..."
     python /mnt/splatwalk/scripts/generate_ortho_tiles.py \
+        --odm_orthophoto "$ODM_ORTHO_TIF" \
         --scene_path "$scene_dir" \
-        --model_path "$OUTPUT_DIR/instantsplat" \
         --output_dir "$OUTPUT_DIR/ortho" \
         --job_id "$JOB_ID" \
-        --drone_agl "${DRONE_AGL:-63}" \
         --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
-        || notify_slack "Ortho generation failed (non-fatal)"
+        || { notify_slack "FATAL: Ortho tile generation failed" "error"; return 1; }
 
     # Stage 3: Top-Down Progressive Zoom Descent
     notify_slack "Stage 3: Top-down zoom descent (5 altitude levels)..."
