@@ -118,32 +118,28 @@ upload_log() {
   notify_slack "Log: __SPACES_ENDPOINT__/__SPACES_BUCKET__/$log_key"
 }
 
-# --- Self-destruct trap ---
+# --- Self-destruct trap --- ALWAYS destroys droplet on exit (success or failure)
 PIPELINE_SUCCESS=false
 self_destruct() {
   echo "EXIT trap fired (success=$PIPELINE_SUCCESS)..."
   upload_log
   if [ "$PIPELINE_SUCCESS" = "true" ]; then
-    echo "Pipeline succeeded — self-destructing..."
     notify_slack "Pipeline complete. Self-destructing." "success"
-    sleep 2
-    umount /mnt/splatwalk 2>/dev/null || true
-    DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
-    curl -s -X POST \
-      -H "Authorization: Bearer __DO_API_TOKEN__" \
-      -H "Content-Type: application/json" \
-      -d '{"type":"detach","droplet_id":'$DROPLET_ID'}' \
-      "https://api.digitalocean.com/v2/volumes/__DO_VOLUME_ID__/actions"
-    sleep 10
-    curl -s -X DELETE \
-      -H "Authorization: Bearer __DO_API_TOKEN__" \
-      "https://api.digitalocean.com/v2/droplets/$DROPLET_ID"
   else
-    echo "Pipeline FAILED — keeping droplet alive for SSH debugging."
-    echo "SSH in: ssh root@$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)"
-    echo "Logs: cat /var/log/splatwalk-job.log"
-    notify_slack "FAILED — droplet kept alive for debugging. SSH to check logs." "error"
+    notify_slack "Pipeline FAILED. Uploading logs + self-destructing." "error"
   fi
+  sleep 2
+  umount /mnt/splatwalk 2>/dev/null || true
+  DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
+  curl -s -X POST \
+    -H "Authorization: Bearer __DO_API_TOKEN__" \
+    -H "Content-Type: application/json" \
+    -d '{"type":"detach","droplet_id":'$DROPLET_ID'}' \
+    "https://api.digitalocean.com/v2/volumes/__DO_VOLUME_ID__/actions"
+  sleep 10
+  curl -s -X DELETE \
+    -H "Authorization: Bearer __DO_API_TOKEN__" \
+    "https://api.digitalocean.com/v2/droplets/$DROPLET_ID"
 }
 trap self_destruct EXIT
 
