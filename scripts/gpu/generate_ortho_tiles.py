@@ -107,6 +107,16 @@ def enhance_tiles_with_realesrgan(parent_tiles, zoom_level, tile_size=512):
     Returns list of (x, y, tile) for the child level.
     """
     import torch
+    # Patch for torchvision 0.19+ (removed functional_tensor module)
+    try:
+        from torchvision.transforms import functional_tensor  # noqa: F401
+    except ImportError:
+        import torchvision.transforms.functional as _F
+        import types
+        _mod = types.ModuleType("torchvision.transforms.functional_tensor")
+        _mod.rgb_to_grayscale = _F.rgb_to_grayscale
+        import sys as _sys
+        _sys.modules["torchvision.transforms.functional_tensor"] = _mod
     from basicsr.archs.rrdbnet_arch import RRDBNet
     from realesrgan import RealESRGANer
 
