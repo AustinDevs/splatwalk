@@ -23,7 +23,7 @@ echo "Updating pipeline scripts from GitHub..."
 _CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
 [ -n "$GITHUB_TOKEN" ] && _CURL_ARGS+=(-H "Authorization: token $GITHUB_TOKEN")
 _BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/scripts/gpu"
-for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py generate_ortho_tiles.py; do
+for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py generate_ortho_tiles.py generate_ground_views.py align_geo_colmap.py; do
     if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
         echo "  Updated $_script"
     else
@@ -393,6 +393,19 @@ except Exception as e:
     print(f'# EXIF extraction failed: {e}', file=sys.stderr)
 " 2>&1)" || true
 
+    # Save EXIF GPS data to JSON for ground view generation
+    python3 -c "
+import sys
+sys.path.insert(0, '/mnt/splatwalk/scripts')
+try:
+    from align_geo_colmap import extract_exif_gps, save_exif_gps_json
+    gps = extract_exif_gps('$INPUT_DIR')
+    if gps:
+        save_exif_gps_json(gps, '$OUTPUT_DIR/exif_gps.json')
+except Exception as e:
+    print(f'EXIF GPS extraction warning: {e}')
+" 2>&1 || true
+
     # Compute drone AGL from EXIF altitude + ground elevation
     if [ -n "$EXIF_COORDS" ] && [ "${EXIF_ALT:-0}" != "0" ]; then
         echo "  EXIF coordinates: $EXIF_COORDS, altitude: ${EXIF_ALT}m"
@@ -472,6 +485,46 @@ except Exception as e:
     notify_slack "Stage 3 complete: zoom descent finished"
 
     local final_model_path="$OUTPUT_DIR/descent/final"
+
+    # Stage 3b: Ground-Level View Generation (3DEP DEM + ODM texture)
+    notify_slack "Stage 3b: generating ground-level views via 3DEP DEM..."
+    python /mnt/splatwalk/scripts/generate_ground_views.py \
+        --scene_path "$scene_dir" \
+        --model_path "$final_model_path" \
+        --input_dir "$INPUT_DIR" \
+        --output_dir "$OUTPUT_DIR/ground_views" \
+        --odm_orthophoto "${ODM_ORTHO_TIF:-}" \
+        --exif_gps_json "$OUTPUT_DIR/exif_gps.json" \
+        --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
+        --job_id "${JOB_ID:-}" \
+        || {
+            notify_slack "Stage 3b (ground views) failed" "error"
+            return 1
+        }
+    notify_slack "Stage 3b complete: ground views generated"
+
+    # Stage 3c: Retrain with ground views (3000 iterations)
+    notify_slack "Stage 3c: retraining with ground views (3000 iterations)..."
+    cd /mnt/splatwalk/InstantSplat
+    local n_views_ground=$(ls -1 "$scene_dir/images"/*.jpg 2>/dev/null | wc -l)
+    [ "$n_views_ground" -gt 24 ] && n_views_ground=24
+    python train.py \
+        --source_path "$scene_dir" \
+        --model_path "$final_model_path" \
+        --iterations 3000 \
+        --n_views "$n_views_ground" \
+        --pp_optimizer \
+        --optim_pose \
+        --test_iterations 10001 \
+        --densify_from_iter 200 \
+        --densify_until_iter 2250 \
+        --densification_interval 100 \
+        --densify_grad_threshold 0.0005 \
+        || {
+            notify_slack "Stage 3c (retrain with ground views) failed" "error"
+            return 1
+        }
+    notify_slack "Stage 3c complete: retrained with ground views"
 
     # Stage 4: Quality Gating
     echo "Stage 4/4: Quality gate confidence scoring..."

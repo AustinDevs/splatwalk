@@ -128,6 +128,10 @@ pip install --no-cache-dir realesrgan 2>&1 | tail -3
 echo "Installing google-genai SDK..."
 pip install --no-cache-dir google-genai 2>&1 | tail -1
 
+# Geospatial packages (for 3DEP DEM + ground-level view generation)
+echo "Installing geospatial packages (py3dep, rioxarray, pyproj)..."
+pip install --no-cache-dir py3dep rioxarray rasterio pyproj 2>&1 | tail -3
+
 # --- Step 5: InstantSplat + CUDA extensions ---
 echo ""
 echo "=== Step 5/9: InstantSplat + CUDA extensions ==="

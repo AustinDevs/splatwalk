@@ -252,6 +252,26 @@ def main():
         },
     }
 
+    # Check if ground views were generated — add walk mode
+    ground_meta_path = os.path.join(os.path.dirname(args.output_dir), "ground_views", "ground_views_metadata.json")
+    if os.path.exists(ground_meta_path):
+        try:
+            with open(ground_meta_path) as f:
+                ground_meta = json.load(f)
+            manifest["viewer_modes"] = ["topdown", "walk"]
+            # Walk camera at ground level, looking horizontal
+            ground_z = bounds["ground_z"]
+            walk_height = ground_z + 3.0  # slightly above ground in scaled coords
+            manifest["walk_camera_defaults"] = {
+                "position": [0.0, 0.0, walk_height],
+                "look_at": [5.0, 0.0, walk_height],
+                "up": [0.0, 0.0, 1.0],
+            }
+            manifest["metadata"]["ground_views"] = ground_meta.get("num_cameras", 0)
+            print(f"  Walk mode enabled ({ground_meta.get('num_cameras', 0)} ground views)")
+        except Exception as e:
+            print(f"  Walk mode metadata read failed: {e}")
+
     manifest_path = os.path.join(args.output_dir, "manifest.json")
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)

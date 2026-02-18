@@ -22,6 +22,9 @@ let splatViewer = null;
 let splatCamera = null;
 let moveSpeed = 0.25;
 let altitudeSpeed = 0.15;
+let viewerMode = 'topdown'; // 'topdown' or 'walk'
+let savedTopdownPos = null;
+let savedTopdownLookAt = null;
 
 // Key state
 const keys = {};
@@ -254,21 +257,117 @@ function startMovementLoop() {
     const right = new THREE.Vector3();
     right.crossVectors(new THREE.Vector3(0, 0, 1), forward).normalize();
 
+    // Walk mode uses smaller speed and clamps to ground
+    var speed = viewerMode === 'walk' ? moveSpeed * 0.4 : moveSpeed;
+    var altSpeed = viewerMode === 'walk' ? altitudeSpeed * 0.3 : altitudeSpeed;
+
     // Keyboard input
-    if (keys['w']) splatCamera.position.addScaledVector(forward, moveSpeed);
-    if (keys['s']) splatCamera.position.addScaledVector(forward, -moveSpeed);
-    if (keys['a']) splatCamera.position.addScaledVector(right, moveSpeed);
-    if (keys['d']) splatCamera.position.addScaledVector(right, -moveSpeed);
-    if (keys['q']) splatCamera.position.z += altitudeSpeed;
-    if (keys['e']) splatCamera.position.z -= altitudeSpeed;
+    if (keys['w']) splatCamera.position.addScaledVector(forward, speed);
+    if (keys['s']) splatCamera.position.addScaledVector(forward, -speed);
+    if (keys['a']) splatCamera.position.addScaledVector(right, speed);
+    if (keys['d']) splatCamera.position.addScaledVector(right, -speed);
+    if (keys['q']) splatCamera.position.z += altSpeed;
+    if (keys['e']) splatCamera.position.z -= altSpeed;
 
     // Mobile joystick input
     if (joystickMovement.x !== 0 || joystickMovement.y !== 0) {
-      splatCamera.position.addScaledVector(forward, -joystickMovement.y * moveSpeed * 0.1);
-      splatCamera.position.addScaledVector(right, joystickMovement.x * moveSpeed * 0.1);
+      splatCamera.position.addScaledVector(forward, -joystickMovement.y * speed * 0.1);
+      splatCamera.position.addScaledVector(right, joystickMovement.x * speed * 0.1);
+    }
+
+    // Walk mode: clamp Z to stay above ground
+    if (viewerMode === 'walk' && manifest && manifest.scene_bounds) {
+      var groundZ = manifest.scene_bounds.ground_z || 0;
+      var minWalkZ = groundZ + 1.0;
+      if (splatCamera.position.z < minWalkZ) {
+        splatCamera.position.z = minWalkZ;
+      }
     }
   }
   animate();
+}
+
+// ---------------------------------------------------------------------------
+// Walk mode toggle
+// ---------------------------------------------------------------------------
+
+function switchToWalkMode() {
+  if (!manifest || !manifest.walk_camera_defaults) return;
+
+  // Save current topdown camera state
+  savedTopdownPos = splatCamera.position.clone();
+
+  viewerMode = 'walk';
+  var walkDefaults = manifest.walk_camera_defaults;
+  splatCamera.position.set(
+    walkDefaults.position[0],
+    walkDefaults.position[1],
+    walkDefaults.position[2]
+  );
+
+  // Look horizontal in walk mode
+  var lookAt = new THREE.Vector3(
+    walkDefaults.look_at[0],
+    walkDefaults.look_at[1],
+    walkDefaults.look_at[2]
+  );
+  splatCamera.lookAt(lookAt);
+
+  var walkBtn = document.getElementById('walk-btn');
+  if (walkBtn) walkBtn.textContent = 'Fly Mode';
+
+  // Update info panel
+  var infoPanel = document.getElementById('info-panel');
+  if (infoPanel) {
+    infoPanel.style.display = '';
+    infoPanel.style.opacity = '1';
+    infoPanel.innerHTML =
+      '<kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> walk' +
+      '&nbsp;&middot;&nbsp;' +
+      '<kbd>Q</kbd><kbd>E</kbd> height' +
+      '&nbsp;&middot;&nbsp;' +
+      'Mouse to look';
+    setTimeout(function () {
+      infoPanel.style.opacity = '0';
+      setTimeout(function () { infoPanel.style.display = 'none'; }, 300);
+    }, 5000);
+  }
+}
+
+function switchToTopdownMode() {
+  viewerMode = 'topdown';
+
+  if (savedTopdownPos) {
+    splatCamera.position.copy(savedTopdownPos);
+  } else if (manifest && manifest.camera_defaults) {
+    var pos = manifest.camera_defaults.position;
+    splatCamera.position.set(pos[0], pos[1], pos[2]);
+  }
+
+  // Look down
+  if (manifest && manifest.camera_defaults) {
+    var lookAt = manifest.camera_defaults.look_at;
+    splatCamera.lookAt(new THREE.Vector3(lookAt[0], lookAt[1], lookAt[2]));
+  }
+
+  var walkBtn = document.getElementById('walk-btn');
+  if (walkBtn) walkBtn.textContent = 'Walk Mode';
+
+  var infoPanel = document.getElementById('info-panel');
+  if (infoPanel) {
+    infoPanel.style.display = '';
+    infoPanel.style.opacity = '1';
+    infoPanel.innerHTML =
+      '<kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move' +
+      '&nbsp;&middot;&nbsp;' +
+      '<kbd>Q</kbd><kbd>E</kbd> altitude' +
+      '&nbsp;&middot;&nbsp;' +
+      'Mouse to orbit';
+    setTimeout(function () {
+      infoPanel.style.opacity = '0';
+      setTimeout(function () { infoPanel.style.display = 'none'; }, 300);
+    }, 5000);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +425,22 @@ async function init() {
         orthoBtn.addEventListener('click', function () {
           window.location.href = 'ortho.html?manifest=' +
             encodeURIComponent(manifest.ortho_manifest_url);
+        });
+      }
+    }
+
+    // Wire up "Walk Mode" button if manifest includes walk mode
+    if (manifest.viewer_modes && manifest.viewer_modes.indexOf('walk') !== -1
+        && manifest.walk_camera_defaults) {
+      var walkBtn = document.getElementById('walk-btn');
+      if (walkBtn) {
+        walkBtn.style.display = '';
+        walkBtn.addEventListener('click', function () {
+          if (viewerMode === 'topdown') {
+            switchToWalkMode();
+          } else {
+            switchToTopdownMode();
+          }
         });
       }
     }

@@ -132,11 +132,14 @@ def notify_slack_with_image(message, image_path, webhook_url, job_id, status="in
 
 
 def verify_mosaic_with_gemini(mosaic_path, level_name, webhook_url, job_id):
-    """Send descent mosaic to Gemini Vision for quality check."""
+    """Send descent mosaic to Gemini Vision for quality check. Returns True=PASS.
+
+    Raises RuntimeError on FAIL so the pipeline aborts.
+    """
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     if not gemini_key:
         print(f"  Gemini verify skipped (no API key)")
-        return
+        return True
 
     try:
         import base64
@@ -188,8 +191,15 @@ def verify_mosaic_with_gemini(mosaic_path, level_name, webhook_url, job_id):
             f"{emoji} Gemini verify [{level_name}]: {text}",
             webhook_url, job_id, status,
         )
+
+        if not passed:
+            raise RuntimeError(f"Gemini quality check FAILED at {level_name}: {text}")
+        return True
+    except RuntimeError:
+        raise  # Re-raise quality failures
     except Exception as e:
         print(f"  Gemini verify failed ({e}), continuing")
+        return True  # Don't block on API issues
 
 
 def load_point_cloud(model_path):
@@ -540,10 +550,12 @@ def retrain_model(scene_path, model_path, output_model_path, iterations, n_views
         "--pp_optimizer",
         "--optim_pose",
         # Densification enabled to grow detail at lower altitudes
+        # Stop at 75% to let model converge; higher grad threshold = fewer pathological splits
         "--densify_from_iter", "200",
         "--opacity_reset_interval", "1000",
-        "--densify_until_iter", str(iterations),
+        "--densify_until_iter", str(int(iterations * 0.75)),
         "--densification_interval", "100",
+        "--densify_grad_threshold", "0.0005",
     ]
 
     if output_model_path != model_path and not os.path.exists(output_model_path):
@@ -704,6 +716,75 @@ def stitch_level_mosaic(render_dir, cameras, odm_orthophoto_path=None):
 
 
 # ---------------------------------------------------------------------------
+# Intermediate floater pruning
+# ---------------------------------------------------------------------------
+
+def prune_intermediate_floaters(model_path):
+    """Remove pathological Gaussians between descent levels.
+
+    Tighter thresholds than compress_splat.py final pass since
+    these floaters compound across levels.
+    """
+    ckpt_dirs = sorted(Path(model_path).glob("point_cloud/iteration_*"))
+    if not ckpt_dirs:
+        return
+    ply_path = str(ckpt_dirs[-1] / "point_cloud.ply")
+
+    ply_data = PlyData.read(ply_path)
+    vertex = ply_data["vertex"]
+    N = len(vertex.data)
+    field_names = [p.name for p in vertex.properties]
+
+    keep = np.ones(N, dtype=bool)
+
+    # 1. Opacity < 5% (tighter than compress_splat's 10%)
+    if "opacity" in field_names:
+        opacity_logit = np.array(vertex["opacity"], dtype=np.float32)
+        opacity = 1.0 / (1.0 + np.exp(-opacity_logit))
+        keep &= opacity >= 0.05
+
+    # 2. Elongation > 15:1 (tighter than compress_splat's 25:1)
+    if "scale_0" in field_names:
+        scales = np.exp(np.stack([
+            np.array(vertex["scale_0"], dtype=np.float32),
+            np.array(vertex["scale_1"], dtype=np.float32),
+            np.array(vertex["scale_2"], dtype=np.float32),
+        ], axis=-1))
+        max_s = scales.max(axis=-1)
+        min_s = scales.min(axis=-1)
+        min_s[min_s == 0] = 1e-10
+        keep &= (max_s / min_s) <= 15.0
+
+        # 3. Giant Gaussians (> 95th percentile of max scale)
+        scale_cap = np.percentile(max_s[keep], 95.0)
+        keep &= max_s <= scale_cap
+
+    # 4. White floaters (bright + desaturated + opaque)
+    if "f_dc_0" in field_names and "opacity" in field_names:
+        SH_C0 = 0.28209479177387814
+        rgb = np.stack([
+            np.array(vertex["f_dc_0"], dtype=np.float32),
+            np.array(vertex["f_dc_1"], dtype=np.float32),
+            np.array(vertex["f_dc_2"], dtype=np.float32),
+        ], axis=-1) * SH_C0 + 0.5
+        brightness = rgb.mean(axis=-1)
+        max_rgb = rgb.max(axis=-1)
+        min_rgb = rgb.min(axis=-1)
+        sat = (max_rgb - min_rgb) / np.maximum(max_rgb, 1e-6)
+        keep &= ~((brightness > 0.8) & (sat < 0.15) & (opacity > 0.3))
+
+    pruned = keep.sum()
+    removed = N - pruned
+    if removed > 0:
+        from plyfile import PlyElement
+        pruned_el = PlyElement.describe(vertex.data[keep], "vertex")
+        PlyData([pruned_el]).write(ply_path)
+        print(f"  Pruned {removed} floaters ({N} -> {pruned}, {100*removed/N:.1f}% removed)")
+    else:
+        print(f"  No floaters to prune ({N} Gaussians clean)")
+
+
+# ---------------------------------------------------------------------------
 # FOV schedule
 # ---------------------------------------------------------------------------
 
@@ -820,11 +901,15 @@ def main():
                 f"{len(cameras)} views{ssim_str})",
                 mosaic_path, args.slack_webhook_url, args.job_id,
             )
-            verify_mosaic_with_gemini(
-                mosaic_path,
-                f"Level {level_idx+1} (~{real_alt:.0f}m AGL)",
-                args.slack_webhook_url, args.job_id,
-            )
+            try:
+                verify_mosaic_with_gemini(
+                    mosaic_path,
+                    f"Level {level_idx+1} (~{real_alt:.0f}m AGL)",
+                    args.slack_webhook_url, args.job_id,
+                )
+            except RuntimeError as e:
+                notify_slack(f"ABORT: {e}", args.slack_webhook_url, args.job_id, "error")
+                sys.exit(1)
 
         # Add renders to training set
         added = 0
@@ -844,6 +929,9 @@ def main():
             args.scene_path, current_model_path, altitude_model,
             args.retrain_iterations, updated_n_views,
         )
+
+        # Prune pathological Gaussians before next level to prevent compounding
+        prune_intermediate_floaters(altitude_model)
 
         current_model_path = altitude_model
 
