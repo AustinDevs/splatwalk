@@ -206,19 +206,41 @@ fi
 
 # --- Repair torch if SAM2 upgraded it (breaks compiled CUDA extensions) ---
 export PATH="/mnt/splatwalk/conda/bin:$PATH"
+export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 TORCH_VER=$(/mnt/splatwalk/conda/bin/python -c "import torch; print(torch.__version__)" 2>/dev/null || echo "unknown")
 if [[ "$TORCH_VER" != 2.4.* ]]; then
   notify_slack "REPAIR: torch is $TORCH_VER (expected 2.4.x) — downgrading + rebuilding CUDA extensions..."
   /mnt/splatwalk/conda/bin/pip install --no-cache-dir \
       torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 \
       --index-url https://download.pytorch.org/whl/cu124 2>&1 | tail -5
-  # Rebuild CUDA extensions against correct torch
+  # Purge old CUDA extension builds + site-packages before rebuilding
+  /mnt/splatwalk/conda/bin/pip uninstall -y diff-gaussian-rasterization simple-knn fused-ssim 2>/dev/null || true
+  rm -rf /mnt/splatwalk/conda/lib/python*/site-packages/diff_gaussian_rasterization* 2>/dev/null || true
+  rm -rf /mnt/splatwalk/conda/lib/python*/site-packages/simple_knn* 2>/dev/null || true
+  rm -rf /mnt/splatwalk/conda/lib/python*/site-packages/fused_ssim* 2>/dev/null || true
+  # Clean build dirs
+  rm -rf /mnt/splatwalk/InstantSplat/submodules/diff-gaussian-rasterization/build 2>/dev/null || true
+  rm -rf /mnt/splatwalk/InstantSplat/submodules/simple-knn/build 2>/dev/null || true
+  # Rebuild CUDA extensions from source with correct torch + CUDA arch list
   cd /mnt/splatwalk/InstantSplat/submodules/diff-gaussian-rasterization
-  /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation --force-reinstall . 2>&1 | tail -3
+  FORCE_CUDA=1 /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation . 2>&1 | tail -5
   cd /mnt/splatwalk/InstantSplat/submodules/simple-knn
-  /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation --force-reinstall . 2>&1 | tail -3
-  notify_slack "REPAIR complete: torch downgraded + CUDA extensions rebuilt"
+  /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation . 2>&1 | tail -5
+  # Also rebuild fused-ssim if present
+  if [ -d /mnt/splatwalk/InstantSplat/submodules/fused-ssim ]; then
+    cd /mnt/splatwalk/InstantSplat/submodules/fused-ssim
+    /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation . 2>&1 | tail -3 || true
+  fi
+  notify_slack "REPAIR complete: torch 2.4.0 + CUDA extensions rebuilt"
 fi
+# Verify CUDA extensions work before proceeding
+/mnt/splatwalk/conda/bin/python -c "
+import torch, simple_knn, diff_gaussian_rasterization
+print(f'torch={torch.__version__} cuda={torch.cuda.is_available()}')
+# Quick CUDA sanity check
+t = torch.randn(100, 3, device='cuda')
+print(f'CUDA tensor OK: {t.shape}')
+" || { notify_slack "FATAL: CUDA extensions broken after repair" "error"; exit 1; }
 
 # --- Ensure Real-ESRGAN is installed (handles existing volumes without it) ---
 if ! /mnt/splatwalk/conda/bin/python -c "import realesrgan" 2>/dev/null; then
