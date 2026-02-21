@@ -483,9 +483,13 @@ python /mnt/splatwalk/scripts/generate_ortho_tiles.py \
     --slack_webhook_url "$SLACK_WEBHOOK_URL" \
     || { notify_slack "FATAL: Ortho tile generation failed" "error"; exit 1; }
 
-# --- Stage 3: Top-Down Progressive Zoom Descent ---
+# --- Stage 3: Top-Down Progressive Zoom Descent (non-fatal) ---
+# Zoom descent often fails on quality gate — Stage 4 GLB is the alternative
+BEST_MODEL="/workspace/__JOB_ID__/output/instantsplat"  # fallback: Stage 2 model
+DESCENT_OK=false
+
 notify_slack "Stage 3: Top-down zoom descent (5 altitude levels)..."
-python /mnt/splatwalk/scripts/render_zoom_descent.py \
+if python /mnt/splatwalk/scripts/render_zoom_descent.py \
     --model_path "/workspace/__JOB_ID__/output/instantsplat" \
     --scene_path "$SCENE_DIR" \
     --output_dir "/workspace/__JOB_ID__/output/descent" \
@@ -495,40 +499,45 @@ python /mnt/splatwalk/scripts/render_zoom_descent.py \
     --max_images_per_level 64 \
     --slack_webhook_url "$SLACK_WEBHOOK_URL" \
     --job_id "__JOB_ID__" \
-    --odm_orthophoto "$ODM_ORTHO_TIF" \
-    || { notify_slack "render_zoom_descent.py failed" "error"; exit 1; }
+    --odm_orthophoto "$ODM_ORTHO_TIF"; then
 
-# --- Stage 3b: Ground-Level View Generation (3DEP DEM + ODM texture) ---
-notify_slack "Stage 3b: generating ground-level views via 3DEP DEM..."
-python /mnt/splatwalk/scripts/generate_ground_views.py \
-    --scene_path "$SCENE_DIR" \
-    --model_path "/workspace/__JOB_ID__/output/descent/final" \
-    --input_dir "$INPUT_DIR" \
-    --output_dir "/workspace/__JOB_ID__/output/ground_views" \
-    --odm_orthophoto "$ODM_ORTHO_TIF" \
-    --slack_webhook_url "$SLACK_WEBHOOK_URL" \
-    --job_id "__JOB_ID__" \
-    || { notify_slack "Stage 3b (ground views) failed" "error"; exit 1; }
+    BEST_MODEL="/workspace/__JOB_ID__/output/descent/final"
+    DESCENT_OK=true
 
-# --- Stage 3c: Retrain with ground views (3000 iterations) ---
-notify_slack "Stage 3c: retraining with ground views (3000 iterations)..."
-cd /mnt/splatwalk/InstantSplat
-N_VIEWS_GROUND=$(ls -1 "$SCENE_DIR/images"/*.jpg 2>/dev/null | wc -l)
-[ "$N_VIEWS_GROUND" -gt 24 ] && N_VIEWS_GROUND=24
-python train.py \
-    --source_path "$SCENE_DIR" \
-    --model_path "/workspace/__JOB_ID__/output/descent/final" \
-    --iterations 3000 \
-    --n_views "$N_VIEWS_GROUND" \
-    --pp_optimizer \
-    --optim_pose \
-    --test_iterations 10001 \
-    --densify_from_iter 200 \
-    --densify_until_iter 2250 \
-    --densification_interval 100 \
-    --densify_grad_threshold 0.0005 \
-    || { notify_slack "Stage 3c (retrain with ground views) failed" "error"; exit 1; }
-notify_slack "Stage 3c complete (retrained with ground views)"
+    # --- Stage 3b: Ground-Level View Generation (3DEP DEM + ODM texture) ---
+    notify_slack "Stage 3b: generating ground-level views via 3DEP DEM..."
+    python /mnt/splatwalk/scripts/generate_ground_views.py \
+        --scene_path "$SCENE_DIR" \
+        --model_path "$BEST_MODEL" \
+        --input_dir "$INPUT_DIR" \
+        --output_dir "/workspace/__JOB_ID__/output/ground_views" \
+        --odm_orthophoto "$ODM_ORTHO_TIF" \
+        --slack_webhook_url "$SLACK_WEBHOOK_URL" \
+        --job_id "__JOB_ID__" \
+        || notify_slack "Stage 3b (ground views) failed (non-fatal)" "info"
+
+    # --- Stage 3c: Retrain with ground views (3000 iterations) ---
+    notify_slack "Stage 3c: retraining with ground views (3000 iterations)..."
+    cd /mnt/splatwalk/InstantSplat
+    N_VIEWS_GROUND=$(ls -1 "$SCENE_DIR/images"/*.jpg 2>/dev/null | wc -l)
+    [ "$N_VIEWS_GROUND" -gt 24 ] && N_VIEWS_GROUND=24
+    python train.py \
+        --source_path "$SCENE_DIR" \
+        --model_path "$BEST_MODEL" \
+        --iterations 3000 \
+        --n_views "$N_VIEWS_GROUND" \
+        --pp_optimizer \
+        --optim_pose \
+        --test_iterations 10001 \
+        --densify_from_iter 200 \
+        --densify_until_iter 2250 \
+        --densification_interval 100 \
+        --densify_grad_threshold 0.0005 \
+        || notify_slack "Stage 3c (retrain) failed (non-fatal)" "info"
+    notify_slack "Stage 3c complete"
+else
+    notify_slack "Stage 3 (zoom descent) failed — using Stage 2 model + building GLB" "info"
+fi
 
 # --- Stage 4: Game-Level Scene Construction (.glb from ODM outputs) ---
 notify_slack "Stage 4: Building game-level scene (.glb)..."
@@ -538,7 +547,7 @@ python /mnt/splatwalk/scripts/build_game_scene.py \
     --dtm "$ODM_OUTPUT/odm_dem/dtm.tif" \
     --images "$INPUT_DIR" \
     --scene_path "$SCENE_DIR" \
-    --model_path "/workspace/__JOB_ID__/output/descent/final" \
+    --model_path "$BEST_MODEL" \
     --output "/workspace/__JOB_ID__/output/scene.glb" \
     --texture_library "/mnt/splatwalk/textures/" \
     --scene_scale 50.0 \
@@ -552,7 +561,7 @@ notify_slack "Stages complete. Generating demo assets..."
 
 # --- Generate demo viewer assets (top-down fly-over) ---
 python /mnt/splatwalk/scripts/generate_viewer_assets.py \
-    --model_path "/workspace/__JOB_ID__/output/descent/final" \
+    --model_path "$BEST_MODEL" \
     --scene_path "$SCENE_DIR" \
     --output_dir "/workspace/__JOB_ID__/output/demo" \
     --job_id "aukerman" \
