@@ -204,8 +204,23 @@ if ! /mnt/splatwalk/conda/bin/python --version > /dev/null 2>&1; then
   notify_slack "Volume setup complete!"
 fi
 
-# --- Ensure Real-ESRGAN is installed (handles existing volumes without it) ---
+# --- Repair torch if SAM2 upgraded it (breaks compiled CUDA extensions) ---
 export PATH="/mnt/splatwalk/conda/bin:$PATH"
+TORCH_VER=$(/mnt/splatwalk/conda/bin/python -c "import torch; print(torch.__version__)" 2>/dev/null || echo "unknown")
+if [[ "$TORCH_VER" != 2.4.* ]]; then
+  notify_slack "REPAIR: torch is $TORCH_VER (expected 2.4.x) — downgrading + rebuilding CUDA extensions..."
+  /mnt/splatwalk/conda/bin/pip install --no-cache-dir \
+      torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 \
+      --index-url https://download.pytorch.org/whl/cu124 2>&1 | tail -5
+  # Rebuild CUDA extensions against correct torch
+  cd /mnt/splatwalk/InstantSplat/submodules/diff-gaussian-rasterization
+  /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation --force-reinstall . 2>&1 | tail -3
+  cd /mnt/splatwalk/InstantSplat/submodules/simple-knn
+  /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation --force-reinstall . 2>&1 | tail -3
+  notify_slack "REPAIR complete: torch downgraded + CUDA extensions rebuilt"
+fi
+
+# --- Ensure Real-ESRGAN is installed (handles existing volumes without it) ---
 if ! /mnt/splatwalk/conda/bin/python -c "import realesrgan" 2>/dev/null; then
   notify_slack "Installing Real-ESRGAN on existing volume..."
   /mnt/splatwalk/conda/bin/pip install --no-cache-dir realesrgan 2>&1 | tail -3
@@ -232,7 +247,10 @@ fi
 if ! /mnt/splatwalk/conda/bin/python -c "import pygltflib, pvlib" 2>/dev/null; then
   notify_slack "Installing Stage 4 packages (pygltflib, pvlib, SAM2) on existing volume..."
   /mnt/splatwalk/conda/bin/pip install --no-cache-dir pygltflib pvlib 2>&1 | tail -3
-  /mnt/splatwalk/conda/bin/pip install --no-cache-dir "git+https://github.com/facebookresearch/sam2.git" 2>&1 | tail -5 || true
+  # SAM2: install with --no-deps to avoid upgrading torch (breaks compiled CUDA extensions)
+  /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-deps "git+https://github.com/facebookresearch/sam2.git" 2>&1 | tail -5 || true
+  # Install SAM2's non-torch deps separately
+  /mnt/splatwalk/conda/bin/pip install --no-cache-dir hydra-core iopath 2>&1 | tail -3 || true
 fi
 # Download SAM2 model if missing
 if [ ! -f "/mnt/splatwalk/models/sam2/sam2.1_hiera_large.pt" ]; then

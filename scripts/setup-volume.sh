@@ -135,8 +135,10 @@ pip install --no-cache-dir py3dep rioxarray rasterio pyproj 2>&1 | tail -3
 # Stage 4: Game-level scene construction packages
 echo "Installing game scene construction packages (pygltflib, pvlib, SAM2)..."
 pip install --no-cache-dir pygltflib pvlib 2>&1 | tail -3
-pip install --no-cache-dir "git+https://github.com/facebookresearch/sam2.git" 2>&1 | tail -5 \
+# SAM2: install with --no-deps to avoid upgrading torch (breaks compiled CUDA extensions)
+pip install --no-cache-dir --no-deps "git+https://github.com/facebookresearch/sam2.git" 2>&1 | tail -5 \
     || echo "WARNING: SAM2 install failed (scene construction will use fallback segmentation)"
+pip install --no-cache-dir hydra-core iopath 2>&1 | tail -3 || true
 
 # --- Step 5: InstantSplat + CUDA extensions ---
 echo ""
