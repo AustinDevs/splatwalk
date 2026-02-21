@@ -181,8 +181,146 @@ def get_colmap_poses(scene_path):
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Terrain mesh from DSM
+# Step 1: Terrain mesh from DSM (with flat fallback)
 # ---------------------------------------------------------------------------
+
+def _build_flat_terrain(orthophoto_path, model_path, scene_path,
+                        scene_scale, intermediates_dir):
+    """Fallback: build a flat terrain mesh from orthophoto bounds when DSM is unavailable.
+
+    Uses the orthophoto pixel dimensions + COLMAP/PLY centroid to create a flat
+    grid at ground Z, with UVs mapping to the orthophoto.
+    """
+    import rasterio
+
+    print("  Building flat terrain (DSM fallback)...")
+
+    # Get orthophoto bounds for terrain extent
+    try:
+        with rasterio.open(orthophoto_path) as src:
+            ortho_bounds = src.bounds
+            ortho_crs = src.crs
+        x_extent = ortho_bounds.right - ortho_bounds.left
+        y_extent = ortho_bounds.top - ortho_bounds.bottom
+        print(f"  Orthophoto bounds: {x_extent:.1f}m x {y_extent:.1f}m")
+    except Exception as e:
+        print(f"  Cannot read orthophoto bounds: {e}")
+        # Fallback: use PLY extent
+        x_extent = 100.0
+        y_extent = 100.0
+
+    # Load centroid from PLY (matches compress_splat.py)
+    centroid = load_ply_centroid(model_path)
+
+    # Build a flat grid at ground Z (5th percentile from PLY)
+    from plyfile import PlyData
+    ckpt_dirs = sorted(Path(model_path).glob("point_cloud/iteration_*"))
+    ply_path = str(ckpt_dirs[-1] / "point_cloud.ply")
+    ply_data = PlyData.read(ply_path)
+    vertex = ply_data["vertex"]
+    z_vals = np.array(vertex["z"], dtype=np.float32)
+    ground_z_raw = float(np.percentile(z_vals, 5))
+    ground_z_scaled = (ground_z_raw - centroid[2]) * scene_scale
+
+    # Try geo transform to get proper COLMAP alignment
+    has_geo_transform = False
+    try:
+        from align_geo_colmap import extract_exif_gps, compute_geo_to_colmap_transform, project_gps_to_utm
+        input_dir = os.path.join(scene_path, "images")
+        if not os.path.isdir(input_dir):
+            for candidate in [
+                os.path.join(os.path.dirname(model_path), "..", "scene", "images"),
+            ]:
+                if os.path.isdir(candidate):
+                    input_dir = candidate
+                    break
+
+        exif_gps = extract_exif_gps(input_dir)
+        colmap_poses = get_colmap_poses(scene_path)
+        if len(exif_gps) >= 4 and len(colmap_poses) >= 4:
+            utm_coords = project_gps_to_utm(exif_gps)
+            s, R, t = compute_geo_to_colmap_transform(utm_coords, colmap_poses)
+            has_geo_transform = True
+            # Transform orthophoto corners through UTM → COLMAP → web
+            corners_utm = np.array([
+                [ortho_bounds.left, ortho_bounds.bottom, ground_z_raw],
+                [ortho_bounds.right, ortho_bounds.bottom, ground_z_raw],
+                [ortho_bounds.right, ortho_bounds.top, ground_z_raw],
+                [ortho_bounds.left, ortho_bounds.top, ground_z_raw],
+            ])
+            corners_colmap = (s * (R @ corners_utm.T).T + t)
+            print(f"  Geo transform: scale={s:.6f}")
+    except Exception as e:
+        print(f"  Geo transform failed: {e}, using PLY-centered flat grid")
+
+    # Grid size: ~200x200 for flat terrain
+    rows, cols = 100, 100
+
+    if has_geo_transform:
+        # Interpolate between corners to make the grid
+        xs_min = corners_colmap[:, 0].min()
+        xs_max = corners_colmap[:, 0].max()
+        ys_min = corners_colmap[:, 1].min()
+        ys_max = corners_colmap[:, 1].max()
+        xs = np.linspace(xs_min, xs_max, cols)
+        ys = np.linspace(ys_min, ys_max, rows)
+        xx, yy = np.meshgrid(xs, ys)
+        zz = np.full_like(xx, corners_colmap[:, 2].mean())
+        colmap_points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=-1)
+        web_points = (colmap_points - centroid) * scene_scale
+    else:
+        # Center a flat grid at origin in web coords
+        from plyfile import PlyData as _PD  # noqa: already imported
+        positions = np.stack([
+            np.array(vertex["x"], dtype=np.float32),
+            np.array(vertex["y"], dtype=np.float32),
+            np.array(vertex["z"], dtype=np.float32),
+        ], axis=-1)
+        pos_scaled = (positions - centroid) * scene_scale
+        xs = np.linspace(pos_scaled[:, 0].min(), pos_scaled[:, 0].max(), cols)
+        ys = np.linspace(pos_scaled[:, 1].min(), pos_scaled[:, 1].max(), rows)
+        xx, yy = np.meshgrid(xs, ys)
+        zz = np.full_like(xx, ground_z_scaled)
+        web_points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=-1)
+
+    # Generate triangle mesh
+    faces = []
+    for r in range(rows - 1):
+        for c in range(cols - 1):
+            idx00 = r * cols + c
+            idx01 = r * cols + (c + 1)
+            idx10 = (r + 1) * cols + c
+            idx11 = (r + 1) * cols + (c + 1)
+            faces.append([idx00, idx10, idx01])
+            faces.append([idx01, idx10, idx11])
+
+    vertices = web_points.astype(np.float32)
+    faces = np.array(faces, dtype=np.int32)
+
+    # UVs
+    us = np.linspace(0, 1, cols)
+    vs = np.linspace(0, 1, rows)
+    uu, vv = np.meshgrid(us, vs)
+    uvs = np.stack([uu.ravel(), vv.ravel()], axis=-1).astype(np.float32)
+
+    terrain = {
+        "vertices": vertices,
+        "faces": faces,
+        "uvs": uvs,
+        "grid_shape": (rows, cols),
+        "has_geo_transform": has_geo_transform,
+        "centroid": centroid.tolist(),
+        "scene_scale": scene_scale,
+        "is_flat_fallback": True,
+    }
+
+    print(f"  Flat terrain mesh: {len(vertices)} vertices, {len(faces)} faces")
+    save_intermediate({"vertices": len(vertices), "faces": len(faces),
+                       "grid": [rows, cols], "flat_fallback": True},
+                      "terrain_stats.json", intermediates_dir)
+
+    return terrain
+
 
 def step_terrain(dsm_path, dtm_path, orthophoto_path, model_path, scene_path,
                  scene_scale, intermediates_dir):
@@ -194,6 +332,13 @@ def step_terrain(dsm_path, dtm_path, orthophoto_path, model_path, scene_path,
     from scipy.ndimage import gaussian_filter, distance_transform_edt
 
     print("Step 1: Building terrain mesh from DSM...")
+
+    # Check if DSM exists; if not, create flat terrain from orthophoto bounds
+    if not os.path.exists(dsm_path):
+        print(f"  WARNING: DSM not found at {dsm_path}")
+        print("  Falling back to flat terrain from orthophoto bounds...")
+        return _build_flat_terrain(orthophoto_path, model_path, scene_path,
+                                   scene_scale, intermediates_dir)
 
     # Load DSM
     with rasterio.open(dsm_path) as src:

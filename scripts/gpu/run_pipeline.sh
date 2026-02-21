@@ -439,13 +439,13 @@ except Exception as e:
         -v "$ODM_OUTPUT:/datasets/project" \
         opendronemap/odm \
         --project-path /datasets project \
-        --fast-orthophoto \
+        --dsm \
+        --dtm \
         --orthophoto-resolution 5 \
-        --skip-3dmodel \
         --max-concurrency 4 \
-        2>&1 | tail -20 \
-        || { notify_slack "FATAL: ODM orthomosaic failed" "error"; return 1; }
-    notify_slack "ODM orthomosaic complete"
+        2>&1 | tail -50 \
+        || { notify_slack "FATAL: ODM failed" "error"; return 1; }
+    notify_slack "ODM complete (orthophoto + DSM/DTM)"
 
     # Ortho tile generation (requires ODM orthophoto — fatal on failure)
     if [ ! -f "$ODM_ORTHO_TIF" ]; then
