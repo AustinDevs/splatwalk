@@ -228,6 +228,27 @@ if ! /mnt/splatwalk/conda/bin/python -c "import py3dep, pyproj" 2>/dev/null; the
   /mnt/splatwalk/conda/bin/pip install --no-cache-dir py3dep rioxarray rasterio pyproj 2>&1 | tail -3
 fi
 
+# --- Ensure Stage 4 packages are installed (handles existing volumes without them) ---
+if ! /mnt/splatwalk/conda/bin/python -c "import pygltflib, pvlib" 2>/dev/null; then
+  notify_slack "Installing Stage 4 packages (pygltflib, pvlib, SAM2) on existing volume..."
+  /mnt/splatwalk/conda/bin/pip install --no-cache-dir pygltflib pvlib 2>&1 | tail -3
+  /mnt/splatwalk/conda/bin/pip install --no-cache-dir "git+https://github.com/facebookresearch/sam2.git" 2>&1 | tail -5 || true
+fi
+# Download SAM2 model if missing
+if [ ! -f "/mnt/splatwalk/models/sam2/sam2.1_hiera_large.pt" ]; then
+  mkdir -p /mnt/splatwalk/models/sam2
+  /mnt/splatwalk/conda/bin/python -c "
+import os, urllib.request
+model_path = '/mnt/splatwalk/models/sam2/sam2.1_hiera_large.pt'
+if not os.path.exists(model_path):
+    print('Downloading SAM2 weights (~898MB)...')
+    urllib.request.urlretrieve(
+        'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt',
+        model_path)
+    print(f'Saved ({os.path.getsize(model_path)/1e6:.0f}MB)')
+" || echo "WARNING: SAM2 model download failed"
+fi
+
 notify_slack "Volume ready. Downloading dataset..."
 
 # --- Download aukerman dataset ---
@@ -275,7 +296,7 @@ echo "Fetching latest pipeline scripts from GitHub..."
 _CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
 [ -n "__GITHUB_TOKEN__" ] && _CURL_ARGS+=(-H "Authorization: token __GITHUB_TOKEN__")
 _BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/scripts/gpu"
-for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py generate_ortho_tiles.py generate_ground_views.py align_geo_colmap.py; do
+for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py generate_ortho_tiles.py generate_ground_views.py align_geo_colmap.py build_game_scene.py; do
     if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
         echo "  Updated $_script (from GitHub)"
     elif curl -fsSL "__SPACES_ENDPOINT__/__SPACES_BUCKET__/scripts/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
@@ -491,7 +512,25 @@ python train.py \
     || { notify_slack "Stage 3c (retrain with ground views) failed" "error"; exit 1; }
 notify_slack "Stage 3c complete (retrained with ground views)"
 
-notify_slack "Stage 3 complete. Generating demo assets..."
+# --- Stage 4: Game-Level Scene Construction (.glb from ODM outputs) ---
+notify_slack "Stage 4: Building game-level scene (.glb)..."
+python /mnt/splatwalk/scripts/build_game_scene.py \
+    --orthophoto "$ODM_ORTHO_TIF" \
+    --dsm "$ODM_OUTPUT/odm_dem/dsm.tif" \
+    --dtm "$ODM_OUTPUT/odm_dem/dtm.tif" \
+    --images "$INPUT_DIR" \
+    --scene_path "$SCENE_DIR" \
+    --model_path "/workspace/__JOB_ID__/output/descent/final" \
+    --output "/workspace/__JOB_ID__/output/scene.glb" \
+    --texture_library "/mnt/splatwalk/textures/" \
+    --scene_scale 50.0 \
+    --gemini_api_key "${GEMINI_API_KEY:-}" \
+    || {
+        notify_slack "Stage 4 (scene construction) failed (non-fatal)" "info"
+        echo "WARNING: Game-level scene construction failed, continuing without .glb"
+    }
+
+notify_slack "Stages complete. Generating demo assets..."
 
 # --- Generate demo viewer assets (top-down fly-over) ---
 python /mnt/splatwalk/scripts/generate_viewer_assets.py \
