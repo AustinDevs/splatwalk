@@ -23,7 +23,7 @@ echo "Updating pipeline scripts from GitHub..."
 _CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
 [ -n "$GITHUB_TOKEN" ] && _CURL_ARGS+=(-H "Authorization: token $GITHUB_TOKEN")
 _BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/scripts/gpu"
-for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py generate_ortho_tiles.py generate_ground_views.py align_geo_colmap.py; do
+for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py generate_ortho_tiles.py generate_ground_views.py align_geo_colmap.py build_game_scene.py; do
     if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
         echo "  Updated $_script"
     else
@@ -329,7 +329,7 @@ PREPROCESS_SCRIPT
 
     # Stage 1: Geometry init
     notify_slack "Stage 1: Geometry init (MASt3R, $n_views views)..."
-    echo "Stage 1/4: Running geometry initialization with MASt3R ($n_views views)..."
+    echo "Stage 1/6: Running geometry initialization with MASt3R ($n_views views)..."
     python init_geo.py \
         --source_path "$scene_dir" \
         --model_path "$OUTPUT_DIR/instantsplat" \
@@ -345,7 +345,7 @@ PREPROCESS_SCRIPT
 
     # Stage 2: Train aerial splat
     notify_slack "Stage 2: Training aerial splat ($train_iters iterations)..."
-    echo "Stage 2/4: Training Gaussian Splatting ($train_iters iterations)..."
+    echo "Stage 2/6: Training Gaussian Splatting ($train_iters iterations)..."
     python train.py \
         --source_path "$scene_dir" \
         --model_path "$OUTPUT_DIR/instantsplat" \
@@ -463,7 +463,7 @@ except Exception as e:
 
     # Stage 3: Top-Down Progressive Zoom Descent
     notify_slack "Stage 3: Top-down zoom descent (5 altitude levels)..."
-    echo "Stage 3/4: Top-down progressive zoom descent..."
+    echo "Stage 3/6: Top-down progressive zoom descent..."
     local descent_args=(
         --model_path "$OUTPUT_DIR/instantsplat"
         --scene_path "$scene_dir"
@@ -526,19 +526,38 @@ except Exception as e:
         }
     notify_slack "Stage 3c complete: retrained with ground views"
 
-    # Stage 4: Quality Gating
-    echo "Stage 4/4: Quality gate confidence scoring..."
+    # Stage 4: Game-Level Scene Construction (.glb from ODM outputs)
+    notify_slack "Stage 4: Building game-level scene (.glb)..."
+    echo "Stage 4/6: Building game-level scene (.glb)..."
+    python /mnt/splatwalk/scripts/build_game_scene.py \
+        --orthophoto "$ODM_ORTHO_TIF" \
+        --dsm "$ODM_OUTPUT/odm_dem/dsm.tif" \
+        --dtm "$ODM_OUTPUT/odm_dem/dtm.tif" \
+        --images "$INPUT_DIR" \
+        --scene_path "$scene_dir" \
+        --model_path "$final_model_path" \
+        --output "$OUTPUT_DIR/scene.glb" \
+        --texture_library "/mnt/splatwalk/textures/" \
+        --scene_scale 50.0 \
+        --gemini_api_key "${GEMINI_API_KEY:-}" \
+        || {
+            notify_slack "Stage 4 (scene construction) failed (non-fatal)" "info"
+            echo "WARNING: Game-level scene construction failed, continuing without .glb"
+        }
+
+    # Stage 5: Quality Gating
+    echo "Stage 5/6: Quality gate confidence scoring..."
     python /mnt/splatwalk/scripts/quality_gate.py \
         --model_path "$final_model_path" \
         --real_images "$scene_dir/images" \
         --output_dir "$OUTPUT_DIR/walkable" \
         || {
-            notify_slack "Stage 4 failed (non-fatal), using model directly" "info"
+            notify_slack "Stage 5 failed (non-fatal), using model directly" "info"
             echo "WARNING: Quality gate failed, copying model directly"
             mkdir -p "$OUTPUT_DIR/walkable"
             cp -r "$final_model_path"/* "$OUTPUT_DIR/walkable/" 2>/dev/null || true
         }
-    notify_slack "Stage 4 complete"
+    notify_slack "Stage 5 complete"
 
     echo "Walkable Splat pipeline completed"
     return 0
@@ -585,6 +604,13 @@ convert_and_upload() {
     # Upload compressed splat
     local splat_key="jobs/$JOB_ID/output/$pipeline_name/scene.splat"
     local splat_url=$(upload_to_spaces "$splat_path" "$splat_key" "application/octet-stream")
+
+    # Upload scene.glb if generated (Stage 4)
+    if [ -f "$OUTPUT_DIR/scene.glb" ]; then
+        local glb_key="jobs/$JOB_ID/output/$pipeline_name/scene.glb"
+        upload_to_spaces "$OUTPUT_DIR/scene.glb" "$glb_key" "model/gltf-binary"
+        echo "Uploaded scene.glb"
+    fi
 
     # Upload thumbnail if available
     local thumb_url=""

@@ -132,6 +132,12 @@ pip install --no-cache-dir google-genai 2>&1 | tail -1
 echo "Installing geospatial packages (py3dep, rioxarray, pyproj)..."
 pip install --no-cache-dir py3dep rioxarray rasterio pyproj 2>&1 | tail -3
 
+# Stage 4: Game-level scene construction packages
+echo "Installing game scene construction packages (pygltflib, pvlib, SAM2)..."
+pip install --no-cache-dir pygltflib pvlib 2>&1 | tail -3
+pip install --no-cache-dir "git+https://github.com/facebookresearch/sam2.git" 2>&1 | tail -5 \
+    || echo "WARNING: SAM2 install failed (scene construction will use fallback segmentation)"
+
 # --- Step 5: InstantSplat + CUDA extensions ---
 echo ""
 echo "=== Step 5/9: InstantSplat + CUDA extensions ==="
@@ -338,6 +344,90 @@ else:
     print(f'Real-ESRGAN model already present ({os.path.getsize(model_path) / 1e6:.1f}MB)')
 " || echo "WARNING: Real-ESRGAN model download failed (will download at runtime)"
 
+# Real-ESRGAN x4plus model (for Stage 4 super-resolution)
+echo "Pre-downloading Real-ESRGAN x4plus model..."
+python -c "
+import os, urllib.request
+model_dir = '$VOLUME_ROOT/models'
+model_path = os.path.join(model_dir, 'RealESRGAN_x4plus.pth')
+if not os.path.exists(model_path):
+    url = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth'
+    print(f'Downloading {url}...')
+    urllib.request.urlretrieve(url, model_path)
+    print(f'Saved to {model_path} ({os.path.getsize(model_path) / 1e6:.1f}MB)')
+else:
+    print(f'Real-ESRGAN x4plus model already present ({os.path.getsize(model_path) / 1e6:.1f}MB)')
+" || echo "WARNING: Real-ESRGAN x4plus model download failed (will download at runtime)"
+
+# SAM2 model weights (for Stage 4 scene segmentation)
+echo "Pre-downloading SAM2 model weights..."
+mkdir -p "$VOLUME_ROOT/models/sam2"
+python -c "
+import os, urllib.request
+model_dir = '$VOLUME_ROOT/models/sam2'
+model_path = os.path.join(model_dir, 'sam2.1_hiera_large.pt')
+if not os.path.exists(model_path):
+    url = 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt'
+    print(f'Downloading SAM2 weights (~898MB...')
+    urllib.request.urlretrieve(url, model_path)
+    print(f'Saved to {model_path} ({os.path.getsize(model_path) / 1e6:.1f}MB)')
+else:
+    print(f'SAM2 model already present ({os.path.getsize(model_path) / 1e6:.1f}MB)')
+" || echo "WARNING: SAM2 model download failed (scene construction will use fallback segmentation)"
+
+# PBR texture library from ambientCG (CC0, for Stage 4 game scene materials)
+echo "Downloading PBR texture library from ambientCG..."
+TEXTURE_DIR="$VOLUME_ROOT/textures"
+mkdir -p "$TEXTURE_DIR"
+python -c "
+import os, urllib.request, zipfile, tempfile
+texture_dir = '$TEXTURE_DIR'
+materials = {
+    'grass': 'Ground054',
+    'concrete': 'Concrete034',
+    'asphalt': 'Asphalt012',
+    'gravel': 'Ground037',
+    'bare_soil': 'Ground048',
+    'mulch': 'Ground042',
+    'wood_deck': 'Wood051',
+    'roof_shingle': 'RoofingTiles006',
+}
+for mat_name, acg_id in materials.items():
+    mat_dir = os.path.join(texture_dir, mat_name)
+    if os.path.isdir(mat_dir) and len(os.listdir(mat_dir)) >= 2:
+        print(f'  {mat_name}: already present — skipping')
+        continue
+    os.makedirs(mat_dir, exist_ok=True)
+    url = f'https://ambientcg.com/get?file={acg_id}_2K-JPG.zip'
+    print(f'  Downloading {mat_name} ({acg_id})...')
+    try:
+        tmp = os.path.join(mat_dir, 'download.zip')
+        urllib.request.urlretrieve(url, tmp)
+        with zipfile.ZipFile(tmp) as zf:
+            for member in zf.namelist():
+                lower = member.lower()
+                if any(k in lower for k in ('color', 'normal', 'roughness', 'displacement')):
+                    # Extract with flat name
+                    basename = os.path.basename(member)
+                    if 'color' in lower:
+                        dest = 'albedo.jpg'
+                    elif 'normal' in lower and 'gl' in lower:
+                        dest = 'normal.jpg'
+                    elif 'normal' in lower:
+                        dest = 'normal.jpg'
+                    elif 'roughness' in lower:
+                        dest = 'roughness.jpg'
+                    else:
+                        continue
+                    with zf.open(member) as src, open(os.path.join(mat_dir, dest), 'wb') as dst:
+                        dst.write(src.read())
+        os.remove(tmp)
+        print(f'  {mat_name}: extracted to {mat_dir}')
+    except Exception as e:
+        print(f'  WARNING: {mat_name} download failed: {e}')
+print('PBR texture library download complete')
+" || echo "WARNING: PBR texture download failed (scene will use orthophoto drape only)"
+
 # --- Step 7: Pipeline scripts ---
 echo ""
 echo "=== Step 7/9: Pipeline scripts ==="
@@ -402,6 +492,8 @@ import trimesh; print(f'Trimesh {trimesh.__version__}')
 import kornia; print(f'Kornia {kornia.__version__}')
 import transformers; print(f'Transformers {transformers.__version__}')
 import realesrgan; print('Real-ESRGAN OK')
+import pygltflib; print(f'pygltflib {pygltflib.__version__}')
+import pvlib; print(f'pvlib {pvlib.__version__}')
 print('All imports OK')
 "
 

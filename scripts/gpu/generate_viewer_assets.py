@@ -252,6 +252,15 @@ def main():
         },
     }
 
+    # Check if game-level scene GLB was generated (Stage 4)
+    glb_path = os.path.join(os.path.dirname(args.output_dir), "scene.glb")
+    if os.path.exists(glb_path):
+        glb_url = upload_to_cdn(glb_path, f"{remote_prefix}/scene.glb")
+        manifest["scene_glb_url"] = glb_url
+        manifest["crossfade_altitude"] = 30.0
+        glb_size_mb = Path(glb_path).stat().st_size / 1024 / 1024
+        print(f"  GLB scene: {glb_size_mb:.1f}MB → {glb_url}")
+
     # Check if ground views were generated — add walk mode
     ground_meta_path = os.path.join(os.path.dirname(args.output_dir), "ground_views", "ground_views_metadata.json")
     if os.path.exists(ground_meta_path):
