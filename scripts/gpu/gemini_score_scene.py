@@ -140,7 +140,7 @@ def _add_camera_looking_at(scene, camera, eye, target, up=None):
 def _save_render(color_array, path, quality=90):
     """Save render as JPEG."""
     from PIL import Image
-    img = Image.fromarray(color_array)
+    img = Image.fromarray(color_array).convert("RGB")
     img.save(path, "JPEG", quality=quality)
 
 
@@ -162,7 +162,7 @@ def score_with_gemini(views, orthophoto_path, api_key):
 
     # Add orthophoto as reference (resize to max 1024px for API)
     from PIL import Image
-    ortho = Image.open(orthophoto_path)
+    ortho = Image.open(orthophoto_path).convert("RGB")
     ortho.thumbnail((1024, 1024))
     ortho_path_tmp = orthophoto_path + ".thumb.jpg"
     ortho.save(ortho_path_tmp, "JPEG", quality=85)
