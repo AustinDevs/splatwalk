@@ -656,26 +656,56 @@ except Exception as e:
 " 2>&1)" || true
     echo "Drone AGL: ${DRONE_AGL}m"
 
-    # === Ortho tile generation ===
-    notify_slack "Ortho: generating 2D tile pyramid..."
-    python /mnt/splatwalk/scripts/generate_ortho_tiles.py \
-        --odm_orthophoto "$ODM_ORTHO_TIF" \
-        --output_dir "$OUTPUT_DIR/ortho" \
-        --job_id "$JOB_ID" \
-        --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
-        || notify_slack "Ortho tile generation failed (non-fatal)" "info"
+    # === Ortho tile generation (cached on volume) ===
+    local ORTHO_CACHE="/mnt/splatwalk/cache/ortho/${JOB_ID}"
+    if [ -d "$ORTHO_CACHE/tiles" ] && [ -f "$ORTHO_CACHE/ortho_manifest.json" ]; then
+        notify_slack "Ortho: using cached tiles from volume (skipping ~5 min upscale)"
+        mkdir -p "$OUTPUT_DIR/ortho"
+        cp -r "$ORTHO_CACHE"/* "$OUTPUT_DIR/ortho/"
+        echo "  Restored ortho cache: $(du -sh "$ORTHO_CACHE" | cut -f1)"
+    else
+        notify_slack "Ortho: generating 2D tile pyramid..."
+        python /mnt/splatwalk/scripts/generate_ortho_tiles.py \
+            --odm_orthophoto "$ODM_ORTHO_TIF" \
+            --output_dir "$OUTPUT_DIR/ortho" \
+            --job_id "$JOB_ID" \
+            --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
+            || notify_slack "Ortho tile generation failed (non-fatal)" "info"
 
-    # === Aerial GLB (orthophoto draped on DSM terrain mesh) ===
-    notify_slack "Generating aerial GLB..."
-    python /mnt/splatwalk/scripts/generate_aerial_glb.py \
-        --orthophoto "$ODM_ORTHO_TIF" \
-        --dsm "$ODM_OUTPUT/odm_dem/dsm.tif" \
-        --output "$OUTPUT_DIR/aerial.glb" \
-        --scene_scale 50.0 \
-        --upscale \
-        --scene_transform_out "$OUTPUT_DIR/scene_transform.json" \
-        || { notify_slack "FATAL: Aerial GLB generation failed" "error"; return 1; }
-    notify_slack "Aerial GLB generated"
+        # Cache ortho output on volume
+        if [ -d "$OUTPUT_DIR/ortho/tiles" ]; then
+            mkdir -p "$ORTHO_CACHE"
+            cp -r "$OUTPUT_DIR/ortho"/* "$ORTHO_CACHE/" 2>/dev/null || true
+            echo "  Ortho tiles cached to volume: $(du -sh "$ORTHO_CACHE" | cut -f1)"
+        fi
+    fi
+
+    # === Aerial GLB (cached on volume — only depends on ODM output) ===
+    local AERIAL_CACHE="/mnt/splatwalk/cache/aerial/${JOB_ID}"
+    if [ -f "$AERIAL_CACHE/aerial.glb" ] && [ -f "$AERIAL_CACHE/scene_transform.json" ]; then
+        notify_slack "Aerial GLB: using cached output from volume"
+        cp "$AERIAL_CACHE/aerial.glb" "$OUTPUT_DIR/aerial.glb"
+        cp "$AERIAL_CACHE/scene_transform.json" "$OUTPUT_DIR/scene_transform.json"
+        echo "  Restored aerial cache: $(du -sh "$AERIAL_CACHE" | cut -f1)"
+    else
+        notify_slack "Generating aerial GLB..."
+        python /mnt/splatwalk/scripts/generate_aerial_glb.py \
+            --orthophoto "$ODM_ORTHO_TIF" \
+            --dsm "$ODM_OUTPUT/odm_dem/dsm.tif" \
+            --output "$OUTPUT_DIR/aerial.glb" \
+            --scene_scale 50.0 \
+            --upscale \
+            --scene_transform_out "$OUTPUT_DIR/scene_transform.json" \
+            || { notify_slack "FATAL: Aerial GLB generation failed" "error"; return 1; }
+
+        # Cache aerial GLB + scene_transform on volume
+        if [ -f "$OUTPUT_DIR/aerial.glb" ]; then
+            mkdir -p "$AERIAL_CACHE"
+            cp "$OUTPUT_DIR/aerial.glb" "$OUTPUT_DIR/scene_transform.json" "$AERIAL_CACHE/" 2>/dev/null || true
+            echo "  Aerial GLB cached to volume: $(du -sh "$AERIAL_CACHE" | cut -f1)"
+        fi
+    fi
+    notify_slack "Aerial GLB ready"
 
     # === Ground GLB (game-level scene with PBR + vegetation) ===
     notify_slack "Building ground-level scene GLB..."
