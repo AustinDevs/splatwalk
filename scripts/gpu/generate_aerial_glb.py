@@ -54,6 +54,7 @@ def load_dsm(dsm_path):
         dsm = src.read(1).astype(np.float32)
         transform = src.transform
         bounds = src.bounds
+        crs = src.crs
 
     print(f"  DSM: {dsm.shape[1]}x{dsm.shape[0]} px, "
           f"bounds=({bounds.left:.1f},{bounds.bottom:.1f})-({bounds.right:.1f},{bounds.top:.1f})")
@@ -67,10 +68,92 @@ def load_dsm(dsm_path):
         )
         dsm[nan_mask] = dsm[nearest_idx[0][nan_mask], nearest_idx[1][nan_mask]]
 
+    # --- Supplement with 3DEP bare-earth DEM ---
+    dsm = _blend_3dep(dsm, bounds, crs, transform)
+
     # Light smoothing
     dsm = gaussian_filter(dsm, sigma=1.0)
 
     return dsm, transform, bounds
+
+
+def _blend_3dep(dsm, bounds, crs, dsm_transform):
+    """Fetch USGS 3DEP bare-earth DEM and blend with ODM DSM.
+
+    Uses 3DEP to:
+    - Fill holes where ODM DSM has noise/gaps
+    - Improve ground-level estimation (3DEP is LiDAR bare-earth)
+    - Weighted blend: keep ODM surface detail, anchor to 3DEP ground truth
+    """
+    try:
+        import py3dep
+        from pyproj import Transformer
+    except ImportError:
+        print("  3DEP: py3dep/pyproj not available, using ODM DSM only")
+        return dsm
+
+    try:
+        # Convert DSM bounds from projected CRS to WGS84 (EPSG:4326) for 3DEP query
+        transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+        west, south = transformer.transform(bounds.left, bounds.bottom)
+        east, north = transformer.transform(bounds.right, bounds.top)
+
+        print(f"  3DEP: fetching DEM for ({west:.5f},{south:.5f})-({east:.5f},{north:.5f})")
+
+        # Fetch 3DEP DEM at 10m resolution (widely available across US)
+        dem_3dep = py3dep.get_dem((west, south, east, north), resolution=10, crs="EPSG:4326")
+
+        if dem_3dep is None or dem_3dep.size == 0:
+            print("  3DEP: no data available for this area")
+            return dsm
+
+        # Reproject 3DEP to match ODM DSM grid
+        from rasterio.warp import reproject, Resampling
+        from rasterio.transform import from_bounds
+
+        dem_values = dem_3dep.values.astype(np.float32)
+        dem_bounds = (
+            float(dem_3dep.x.min()), float(dem_3dep.y.min()),
+            float(dem_3dep.x.max()), float(dem_3dep.y.max()),
+        )
+        dem_transform = from_bounds(*dem_bounds, dem_values.shape[1], dem_values.shape[0])
+
+        # Reproject 3DEP into ODM DSM space
+        dep_resampled = np.zeros_like(dsm)
+        reproject(
+            source=dem_values,
+            destination=dep_resampled,
+            src_transform=dem_transform,
+            src_crs="EPSG:4326",
+            dst_transform=dsm_transform,
+            dst_crs=crs,
+            resampling=Resampling.bilinear,
+        )
+
+        # Where 3DEP has valid data, use weighted blend
+        valid_3dep = (dep_resampled > -1000) & (dep_resampled < 10000) & ~np.isnan(dep_resampled)
+        overlap_pct = 100 * valid_3dep.sum() / dsm.size
+
+        if overlap_pct < 5:
+            print(f"  3DEP: only {overlap_pct:.1f}% overlap, using ODM DSM only")
+            return dsm
+
+        # Blend: 70% ODM (local detail) + 30% 3DEP (regional accuracy)
+        # This preserves ODM's fine structure while anchoring to 3DEP ground truth
+        blend_weight = 0.3
+        dsm[valid_3dep] = (
+            (1 - blend_weight) * dsm[valid_3dep] +
+            blend_weight * dep_resampled[valid_3dep]
+        )
+
+        elev_diff = np.abs(dsm[valid_3dep] - dep_resampled[valid_3dep])
+        print(f"  3DEP: blended ({overlap_pct:.0f}% coverage, "
+              f"mean diff={elev_diff.mean():.1f}m, max={elev_diff.max():.1f}m)")
+
+    except Exception as e:
+        print(f"  3DEP: fetch failed ({e}), using ODM DSM only")
+
+    return dsm
 
 
 def build_terrain_mesh(dsm, dsm_transform, dsm_bounds, scene_scale, grid_size=500):

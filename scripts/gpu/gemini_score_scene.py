@@ -42,7 +42,15 @@ def render_glb_views(glb_path, scene_bounds, output_dir, resolution=1024):
     Uses pyrender with EGL backend for headless GPU rendering.
     Returns list of JPEG paths.
     """
-    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+    # Must set these BEFORE any OpenGL/pyglet imports
+    os.environ["PYOPENGL_PLATFORM"] = "egl"
+
+    # Prevent pyglet from creating a shadow window (fails without X11 display)
+    try:
+        import pyglet
+        pyglet.options['shadow_window'] = False
+    except Exception:
+        pass
 
     import trimesh
     import pyrender

@@ -397,6 +397,13 @@ def step_terrain(dsm_path, dtm_path, orthophoto_path, model_path, scene_path,
         _, nearest_idx = distance_transform_edt(nan_mask, return_distances=True, return_indices=True)
         dsm[nan_mask] = dsm[nearest_idx[0][nan_mask], nearest_idx[1][nan_mask]]
 
+    # Supplement with 3DEP bare-earth DEM if available
+    try:
+        from generate_aerial_glb import _blend_3dep
+        dsm = _blend_3dep(dsm, dsm_bounds, dsm_crs, dsm_transform)
+    except Exception as e:
+        print(f"  3DEP blend skipped: {e}")
+
     # Gaussian blur for smoother terrain
     dsm = gaussian_filter(dsm, sigma=dsm_smooth_sigma)
 

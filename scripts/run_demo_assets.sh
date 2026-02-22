@@ -267,7 +267,8 @@ if not os.path.exists(model_path):
 fi
 
 # --- Ensure pyrender + EGL deps for headless GLB rendering (quality loop) ---
-/mnt/splatwalk/conda/bin/pip install --no-cache-dir pyrender PyOpenGL 2>&1 | tail -3
+apt-get update -qq && apt-get install -y -qq libglu1-mesa-dev libegl1-mesa-dev libgl1-mesa-dev libosmesa6-dev 2>&1 | tail -5
+/mnt/splatwalk/conda/bin/pip install --no-cache-dir pyrender PyOpenGL google-genai 2>&1 | tail -3
 export PYOPENGL_PLATFORM=egl
 
 notify_slack "Volume ready. Downloading dataset..."
