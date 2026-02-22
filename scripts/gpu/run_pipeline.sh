@@ -567,33 +567,51 @@ run_mesh() {
     echo "Running Mesh pipeline (ODM → aerial GLB + ground GLB)..."
     notify_slack "Starting mesh pipeline with $(ls -1 "$INPUT_DIR"/*.jpg "$INPUT_DIR"/*.jpeg "$INPUT_DIR"/*.png 2>/dev/null | wc -l | tr -d ' ') images"
 
-    # === ODM Orthomosaic + DSM/DTM ===
+    # === ODM Orthomosaic + DSM/DTM (cached on volume per job_id) ===
     local ODM_OUTPUT="$OUTPUT_DIR/odm"
     local ODM_TAR="/mnt/splatwalk/odm-docker.tar.gz"
     local ODM_ORTHO_TIF="$ODM_OUTPUT/odm_orthophoto/odm_orthophoto.tif"
-    if [ ! -f "$ODM_TAR" ]; then
-        notify_slack "ODM: Docker image not cached — pulling and saving to volume (~5GB)..."
-        docker pull opendronemap/odm:latest \
-            || { notify_slack "FATAL: failed to pull ODM Docker image" "error"; return 1; }
-        docker save opendronemap/odm:latest | gzip > "$ODM_TAR" \
-            || { notify_slack "FATAL: failed to save ODM Docker image to volume" "error"; return 1; }
-        notify_slack "ODM Docker image cached on volume ($(du -h "$ODM_TAR" | cut -f1))"
+    local ODM_CACHE="/mnt/splatwalk/cache/odm/${JOB_ID}"
+
+    # Check for cached ODM output on volume (survives droplet destruction)
+    if [ -f "$ODM_CACHE/odm_orthophoto/odm_orthophoto.tif" ] && \
+       [ -f "$ODM_CACHE/odm_dem/dsm.tif" ]; then
+        notify_slack "ODM: using cached output from volume (skipping ~25 min rebuild)"
+        mkdir -p "$ODM_OUTPUT"
+        cp -r "$ODM_CACHE"/* "$ODM_OUTPUT/"
+        echo "  Restored ODM cache: $(du -sh "$ODM_OUTPUT" | cut -f1)"
+    else
+        if [ ! -f "$ODM_TAR" ]; then
+            notify_slack "ODM: Docker image not cached — pulling and saving to volume (~5GB)..."
+            docker pull opendronemap/odm:latest \
+                || { notify_slack "FATAL: failed to pull ODM Docker image" "error"; return 1; }
+            docker save opendronemap/odm:latest | gzip > "$ODM_TAR" \
+                || { notify_slack "FATAL: failed to save ODM Docker image to volume" "error"; return 1; }
+            notify_slack "ODM Docker image cached on volume ($(du -h "$ODM_TAR" | cut -f1))"
+        fi
+        notify_slack "ODM: loading Docker image + generating orthomosaic + DSM/DTM..."
+        docker load -i "$ODM_TAR" 2>/dev/null
+        mkdir -p "$ODM_OUTPUT"
+        docker run --rm \
+            -v "$INPUT_DIR:/datasets/project/images" \
+            -v "$ODM_OUTPUT:/datasets/project" \
+            opendronemap/odm \
+            --project-path /datasets project \
+            --dsm \
+            --dtm \
+            --orthophoto-resolution 5 \
+            --max-concurrency 4 \
+            2>&1 | tail -50 \
+            || { notify_slack "FATAL: ODM failed" "error"; return 1; }
+        notify_slack "ODM complete (orthophoto + DSM/DTM)"
+
+        # Cache ODM output on volume for next run
+        if [ -f "$ODM_OUTPUT/odm_orthophoto/odm_orthophoto.tif" ]; then
+            mkdir -p "$ODM_CACHE"
+            cp -r "$ODM_OUTPUT/odm_orthophoto" "$ODM_OUTPUT/odm_dem" "$ODM_CACHE/" 2>/dev/null || true
+            echo "  ODM output cached to volume: $(du -sh "$ODM_CACHE" | cut -f1)"
+        fi
     fi
-    notify_slack "ODM: loading Docker image + generating orthomosaic + DSM/DTM..."
-    docker load -i "$ODM_TAR" 2>/dev/null
-    mkdir -p "$ODM_OUTPUT"
-    docker run --rm \
-        -v "$INPUT_DIR:/datasets/project/images" \
-        -v "$ODM_OUTPUT:/datasets/project" \
-        opendronemap/odm \
-        --project-path /datasets project \
-        --dsm \
-        --dtm \
-        --orthophoto-resolution 5 \
-        --max-concurrency 4 \
-        2>&1 | tail -50 \
-        || { notify_slack "FATAL: ODM failed" "error"; return 1; }
-    notify_slack "ODM complete (orthophoto + DSM/DTM)"
 
     if [ ! -f "$ODM_ORTHO_TIF" ]; then
         notify_slack "FATAL: ODM orthophoto not found at $ODM_ORTHO_TIF" "error"
