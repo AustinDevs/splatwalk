@@ -2,16 +2,16 @@
 set -euo pipefail
 
 # ============================================================================
-# Launch GPU droplet to generate Top-Down Fly-Over Demo Assets
+# Launch GPU droplet for Full Pipeline: Splat Aerial + Quality-Gated Ground GLB
 #
 # Uses the aukerman dataset to:
-# 1. Run MASt3R init + 10K InstantSplat training (~10 min)
-# 2. Top-down progressive zoom descent: 5 altitude levels with
-#    render + retrain at each level (~20 min)
-# 3. Compress .splat + upload manifest.json to Spaces CDN
-# 4. Self-destruct
+# 1. ODM orthomosaic + DSM/DTM generation (~8 min)
+# 2. MASt3R → InstantSplat 10K → Zoom Descent → .splat (~25 min)
+# 3. Build ground-level scene GLB (PBR + vegetation) (~3 min)
+# 4. Gemini quality loop on ground GLB (up to 3 iterations) (~10 min)
+# 5. Upload splat + GLBs + manifest to Spaces CDN, self-destruct
 #
-# Total estimated time: ~40-50 min on RTX 4000 Ada (~$0.50)
+# Total estimated time: ~50 min on RTX 6000 Ada (~$1.30)
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -204,43 +204,20 @@ if ! /mnt/splatwalk/conda/bin/python --version > /dev/null 2>&1; then
   notify_slack "Volume setup complete!"
 fi
 
-# --- Repair torch if SAM2 upgraded it (breaks compiled CUDA extensions) ---
+# --- Set up Python environment ---
 export PATH="/mnt/splatwalk/conda/bin:$PATH"
-export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
-TORCH_VER=$(/mnt/splatwalk/conda/bin/python -c "import torch; print(torch.__version__)" 2>/dev/null || echo "unknown")
-if [[ "$TORCH_VER" != 2.4.* ]]; then
-  notify_slack "REPAIR: torch is $TORCH_VER (expected 2.4.x) — downgrading + rebuilding CUDA extensions..."
-  /mnt/splatwalk/conda/bin/pip install --no-cache-dir \
-      torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 \
-      --index-url https://download.pytorch.org/whl/cu124 2>&1 | tail -5
-  # Purge old CUDA extension builds + site-packages before rebuilding
-  /mnt/splatwalk/conda/bin/pip uninstall -y diff-gaussian-rasterization simple-knn fused-ssim 2>/dev/null || true
-  rm -rf /mnt/splatwalk/conda/lib/python*/site-packages/diff_gaussian_rasterization* 2>/dev/null || true
-  rm -rf /mnt/splatwalk/conda/lib/python*/site-packages/simple_knn* 2>/dev/null || true
-  rm -rf /mnt/splatwalk/conda/lib/python*/site-packages/fused_ssim* 2>/dev/null || true
-  # Clean build dirs
-  rm -rf /mnt/splatwalk/InstantSplat/submodules/diff-gaussian-rasterization/build 2>/dev/null || true
-  rm -rf /mnt/splatwalk/InstantSplat/submodules/simple-knn/build 2>/dev/null || true
-  # Rebuild CUDA extensions from source with correct torch + CUDA arch list
-  cd /mnt/splatwalk/InstantSplat/submodules/diff-gaussian-rasterization
-  FORCE_CUDA=1 /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation . 2>&1 | tail -5
-  cd /mnt/splatwalk/InstantSplat/submodules/simple-knn
-  /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation . 2>&1 | tail -5
-  # Also rebuild fused-ssim if present
-  if [ -d /mnt/splatwalk/InstantSplat/submodules/fused-ssim ]; then
-    cd /mnt/splatwalk/InstantSplat/submodules/fused-ssim
-    /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation . 2>&1 | tail -3 || true
-  fi
-  notify_slack "REPAIR complete: torch 2.4.0 + CUDA extensions rebuilt"
-fi
-# Verify CUDA extensions work before proceeding
+
+# Verify basic torch + CUDA works (for Real-ESRGAN upscaling)
 /mnt/splatwalk/conda/bin/python -c "
-import torch, simple_knn, diff_gaussian_rasterization
+import torch
 print(f'torch={torch.__version__} cuda={torch.cuda.is_available()}')
-# Quick CUDA sanity check
-t = torch.randn(100, 3, device='cuda')
-print(f'CUDA tensor OK: {t.shape}')
-" || { notify_slack "FATAL: CUDA extensions broken after repair" "error"; exit 1; }
+if torch.cuda.is_available():
+    t = torch.randn(100, 3, device='cuda')
+    print(f'CUDA tensor OK: {t.shape}')
+" || notify_slack "WARNING: CUDA not available, Real-ESRGAN will use CPU" "info"
+
+# --- Ensure trimesh + rasterio installed (mesh pipeline deps) ---
+/mnt/splatwalk/conda/bin/pip install --no-cache-dir trimesh rasterio scipy 2>&1 | tail -3
 
 # --- Ensure Real-ESRGAN is installed (handles existing volumes without it) ---
 if ! /mnt/splatwalk/conda/bin/python -c "import realesrgan" 2>/dev/null; then
@@ -287,6 +264,49 @@ if not os.path.exists(model_path):
         model_path)
     print(f'Saved ({os.path.getsize(model_path)/1e6:.0f}MB)')
 " || echo "WARNING: SAM2 model download failed"
+fi
+
+# --- Ensure pyrender + EGL deps for headless GLB rendering (quality loop) ---
+/mnt/splatwalk/conda/bin/pip install --no-cache-dir pyrender PyOpenGL 2>&1 | tail -3
+export PYOPENGL_PLATFORM=egl
+
+# --- CUDA extension repair (diff-gaussian-rasterization, simple-knn, fused-ssim) ---
+# Pre-built pip wheels have CPU-only _C.so; we need GPU rasterization for splat training
+if /mnt/splatwalk/conda/bin/python -c "
+import torch
+try:
+    from diff_gaussian_rasterization import _C
+    t = torch.zeros(1, device='cuda')
+    print('CUDA extensions OK')
+except Exception as e:
+    print(f'CUDA extensions broken: {e}')
+    exit(1)
+" 2>/dev/null; then
+    echo "CUDA extensions verified"
+else
+    notify_slack "Repairing CUDA extensions (force rebuild from source)..."
+    export FORCE_CUDA=1
+    export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
+    cd /mnt/splatwalk/InstantSplat
+
+    # diff-gaussian-rasterization
+    /mnt/splatwalk/conda/bin/pip uninstall -y diff-gaussian-rasterization 2>/dev/null || true
+    cd submodules/diff-gaussian-rasterization
+    rm -rf build dist *.egg-info
+    /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation . 2>&1 | tail -10
+    cd ../..
+
+    # simple-knn
+    /mnt/splatwalk/conda/bin/pip uninstall -y simple-knn 2>/dev/null || true
+    cd submodules/simple-knn
+    rm -rf build dist *.egg-info
+    /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation . 2>&1 | tail -10
+    cd ../..
+
+    # fused-ssim
+    /mnt/splatwalk/conda/bin/pip install --no-cache-dir fused-ssim 2>&1 | tail -3
+
+    notify_slack "CUDA extensions rebuilt"
 fi
 
 notify_slack "Volume ready. Downloading dataset..."
@@ -336,7 +356,7 @@ echo "Fetching latest pipeline scripts from GitHub..."
 _CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
 [ -n "__GITHUB_TOKEN__" ] && _CURL_ARGS+=(-H "Authorization: token __GITHUB_TOKEN__")
 _BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/scripts/gpu"
-for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py generate_ortho_tiles.py generate_ground_views.py align_geo_colmap.py build_game_scene.py; do
+for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py generate_ortho_tiles.py generate_ground_views.py align_geo_colmap.py build_game_scene.py generate_aerial_glb.py gemini_score_scene.py; do
     if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
         echo "  Updated $_script (from GitHub)"
     elif curl -fsSL "__SPACES_ENDPOINT__/__SPACES_BUCKET__/scripts/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
@@ -345,6 +365,14 @@ for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate
         echo "  Using baked-in $_script (fetch failed)"
     fi
 done
+# Also fetch run_pipeline.sh (orchestrator)
+if curl "${_CURL_ARGS[@]}" "$_BASE_URL/run_pipeline.sh" -o "/mnt/splatwalk/scripts/run_pipeline.sh" 2>/dev/null; then
+    chmod +x /mnt/splatwalk/scripts/run_pipeline.sh
+    echo "  Updated run_pipeline.sh (from GitHub)"
+elif curl -fsSL "__SPACES_ENDPOINT__/__SPACES_BUCKET__/scripts/run_pipeline.sh" -o "/mnt/splatwalk/scripts/run_pipeline.sh" 2>/dev/null; then
+    chmod +x /mnt/splatwalk/scripts/run_pipeline.sh
+    echo "  Updated run_pipeline.sh (from Spaces)"
+fi
 
 # --- Find images directory (handle various unzip structures) ---
 INPUT_DIR=/workspace/__JOB_ID__/input
@@ -354,244 +382,14 @@ if [ -d "$INPUT_DIR/images" ]; then
     find "$INPUT_DIR/images" -type f \( -name "*.jpg" -o -name "*.JPG" -o -name "*.jpeg" -o -name "*.png" \) -exec mv {} "$INPUT_DIR/" \;
 fi
 
-# --- ODM Orthomosaic (full-res, all images — fatal on failure) ---
-ODM_TAR="/mnt/splatwalk/odm-docker.tar.gz"
-ODM_OUTPUT="/workspace/__JOB_ID__/output/odm"
-if [ ! -f "$ODM_TAR" ]; then
-    notify_slack "ODM: Docker image not cached — pulling and saving to volume (~5GB)..."
-    docker pull opendronemap/odm:latest \
-        || { notify_slack "FATAL: failed to pull ODM Docker image" "error"; exit 1; }
-    docker save opendronemap/odm:latest | gzip > "$ODM_TAR" \
-        || { notify_slack "FATAL: failed to save ODM Docker image to volume" "error"; exit 1; }
-    notify_slack "ODM Docker image cached on volume ($(du -h "$ODM_TAR" | cut -f1))"
-fi
-notify_slack "ODM: generating orthomosaic from original images..."
-docker load -i "$ODM_TAR" 2>/dev/null
-mkdir -p "$ODM_OUTPUT"
-docker run --rm \
-    -v "$INPUT_DIR:/datasets/project/images" \
-    -v "$ODM_OUTPUT:/datasets/project" \
-    opendronemap/odm \
-    --project-path /datasets project \
-    --dsm \
-    --dtm \
-    --orthophoto-resolution 5 \
-    --max-concurrency 4 \
-    2>&1 | tail -50 \
-    || { notify_slack "FATAL: ODM failed" "error"; exit 1; }
-notify_slack "ODM complete (orthophoto + DSM/DTM)"
+# --- Run full pipeline via run_pipeline.sh (handles ODM, splat, GLB, quality loop) ---
+export INPUT_DIR=/workspace/__JOB_ID__/input
+export OUTPUT_DIR=/workspace/__JOB_ID__/output
+export PIPELINE_MODE="full"
+export JOB_ID="aukerman"
 
-# --- Preprocess images to 512x512 ---
-SCENE_DIR=/workspace/__JOB_ID__/output/scene
-mkdir -p "$SCENE_DIR/images"
-
-echo "Preprocessing images to 512x512..."
-python3 << 'PREPROCESS_SCRIPT'
-import os, sys
-from PIL import Image
-from pathlib import Path
-
-input_dir = "/workspace/__JOB_ID__/input"
-output_dir = "/workspace/__JOB_ID__/output/scene/images"
-target_size = (512, 512)
-os.makedirs(output_dir, exist_ok=True)
-count = 0
-for img_file in sorted(Path(input_dir).glob('*')):
-    if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
-        try:
-            img = Image.open(img_file).convert('RGB')
-            w, h = img.size
-            scale = max(target_size[0] / w, target_size[1] / h)
-            new_w, new_h = int(w * scale), int(h * scale)
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-            left = (new_w - target_size[0]) // 2
-            top = (new_h - target_size[1]) // 2
-            img = img.crop((left, top, left + target_size[0], top + target_size[1]))
-            out_path = os.path.join(output_dir, img_file.stem.lower() + '.jpg')
-            img.save(out_path, 'JPEG', quality=95)
-            count += 1
-        except Exception as e:
-            print(f"  Error: {img_file.name}: {e}", file=sys.stderr)
-print(f"Preprocessed {count} images to 512x512")
-PREPROCESS_SCRIPT
-
-NUM_PROCESSED=$(ls -1 "$SCENE_DIR/images"/*.jpg 2>/dev/null | wc -l)
-echo "Preprocessed $NUM_PROCESSED images"
-
-# --- Stage 1: MASt3R geometry init ---
-notify_slack "Stage 1: MASt3R geometry init ($NUM_PROCESSED images)..."
-cd /mnt/splatwalk/InstantSplat
-
-MAX_VIEWS=24
-N_VIEWS=$NUM_PROCESSED
-[ "$N_VIEWS" -gt "$MAX_VIEWS" ] && N_VIEWS=$MAX_VIEWS
-
-python init_geo.py \
-    --source_path "$SCENE_DIR" \
-    --model_path "/workspace/__JOB_ID__/output/instantsplat" \
-    --n_views "$N_VIEWS" \
-    --focal_avg \
-    --co_vis_dsp \
-    --conf_aware_ranking \
-    2>&1 || { notify_slack "Failed at Stage 1" "error"; exit 1; }
-
-notify_slack "Stage 1 complete. Starting Stage 2 (10K training)..."
-
-# --- Stage 2: InstantSplat training (10K iterations) ---
-python train.py \
-    --source_path "$SCENE_DIR" \
-    --model_path "/workspace/__JOB_ID__/output/instantsplat" \
-    --iterations 10000 \
-    --n_views "$N_VIEWS" \
-    --pp_optimizer \
-    --optim_pose \
-    --test_iterations 10001 \
-    || { notify_slack "Failed at Stage 2" "error"; exit 1; }
-
-notify_slack "Stage 2 complete (10K aerial splat trained). Starting render+retrain descent..."
-
-# --- Extract EXIF GPS + altitude ---
-DRONE_AGL=63  # default for aukerman
-eval "$(python3 -c "
-import sys
-from pathlib import Path
-try:
-    from PIL import Image, ExifTags
-    for f in sorted(Path('/workspace/__JOB_ID__/input').glob('*')):
-        if f.suffix.lower() not in ('.jpg','.jpeg','.png'): continue
-        img = Image.open(f)
-        exif = img._getexif()
-        if not exif: continue
-        gps = exif.get(ExifTags.Base.GPSInfo)
-        if not gps: continue
-        tags = {}
-        for k,v in gps.items():
-            tags[ExifTags.GPSTAGS.get(k,k)] = v
-        if 'GPSLatitude' not in tags: continue
-        def dms(d,r):
-            v=float(d[0])+float(d[1])/60+float(d[2])/3600
-            return -v if r in ('S','W') else v
-        alt=float(tags['GPSAltitude']) if 'GPSAltitude' in tags else 0
-        if alt > 0:
-            lat=dms(tags['GPSLatitude'],tags.get('GPSLatitudeRef','N'))
-            lon=dms(tags['GPSLongitude'],tags.get('GPSLongitudeRef','W'))
-            # Get ground elevation
-            import urllib.request, json
-            url=f'https://api.open-meteo.com/v1/elevation?latitude={lat}&longitude={lon}'
-            resp=json.loads(urllib.request.urlopen(url, timeout=5).read())
-            elev=resp.get('elevation',0)
-            if isinstance(elev,list): elev=elev[0]
-            agl=max(10, alt-elev)
-            print(f'DRONE_AGL={agl:.0f}')
-        break
-except Exception as e:
-    print(f'# EXIF extraction failed: {e}', file=sys.stderr)
-" 2>&1)" || true
-
-echo "Drone AGL: ${DRONE_AGL}m"
-
-# --- Ortho tile generation (requires ODM orthophoto — fatal on failure) ---
-ODM_ORTHO_TIF="$ODM_OUTPUT/odm_orthophoto/odm_orthophoto.tif"
-if [ ! -f "$ODM_ORTHO_TIF" ]; then
-    notify_slack "FATAL: ODM orthophoto not found at $ODM_ORTHO_TIF" "error"
-    exit 1
-fi
-notify_slack "Ortho: generating 2D tile pyramid from ODM orthophoto..."
-python /mnt/splatwalk/scripts/generate_ortho_tiles.py \
-    --odm_orthophoto "$ODM_ORTHO_TIF" \
-    --scene_path "$SCENE_DIR" \
-    --output_dir "/workspace/__JOB_ID__/output/ortho" \
-    --job_id "aukerman" \
-    --slack_webhook_url "$SLACK_WEBHOOK_URL" \
-    || { notify_slack "FATAL: Ortho tile generation failed" "error"; exit 1; }
-
-# --- Stage 3: Top-Down Progressive Zoom Descent (non-fatal) ---
-# Zoom descent often fails on quality gate — Stage 4 GLB is the alternative
-BEST_MODEL="/workspace/__JOB_ID__/output/instantsplat"  # fallback: Stage 2 model
-DESCENT_OK=false
-
-notify_slack "Stage 3: Top-down zoom descent (5 altitude levels)..."
-if python /mnt/splatwalk/scripts/render_zoom_descent.py \
-    --model_path "/workspace/__JOB_ID__/output/instantsplat" \
-    --scene_path "$SCENE_DIR" \
-    --output_dir "/workspace/__JOB_ID__/output/descent" \
-    --altitudes "1.0,0.5,0.25,0.12,0.05" \
-    --drone_agl "$DRONE_AGL" \
-    --retrain_iterations 2000 \
-    --max_images_per_level 64 \
-    --slack_webhook_url "$SLACK_WEBHOOK_URL" \
-    --job_id "__JOB_ID__" \
-    --odm_orthophoto "$ODM_ORTHO_TIF"; then
-
-    BEST_MODEL="/workspace/__JOB_ID__/output/descent/final"
-    DESCENT_OK=true
-
-    # --- Stage 3b: Ground-Level View Generation (3DEP DEM + ODM texture) ---
-    notify_slack "Stage 3b: generating ground-level views via 3DEP DEM..."
-    python /mnt/splatwalk/scripts/generate_ground_views.py \
-        --scene_path "$SCENE_DIR" \
-        --model_path "$BEST_MODEL" \
-        --input_dir "$INPUT_DIR" \
-        --output_dir "/workspace/__JOB_ID__/output/ground_views" \
-        --odm_orthophoto "$ODM_ORTHO_TIF" \
-        --slack_webhook_url "$SLACK_WEBHOOK_URL" \
-        --job_id "__JOB_ID__" \
-        || notify_slack "Stage 3b (ground views) failed (non-fatal)" "info"
-
-    # --- Stage 3c: Retrain with ground views (3000 iterations) ---
-    notify_slack "Stage 3c: retraining with ground views (3000 iterations)..."
-    cd /mnt/splatwalk/InstantSplat
-    N_VIEWS_GROUND=$(ls -1 "$SCENE_DIR/images"/*.jpg 2>/dev/null | wc -l)
-    [ "$N_VIEWS_GROUND" -gt 24 ] && N_VIEWS_GROUND=24
-    python train.py \
-        --source_path "$SCENE_DIR" \
-        --model_path "$BEST_MODEL" \
-        --iterations 3000 \
-        --n_views "$N_VIEWS_GROUND" \
-        --pp_optimizer \
-        --optim_pose \
-        --test_iterations 10001 \
-        --densify_from_iter 200 \
-        --densify_until_iter 2250 \
-        --densification_interval 100 \
-        --densify_grad_threshold 0.0005 \
-        || notify_slack "Stage 3c (retrain) failed (non-fatal)" "info"
-    notify_slack "Stage 3c complete"
-else
-    notify_slack "Stage 3 (zoom descent) failed — using Stage 2 model + building GLB" "info"
-fi
-
-# --- Stage 4: Game-Level Scene Construction (.glb from ODM outputs) ---
-notify_slack "Stage 4: Building game-level scene (.glb)..."
-python /mnt/splatwalk/scripts/build_game_scene.py \
-    --orthophoto "$ODM_ORTHO_TIF" \
-    --dsm "$ODM_OUTPUT/odm_dem/dsm.tif" \
-    --dtm "$ODM_OUTPUT/odm_dem/dtm.tif" \
-    --images "$INPUT_DIR" \
-    --scene_path "$SCENE_DIR" \
-    --model_path "$BEST_MODEL" \
-    --output "/workspace/__JOB_ID__/output/scene.glb" \
-    --texture_library "/mnt/splatwalk/textures/" \
-    --scene_scale 50.0 \
-    --gemini_api_key "${GEMINI_API_KEY:-}" \
-    || {
-        notify_slack "Stage 4 (scene construction) failed (non-fatal)" "info"
-        echo "WARNING: Game-level scene construction failed, continuing without .glb"
-    }
-
-notify_slack "Stages complete. Generating demo assets..."
-
-# --- Generate demo viewer assets (top-down fly-over) ---
-python /mnt/splatwalk/scripts/generate_viewer_assets.py \
-    --model_path "$BEST_MODEL" \
-    --scene_path "$SCENE_DIR" \
-    --output_dir "/workspace/__JOB_ID__/output/demo" \
-    --job_id "aukerman" \
-    --drone_agl "$DRONE_AGL" \
-    --prune_ratio 0.20 \
-    --scene_scale 50.0 \
-    --slack_webhook_url "$SLACK_WEBHOOK_URL" \
-    || { notify_slack "generate_viewer_assets.py failed" "error"; exit 1; }
+notify_slack "Launching full pipeline (splat aerial + quality-gated ground GLB)..."
+bash /mnt/splatwalk/scripts/run_pipeline.sh
 
 notify_slack "Demo assets complete! View at: https://splatwalk.austindevs.com/?manifest=__SPACES_ENDPOINT__/__SPACES_BUCKET__/demo/aukerman/manifest.json" "success"
 
@@ -667,10 +465,11 @@ echo "=========================================="
 echo ""
 echo "The droplet will:"
 echo "  1. Attach Volume + download aukerman dataset"
-echo "  2. Run MASt3R init + 10K InstantSplat training (~10 min)"
-echo "  3. Top-down zoom descent: 5 altitude levels render+retrain (~20 min)"
-echo "  4. Compress .splat + upload to CDN (~5 min)"
-echo "  5. Self-destruct"
+echo "  2. ODM orthomosaic + DSM/DTM generation (~8 min)"
+echo "  3. MASt3R + InstantSplat 10K + Zoom Descent (~25 min)"
+echo "  4. Build ground-level scene GLB (PBR + vegetation) (~3 min)"
+echo "  5. Gemini quality loop on ground GLB (up to 3 iterations, ~10 min)"
+echo "  6. Compress splat + upload splat+GLBs+manifest, then self-destruct"
 echo ""
 echo "Monitor progress via Slack or check logs:"
 echo "  ${DO_SPACES_ENDPOINT}/${DO_SPACES_BUCKET}/jobs/${JOB_ID}/logs/cloud-init.log"
@@ -699,4 +498,4 @@ done
 
 echo ""
 echo "Launcher done. Droplet is running autonomously."
-echo "It will self-destruct when finished (~40-50 min total)."
+echo "It will self-destruct when finished (~50 min total)."

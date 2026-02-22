@@ -67,6 +67,15 @@ def save_intermediate(data, name, intermediates_dir):
     print(f"  Saved intermediate: {path}")
 
 
+def load_centroid_from_transform(scene_transform_path):
+    """Load centroid from scene_transform.json (from generate_aerial_glb.py)."""
+    with open(scene_transform_path) as f:
+        data = json.load(f)
+    centroid = np.array(data["centroid_utm"], dtype=np.float32)
+    print(f"  Centroid from scene_transform: [{centroid[0]:.4f}, {centroid[1]:.4f}, {centroid[2]:.4f}]")
+    return centroid
+
+
 def load_ply_centroid(model_path):
     """Load centroid from the PLY file, matching compress_splat.py line 237."""
     from plyfile import PlyData
@@ -185,7 +194,7 @@ def get_colmap_poses(scene_path):
 # ---------------------------------------------------------------------------
 
 def _build_flat_terrain(orthophoto_path, model_path, scene_path,
-                        scene_scale, intermediates_dir):
+                        scene_scale, intermediates_dir, scene_transform_path=""):
     """Fallback: build a flat terrain mesh from orthophoto bounds when DSM is unavailable.
 
     Uses the orthophoto pixel dimensions + COLMAP/PLY centroid to create a flat
@@ -209,49 +218,63 @@ def _build_flat_terrain(orthophoto_path, model_path, scene_path,
         x_extent = 100.0
         y_extent = 100.0
 
-    # Load centroid from PLY (matches compress_splat.py)
-    centroid = load_ply_centroid(model_path)
+    # Load centroid
+    if scene_transform_path and os.path.exists(scene_transform_path):
+        centroid = load_centroid_from_transform(scene_transform_path)
+        with open(scene_transform_path) as f:
+            st_data = json.load(f)
+        ground_z_scaled = st_data.get("ground_z_scaled", 0.0)
+    elif model_path:
+        centroid = load_ply_centroid(model_path)
+        from plyfile import PlyData
+        ckpt_dirs = sorted(Path(model_path).glob("point_cloud/iteration_*"))
+        ply_path = str(ckpt_dirs[-1] / "point_cloud.ply")
+        ply_data = PlyData.read(ply_path)
+        vertex = ply_data["vertex"]
+        z_vals = np.array(vertex["z"], dtype=np.float32)
+        ground_z_raw = float(np.percentile(z_vals, 5))
+        ground_z_scaled = (ground_z_raw - centroid[2]) * scene_scale
+    else:
+        # Auto-center from orthophoto bounds
+        centroid = np.array([
+            (ortho_bounds.left + ortho_bounds.right) / 2,
+            (ortho_bounds.bottom + ortho_bounds.top) / 2,
+            0.0,
+        ], dtype=np.float32)
+        ground_z_scaled = 0.0
 
-    # Build a flat grid at ground Z (5th percentile from PLY)
-    from plyfile import PlyData
-    ckpt_dirs = sorted(Path(model_path).glob("point_cloud/iteration_*"))
-    ply_path = str(ckpt_dirs[-1] / "point_cloud.ply")
-    ply_data = PlyData.read(ply_path)
-    vertex = ply_data["vertex"]
-    z_vals = np.array(vertex["z"], dtype=np.float32)
-    ground_z_raw = float(np.percentile(z_vals, 5))
-    ground_z_scaled = (ground_z_raw - centroid[2]) * scene_scale
-
-    # Try geo transform to get proper COLMAP alignment
+    # Try geo transform to get proper COLMAP alignment (requires model_path + scene_path)
     has_geo_transform = False
-    try:
-        from align_geo_colmap import extract_exif_gps, compute_geo_to_colmap_transform, project_gps_to_utm
-        input_dir = os.path.join(scene_path, "images")
-        if not os.path.isdir(input_dir):
-            for candidate in [
-                os.path.join(os.path.dirname(model_path), "..", "scene", "images"),
-            ]:
-                if os.path.isdir(candidate):
-                    input_dir = candidate
-                    break
+    if model_path and scene_path:
+        try:
+            from align_geo_colmap import extract_exif_gps, compute_geo_to_colmap_transform, project_gps_to_utm
+            input_dir = os.path.join(scene_path, "images")
+            if not os.path.isdir(input_dir):
+                for candidate in [
+                    os.path.join(os.path.dirname(model_path), "..", "scene", "images"),
+                ]:
+                    if os.path.isdir(candidate):
+                        input_dir = candidate
+                        break
 
-        exif_gps = extract_exif_gps(input_dir)
-        colmap_poses = get_colmap_poses(scene_path)
-        if len(exif_gps) >= 4 and len(colmap_poses) >= 4:
-            utm_coords = project_gps_to_utm(exif_gps)
-            s, R, t = compute_geo_to_colmap_transform(utm_coords, colmap_poses)
-            has_geo_transform = True
-            # Transform orthophoto corners through UTM → COLMAP → web
-            corners_utm = np.array([
-                [ortho_bounds.left, ortho_bounds.bottom, ground_z_raw],
-                [ortho_bounds.right, ortho_bounds.bottom, ground_z_raw],
-                [ortho_bounds.right, ortho_bounds.top, ground_z_raw],
-                [ortho_bounds.left, ortho_bounds.top, ground_z_raw],
-            ])
-            corners_colmap = (s * (R @ corners_utm.T).T + t)
-            print(f"  Geo transform: scale={s:.6f}")
-    except Exception as e:
-        print(f"  Geo transform failed: {e}, using PLY-centered flat grid")
+            exif_gps = extract_exif_gps(input_dir)
+            colmap_poses = get_colmap_poses(scene_path)
+            if len(exif_gps) >= 4 and len(colmap_poses) >= 4:
+                utm_coords = project_gps_to_utm(exif_gps)
+                s, R, t = compute_geo_to_colmap_transform(utm_coords, colmap_poses)
+                has_geo_transform = True
+                # Need ground Z in UTM for corner placement
+                gz_utm = centroid[2]  # use centroid Z as ground proxy
+                corners_utm = np.array([
+                    [ortho_bounds.left, ortho_bounds.bottom, gz_utm],
+                    [ortho_bounds.right, ortho_bounds.bottom, gz_utm],
+                    [ortho_bounds.right, ortho_bounds.top, gz_utm],
+                    [ortho_bounds.left, ortho_bounds.top, gz_utm],
+                ])
+                corners_colmap = (s * (R @ corners_utm.T).T + t)
+                print(f"  Geo transform: scale={s:.6f}")
+        except Exception as e:
+            print(f"  Geo transform failed: {e}, using centered flat grid")
 
     # Grid size: ~200x200 for flat terrain
     rows, cols = 100, 100
@@ -268,9 +291,13 @@ def _build_flat_terrain(orthophoto_path, model_path, scene_path,
         zz = np.full_like(xx, corners_colmap[:, 2].mean())
         colmap_points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=-1)
         web_points = (colmap_points - centroid) * scene_scale
-    else:
-        # Center a flat grid at origin in web coords
-        from plyfile import PlyData as _PD  # noqa: already imported
+    elif model_path:
+        # Use PLY positions to define grid extent
+        from plyfile import PlyData as _PD  # noqa
+        ckpt_dirs = sorted(Path(model_path).glob("point_cloud/iteration_*"))
+        ply_path = str(ckpt_dirs[-1] / "point_cloud.ply")
+        ply_data = _PD.read(ply_path)
+        vertex = ply_data["vertex"]
         positions = np.stack([
             np.array(vertex["x"], dtype=np.float32),
             np.array(vertex["y"], dtype=np.float32),
@@ -279,6 +306,15 @@ def _build_flat_terrain(orthophoto_path, model_path, scene_path,
         pos_scaled = (positions - centroid) * scene_scale
         xs = np.linspace(pos_scaled[:, 0].min(), pos_scaled[:, 0].max(), cols)
         ys = np.linspace(pos_scaled[:, 1].min(), pos_scaled[:, 1].max(), rows)
+        xx, yy = np.meshgrid(xs, ys)
+        zz = np.full_like(xx, ground_z_scaled)
+        web_points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=-1)
+    else:
+        # Use orthophoto UTM bounds centered + scaled
+        half_x = (ortho_bounds.right - ortho_bounds.left) / 2 * scene_scale
+        half_y = (ortho_bounds.top - ortho_bounds.bottom) / 2 * scene_scale
+        xs = np.linspace(-half_x, half_x, cols)
+        ys = np.linspace(-half_y, half_y, rows)
         xx, yy = np.meshgrid(xs, ys)
         zz = np.full_like(xx, ground_z_scaled)
         web_points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=-1)
@@ -323,7 +359,8 @@ def _build_flat_terrain(orthophoto_path, model_path, scene_path,
 
 
 def step_terrain(dsm_path, dtm_path, orthophoto_path, model_path, scene_path,
-                 scene_scale, intermediates_dir):
+                 scene_scale, intermediates_dir, scene_transform_path="",
+                 dsm_smooth_sigma=1.5):
     """Load DSM, generate terrain mesh with orthophoto UVs.
 
     Returns dict with: vertices, faces, uvs, transform metadata.
@@ -338,7 +375,7 @@ def step_terrain(dsm_path, dtm_path, orthophoto_path, model_path, scene_path,
         print(f"  WARNING: DSM not found at {dsm_path}")
         print("  Falling back to flat terrain from orthophoto bounds...")
         return _build_flat_terrain(orthophoto_path, model_path, scene_path,
-                                   scene_scale, intermediates_dir)
+                                   scene_scale, intermediates_dir, scene_transform_path)
 
     # Load DSM
     with rasterio.open(dsm_path) as src:
@@ -361,7 +398,7 @@ def step_terrain(dsm_path, dtm_path, orthophoto_path, model_path, scene_path,
         dsm[nan_mask] = dsm[nearest_idx[0][nan_mask], nearest_idx[1][nan_mask]]
 
     # Gaussian blur for smoother terrain
-    dsm = gaussian_filter(dsm, sigma=1.5)
+    dsm = gaussian_filter(dsm, sigma=dsm_smooth_sigma)
 
     # Load DTM if available (for ground height estimation)
     dtm = None
@@ -440,8 +477,18 @@ def step_terrain(dsm_path, dtm_path, orthophoto_path, model_path, scene_path,
         has_geo_transform = False
 
     # COLMAP → web coords: (point - centroid) * scene_scale
-    centroid = load_ply_centroid(model_path)
-    web_points = (colmap_points - centroid) * scene_scale
+    if scene_transform_path and os.path.exists(scene_transform_path):
+        centroid = load_centroid_from_transform(scene_transform_path)
+        # With scene_transform, skip COLMAP transform — use UTM coords directly
+        web_points = (utm_points - centroid) * scene_scale
+    elif model_path:
+        centroid = load_ply_centroid(model_path)
+        web_points = (colmap_points - centroid) * scene_scale
+    else:
+        # Fallback: center UTM points at their own centroid
+        centroid = utm_points.mean(axis=0)
+        web_points = (utm_points - centroid) * scene_scale
+        print(f"  Using auto-centroid: [{centroid[0]:.4f}, {centroid[1]:.4f}, {centroid[2]:.4f}]")
 
     # Reshape to grid
     verts_grid = web_points.reshape(rows, cols, 3)
@@ -578,7 +625,7 @@ MATERIAL_CLASSES = [
 ]
 
 
-def _segment_with_sam2(orthophoto_path, intermediates_dir):
+def _segment_with_sam2(orthophoto_path, intermediates_dir, points_per_side=32):
     """Run SAM2 automatic mask generation."""
     from sam2.build_sam import build_sam2
     from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
@@ -592,7 +639,7 @@ def _segment_with_sam2(orthophoto_path, intermediates_dir):
     sam2 = build_sam2(model_cfg, checkpoint, device="cuda")
     mask_generator = SAM2AutomaticMaskGenerator(
         model=sam2,
-        points_per_side=32,
+        points_per_side=points_per_side,
         pred_iou_thresh=0.7,
         stability_score_thresh=0.92,
         min_mask_region_area=100,
@@ -787,7 +834,8 @@ def _classify_hsv_fallback(orthophoto_path, seg_mask, segments):
     return classifications
 
 
-def step_segment(orthophoto_path, gemini_api_key, intermediates_dir):
+def step_segment(orthophoto_path, gemini_api_key, intermediates_dir,
+                 sam2_points_per_side=32):
     """Segment orthophoto and classify materials.
 
     Returns (seg_mask, manifest) where manifest maps segment_id → material class.
@@ -796,7 +844,8 @@ def step_segment(orthophoto_path, gemini_api_key, intermediates_dir):
 
     # Step 3a: SAM2 segmentation
     try:
-        seg_mask, segments = _segment_with_sam2(orthophoto_path, intermediates_dir)
+        seg_mask, segments = _segment_with_sam2(orthophoto_path, intermediates_dir,
+                                                points_per_side=sam2_points_per_side)
     except Exception as e:
         print(f"  SAM2 failed: {e}")
         seg_mask, segments = _segment_grid_fallback(orthophoto_path, intermediates_dir)
@@ -917,29 +966,64 @@ def step_materials(seg_mask, manifest, superres_path, texture_library_path, inte
 # ---------------------------------------------------------------------------
 
 def _make_tree_broadleaf(height, canopy_diameter):
-    """Procedural broadleaf tree: cylinder trunk + UV sphere canopy."""
+    """Procedural broadleaf tree: cylinder trunk + multi-tier canopy with color variation."""
     import trimesh
+
+    rng = np.random.default_rng()
 
     trunk_radius = max(0.05, height * 0.04)
     trunk_height = height * 0.4
 
+    # Slight random lean on the trunk
+    lean_angle = rng.uniform(-0.08, 0.08)
+    lean_axis = [rng.normal(), rng.normal(), 0]
+    lean_axis = lean_axis / (np.linalg.norm(lean_axis) + 1e-8)
+
     trunk = trimesh.creation.cylinder(
         radius=trunk_radius, height=trunk_height, sections=8
     )
-    # Move trunk base to origin
     trunk.apply_translation([0, 0, trunk_height / 2])
-    trunk.visual.vertex_colors = np.full((len(trunk.vertices), 4), [90, 60, 30, 255], dtype=np.uint8)
+    if abs(lean_angle) > 0.01:
+        rot = trimesh.transformations.rotation_matrix(lean_angle, lean_axis, point=[0, 0, 0])
+        trunk.apply_transform(rot)
+    trunk_color = [
+        int(rng.integers(75, 100)),
+        int(rng.integers(45, 65)),
+        int(rng.integers(20, 40)),
+        255,
+    ]
+    trunk.visual.vertex_colors = np.full((len(trunk.vertices), 4), trunk_color, dtype=np.uint8)
 
-    canopy = trimesh.creation.icosphere(subdivisions=2, radius=canopy_diameter / 2)
-    canopy.apply_translation([0, 0, trunk_height + canopy_diameter * 0.3])
-    canopy.visual.vertex_colors = np.full((len(canopy.vertices), 4), [40, 120, 30, 255], dtype=np.uint8)
+    # Multi-tier canopy: 2-3 overlapping spheres at varying sizes and offsets
+    meshes = [trunk]
+    n_tiers = rng.integers(2, 4)
+    for i in range(n_tiers):
+        tier_scale = 1.0 - i * 0.2 + rng.uniform(-0.05, 0.05)
+        tier_radius = canopy_diameter / 2 * max(0.4, tier_scale)
+        tier_offset_x = rng.uniform(-canopy_diameter * 0.15, canopy_diameter * 0.15)
+        tier_offset_y = rng.uniform(-canopy_diameter * 0.15, canopy_diameter * 0.15)
+        tier_z = trunk_height + canopy_diameter * (0.2 + i * 0.25)
 
-    return trimesh.util.concatenate([trunk, canopy])
+        sphere = trimesh.creation.icosphere(subdivisions=1, radius=tier_radius)
+        sphere.apply_translation([tier_offset_x, tier_offset_y, tier_z])
+
+        # Vary green within a natural range
+        green_val = int(rng.integers(90, 145))
+        red_val = int(rng.integers(25, 55))
+        blue_val = int(rng.integers(15, 40))
+        sphere.visual.vertex_colors = np.full(
+            (len(sphere.vertices), 4), [red_val, green_val, blue_val, 255], dtype=np.uint8
+        )
+        meshes.append(sphere)
+
+    return trimesh.util.concatenate(meshes)
 
 
 def _make_tree_conifer(height, canopy_diameter):
-    """Procedural conifer: cylinder trunk + stacked cones."""
+    """Procedural conifer: cylinder trunk + stacked cones with color variation."""
     import trimesh
+
+    rng = np.random.default_rng()
 
     trunk_radius = max(0.05, height * 0.03)
     trunk_height = height * 0.3
@@ -948,19 +1032,32 @@ def _make_tree_conifer(height, canopy_diameter):
         radius=trunk_radius, height=trunk_height, sections=8
     )
     trunk.apply_translation([0, 0, trunk_height / 2])
-    trunk.visual.vertex_colors = np.full((len(trunk.vertices), 4), [80, 50, 25, 255], dtype=np.uint8)
+    trunk.visual.vertex_colors = np.full(
+        (len(trunk.vertices), 4),
+        [int(rng.integers(70, 90)), int(rng.integers(40, 55)), int(rng.integers(18, 30)), 255],
+        dtype=np.uint8,
+    )
 
-    # 3 stacked cones
+    # 3-4 stacked cones with slight random offsets
     meshes = [trunk]
+    n_cones = rng.integers(3, 5)
     cone_base = canopy_diameter / 2
-    for i in range(3):
-        frac = i / 3.0
-        cone_r = cone_base * (1 - frac * 0.4)
+    for i in range(n_cones):
+        frac = i / n_cones
+        cone_r = cone_base * (1 - frac * 0.45) + rng.uniform(-0.05, 0.05) * cone_base
+        cone_r = max(0.1, cone_r)
         cone_h = (height - trunk_height) / 2.5
         cone = trimesh.creation.cone(radius=cone_r, height=cone_h, sections=8)
-        z_offset = trunk_height + i * cone_h * 0.7 + cone_h / 2
-        cone.apply_translation([0, 0, z_offset])
-        cone.visual.vertex_colors = np.full((len(cone.vertices), 4), [20, 80 + i * 15, 20, 255], dtype=np.uint8)
+        z_offset = trunk_height + i * cone_h * 0.65 + cone_h / 2
+        x_off = rng.uniform(-0.05, 0.05) * canopy_diameter
+        y_off = rng.uniform(-0.05, 0.05) * canopy_diameter
+        cone.apply_translation([x_off, y_off, z_offset])
+        green_val = int(rng.integers(65, 100)) + i * 10
+        cone.visual.vertex_colors = np.full(
+            (len(cone.vertices), 4),
+            [int(rng.integers(10, 30)), min(green_val, 140), int(rng.integers(10, 30)), 255],
+            dtype=np.uint8,
+        )
         meshes.append(cone)
 
     return trimesh.util.concatenate(meshes)
@@ -1011,7 +1108,34 @@ def _make_fence_section(length, height=1.8):
     return trimesh.util.concatenate(meshes)
 
 
-def step_assets(seg_mask, manifest, terrain, intermediates_dir):
+def _make_grass_tuft(width=0.3, height=0.15):
+    """Procedural grass tuft: small scaled box cluster."""
+    import trimesh
+
+    rng = np.random.default_rng()
+    meshes = []
+    n_blades = rng.integers(3, 7)
+    for _ in range(n_blades):
+        blade_w = width * rng.uniform(0.15, 0.3)
+        blade_h = height * rng.uniform(0.6, 1.4)
+        blade = trimesh.creation.box(extents=[blade_w, blade_w * 0.3, blade_h])
+        blade.apply_translation([
+            rng.uniform(-width * 0.4, width * 0.4),
+            rng.uniform(-width * 0.4, width * 0.4),
+            blade_h / 2,
+        ])
+        green = int(rng.integers(80, 140))
+        blade.visual.vertex_colors = np.full(
+            (len(blade.vertices), 4),
+            [int(rng.integers(30, 60)), green, int(rng.integers(15, 35)), 255],
+            dtype=np.uint8,
+        )
+        meshes.append(blade)
+    return trimesh.util.concatenate(meshes)
+
+
+def step_assets(seg_mask, manifest, terrain, intermediates_dir,
+                tree_height_scale=1.0, canopy_diameter_scale=1.0, grass_density=200):
     """Generate procedural 3D assets from segmentation masks."""
     import trimesh
 
@@ -1024,7 +1148,7 @@ def step_assets(seg_mask, manifest, terrain, intermediates_dir):
     dsm_grid = terrain.get("dsm_grid")
     dtm_grid = terrain.get("dtm_grid")
 
-    assets = {"trees": [], "shrubs": [], "fences": []}
+    assets = {"trees": [], "shrubs": [], "fences": [], "grass": []}
 
     # Scale seg_mask to terrain grid size for placement lookups
     seg_grid = cv2.resize(seg_mask, (cols, rows), interpolation=cv2.INTER_NEAREST)
@@ -1068,6 +1192,7 @@ def step_assets(seg_mask, manifest, terrain, intermediates_dir):
                         vertices[:, 1].max() - vertices[:, 1].min())
                 )
                 canopy_diameter = max(1.0, min(canopy_diameter, 30.0))
+                canopy_diameter *= canopy_diameter_scale
 
                 # Height from DSM - DTM
                 if dsm_grid is not None and dtm_grid is not None:
@@ -1076,6 +1201,7 @@ def step_assets(seg_mask, manifest, terrain, intermediates_dir):
                     tree_height = max(2.0, (dsm_val - dtm_val) * terrain["scene_scale"])
                 else:
                     tree_height = canopy_diameter * 1.2
+                tree_height *= tree_height_scale
 
                 # Shape classification by aspect ratio
                 aspect = bbox_h / max(bbox_w, 1)
@@ -1201,11 +1327,48 @@ def step_assets(seg_mask, manifest, terrain, intermediates_dir):
 
         print(f"  Generated {len(assets['fences'])} fence sections")
 
-    total = len(assets["trees"]) + len(assets["shrubs"]) + len(assets["fences"])
+    # --- Ground cover (grass tufts in grass-classified regions) ---
+    grass_segments = [int(k) for k, v in classifications.items() if v == "grass"]
+    if grass_segments:
+        print(f"  Scattering grass tufts in {len(grass_segments)} grass segments...")
+        rng = np.random.default_rng(42)
+        max_grass = grass_density  # cap for performance
+        grass_count = 0
+
+        for seg_id in grass_segments:
+            if grass_count >= max_grass:
+                break
+            # Find grid cells belonging to this segment
+            seg_cells = np.argwhere(seg_grid == seg_id)
+            if len(seg_cells) == 0:
+                continue
+            # Random sample positions
+            n_tufts = min(len(seg_cells) // 4, 30, max_grass - grass_count)
+            if n_tufts < 1:
+                continue
+            indices = rng.choice(len(seg_cells), size=n_tufts, replace=False)
+            for idx in indices:
+                gy, gx = seg_cells[idx]
+                vert_idx = gy * cols + gx
+                if vert_idx >= len(vertices):
+                    continue
+                pos = vertices[vert_idx].copy()
+                # Add small random offset to avoid grid pattern
+                pos[0] += rng.uniform(-0.5, 0.5)
+                pos[1] += rng.uniform(-0.5, 0.5)
+                tuft = _make_grass_tuft()
+                tuft.apply_translation(pos)
+                assets["grass"].append(tuft)
+                grass_count += 1
+
+        print(f"  Generated {len(assets['grass'])} grass tufts")
+
+    total = len(assets["trees"]) + len(assets["shrubs"]) + len(assets["fences"]) + len(assets["grass"])
     print(f"  Total assets: {total}")
 
     save_intermediate(
-        {"trees": len(assets["trees"]), "shrubs": len(assets["shrubs"]), "fences": len(assets["fences"])},
+        {"trees": len(assets["trees"]), "shrubs": len(assets["shrubs"]),
+         "fences": len(assets["fences"]), "grass": len(assets["grass"])},
         "assets_stats.json", intermediates_dir,
     )
 
@@ -1320,6 +1483,9 @@ def step_export(terrain, materials, assets, metadata, output_path, intermediates
 
     for i, fence in enumerate(assets.get("fences", [])):
         scene.add_geometry(fence, node_name=f"fence_{i}")
+
+    for i, tuft in enumerate(assets.get("grass", [])):
+        scene.add_geometry(tuft, node_name=f"grass_{i}")
 
     # --- Metadata as glTF extras ---
     scene.metadata.update({
@@ -1473,8 +1639,9 @@ def main():
     parser.add_argument("--dsm", required=True, help="ODM DSM GeoTIFF")
     parser.add_argument("--dtm", default=None, help="ODM DTM GeoTIFF (optional)")
     parser.add_argument("--images", required=True, help="Input drone images directory")
-    parser.add_argument("--scene_path", required=True, help="Scene directory with COLMAP sparse data")
-    parser.add_argument("--model_path", required=True, help="Trained model path (for PLY centroid)")
+    parser.add_argument("--scene_path", default="", help="Scene directory with COLMAP sparse data (optional)")
+    parser.add_argument("--model_path", default="", help="Trained model path for PLY centroid (optional)")
+    parser.add_argument("--scene_transform", default="", help="scene_transform.json from generate_aerial_glb.py (replaces model_path)")
     parser.add_argument("--output", required=True, help="Output GLB path")
     parser.add_argument("--texture_library", default="/mnt/splatwalk/textures/",
                         help="PBR texture library directory")
@@ -1484,6 +1651,17 @@ def main():
                         help="Gemini API key for material classification")
     parser.add_argument("--step", default="all",
                         help="Run specific step: terrain, superres, segment, materials, assets, export, lighting, all")
+    # Tunable quality parameters (overridable by gemini_score_scene.py per iteration)
+    parser.add_argument("--tree_height_scale", type=float, default=1.0,
+                        help="Multiplier on computed tree height (default 1.0)")
+    parser.add_argument("--canopy_diameter_scale", type=float, default=1.0,
+                        help="Multiplier on canopy diameter (default 1.0)")
+    parser.add_argument("--grass_density", type=int, default=200,
+                        help="Max grass tufts (default 200)")
+    parser.add_argument("--dsm_smooth_sigma", type=float, default=1.5,
+                        help="Gaussian blur sigma for DSM smoothing (default 1.5)")
+    parser.add_argument("--sam2_points_per_side", type=int, default=32,
+                        help="SAM2 grid density (default 32)")
     args = parser.parse_args()
 
     if not args.gemini_api_key:
@@ -1526,6 +1704,8 @@ def main():
                     args.dsm, args.dtm, args.orthophoto,
                     args.model_path, args.scene_path,
                     args.scene_scale, intermediates_dir,
+                    scene_transform_path=args.scene_transform,
+                    dsm_smooth_sigma=args.dsm_smooth_sigma,
                 )
 
             elif step_name == "superres":
@@ -1535,6 +1715,7 @@ def main():
             elif step_name == "segment":
                 seg_mask, seg_manifest = step_segment(
                     args.orthophoto, args.gemini_api_key, intermediates_dir,
+                    sam2_points_per_side=args.sam2_points_per_side,
                 )
 
             elif step_name == "materials":
@@ -1575,7 +1756,10 @@ def main():
                         seg_manifest = {"classifications": {}}
                         seg_mask = np.zeros((100, 100), dtype=np.uint8)
 
-                assets_dict = step_assets(seg_mask, seg_manifest, terrain, intermediates_dir)
+                assets_dict = step_assets(seg_mask, seg_manifest, terrain, intermediates_dir,
+                                          tree_height_scale=args.tree_height_scale,
+                                          canopy_diameter_scale=args.canopy_diameter_scale,
+                                          grass_density=args.grass_density)
 
             elif step_name == "export":
                 if terrain is None:
@@ -1585,7 +1769,7 @@ def main():
                 if materials is None:
                     materials = {}
                 if assets_dict is None:
-                    assets_dict = {"trees": [], "shrubs": [], "fences": []}
+                    assets_dict = {"trees": [], "shrubs": [], "fences": [], "grass": []}
 
                 step_export(
                     terrain, materials, assets_dict, lighting_metadata,
