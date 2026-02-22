@@ -67,9 +67,23 @@ def render_glb_views(glb_path, scene_bounds, output_dir, resolution=1024):
     ground_z = scene_bounds.get("ground_z", center[2] - size[2] / 2)
     max_extent = max(size[0], size[1])
 
-    # Camera setup
-    camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0, aspectRatio=1.0)
+    # Camera setup — znear/zfar must cover the scene (default zfar=100 is way too small)
+    camera = pyrender.PerspectiveCamera(
+        yfov=np.pi / 3.0, aspectRatio=1.0,
+        znear=max_extent * 0.001,
+        zfar=max_extent * 5.0,
+    )
     renderer = pyrender.OffscreenRenderer(resolution, resolution)
+
+    # Add ambient + directional light so the scene is visible
+    scene.ambient_light = np.array([0.3, 0.3, 0.3, 1.0])
+    light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=3.0)
+    light_pose = np.eye(4)
+    light_pose[:3, 2] = [0, -0.5, -1]  # sun from above-front
+    scene.add(light, pose=light_pose)
+
+    print(f"  Scene: center={center.tolist()}, size={size.tolist()}, "
+          f"ground_z={ground_z:.1f}, max_extent={max_extent:.0f}")
 
     views = []
 
