@@ -224,7 +224,6 @@ def main():
 
     # Splat mode
     parser.add_argument("--model_path", default="", help="Path to trained model (PLY, triggers splat compression)")
-    parser.add_argument("--splat_path", default="", help="Pre-compressed .splat (skip compression if provided)")
     parser.add_argument("--scene_path", default="", help="Path to scene directory (legacy)")
     parser.add_argument("--prune_ratio", type=float, default=0.20, help="Splat prune ratio")
     args = parser.parse_args()
@@ -293,13 +292,8 @@ def main():
             scene_size_mb = Path(glb_path).stat().st_size / 1024 / 1024
             print(f"  Scene GLB (auto-found): {scene_size_mb:.1f}MB")
 
-    # Upload splat (pre-compressed or compress from PLY)
-    if args.splat_path and os.path.exists(args.splat_path):
-        print(f"Using pre-compressed splat: {args.splat_path}")
-        splat_url = upload_to_cdn(args.splat_path, f"{remote_prefix}/scene.splat")
-        splat_size_mb = Path(args.splat_path).stat().st_size / 1024 / 1024
-        print(f"  Splat: {splat_size_mb:.1f}MB")
-    elif args.model_path:
+    # Upload splat (compress from PLY — legacy path)
+    if args.model_path and not is_mesh_mode:
         splat_path = os.path.join(args.output_dir, "scene.splat")
         print("Compressing .splat from PLY...")
         compress_splat(args.model_path, splat_path,
@@ -313,11 +307,11 @@ def main():
     viewing_altitude = float(bounds["max"][2] + scene_height * 0.5)
     ground_z = bounds["ground_z"]
 
-    # viewer_mode: splat if we have a splat (hybrid splat+GLB), mesh if GLBs only, topdown legacy
-    if splat_url:
-        viewer_mode = "splat"
-    elif is_mesh_mode:
+    # viewer_mode: mesh if GLBs present, splat if legacy, topdown fallback
+    if is_mesh_mode:
         viewer_mode = "mesh"
+    elif splat_url:
+        viewer_mode = "splat"
     else:
         viewer_mode = "topdown"
 

@@ -2,16 +2,16 @@
 set -euo pipefail
 
 # ============================================================================
-# Launch GPU droplet for Full Pipeline: Splat Aerial + Quality-Gated Ground GLB
+# Launch GPU droplet for Mesh Pipeline + Gemini Quality Loop
 #
 # Uses the aukerman dataset to:
 # 1. ODM orthomosaic + DSM/DTM generation (~8 min)
-# 2. MASt3R → InstantSplat 10K → Zoom Descent → .splat (~25 min)
-# 3. Build ground-level scene GLB (PBR + vegetation) (~3 min)
-# 4. Gemini quality loop on ground GLB (up to 3 iterations) (~10 min)
-# 5. Upload splat + GLBs + manifest to Spaces CDN, self-destruct
+# 2. Generate aerial GLB (orthophoto draped on DSM terrain mesh) (~1 min)
+# 3. Build ground-level scene GLB (PBR terrain + vegetation) (~3 min)
+# 4. Gemini quality loop on ground GLB (up to 3 iterations) (~5 min)
+# 5. Upload GLBs + manifest to Spaces CDN, self-destruct
 #
-# Total estimated time: ~50 min on RTX 6000 Ada (~$1.30)
+# Total estimated time: ~18 min on RTX 6000 Ada (~$0.47)
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -270,45 +270,6 @@ fi
 /mnt/splatwalk/conda/bin/pip install --no-cache-dir pyrender PyOpenGL 2>&1 | tail -3
 export PYOPENGL_PLATFORM=egl
 
-# --- CUDA extension repair (diff-gaussian-rasterization, simple-knn, fused-ssim) ---
-# Pre-built pip wheels have CPU-only _C.so; we need GPU rasterization for splat training
-if /mnt/splatwalk/conda/bin/python -c "
-import torch
-try:
-    from diff_gaussian_rasterization import _C
-    t = torch.zeros(1, device='cuda')
-    print('CUDA extensions OK')
-except Exception as e:
-    print(f'CUDA extensions broken: {e}')
-    exit(1)
-" 2>/dev/null; then
-    echo "CUDA extensions verified"
-else
-    notify_slack "Repairing CUDA extensions (force rebuild from source)..."
-    export FORCE_CUDA=1
-    export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
-    cd /mnt/splatwalk/InstantSplat
-
-    # diff-gaussian-rasterization
-    /mnt/splatwalk/conda/bin/pip uninstall -y diff-gaussian-rasterization 2>/dev/null || true
-    cd submodules/diff-gaussian-rasterization
-    rm -rf build dist *.egg-info
-    /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation . 2>&1 | tail -10
-    cd ../..
-
-    # simple-knn
-    /mnt/splatwalk/conda/bin/pip uninstall -y simple-knn 2>/dev/null || true
-    cd submodules/simple-knn
-    rm -rf build dist *.egg-info
-    /mnt/splatwalk/conda/bin/pip install --no-cache-dir --no-build-isolation . 2>&1 | tail -10
-    cd ../..
-
-    # fused-ssim
-    /mnt/splatwalk/conda/bin/pip install --no-cache-dir fused-ssim 2>&1 | tail -3
-
-    notify_slack "CUDA extensions rebuilt"
-fi
-
 notify_slack "Volume ready. Downloading dataset..."
 
 # --- Download aukerman dataset ---
@@ -356,7 +317,7 @@ echo "Fetching latest pipeline scripts from GitHub..."
 _CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
 [ -n "__GITHUB_TOKEN__" ] && _CURL_ARGS+=(-H "Authorization: token __GITHUB_TOKEN__")
 _BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/scripts/gpu"
-for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py generate_ortho_tiles.py generate_ground_views.py align_geo_colmap.py build_game_scene.py generate_aerial_glb.py gemini_score_scene.py; do
+for _script in generate_viewer_assets.py build_game_scene.py generate_aerial_glb.py gemini_score_scene.py; do
     if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
         echo "  Updated $_script (from GitHub)"
     elif curl -fsSL "__SPACES_ENDPOINT__/__SPACES_BUCKET__/scripts/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
@@ -382,13 +343,13 @@ if [ -d "$INPUT_DIR/images" ]; then
     find "$INPUT_DIR/images" -type f \( -name "*.jpg" -o -name "*.JPG" -o -name "*.jpeg" -o -name "*.png" \) -exec mv {} "$INPUT_DIR/" \;
 fi
 
-# --- Run full pipeline via run_pipeline.sh (handles ODM, splat, GLB, quality loop) ---
+# --- Run mesh pipeline via run_pipeline.sh (handles ODM, GLB, quality loop) ---
 export INPUT_DIR=/workspace/__JOB_ID__/input
 export OUTPUT_DIR=/workspace/__JOB_ID__/output
-export PIPELINE_MODE="full"
+export PIPELINE_MODE="mesh"
 export JOB_ID="aukerman"
 
-notify_slack "Launching full pipeline (splat aerial + quality-gated ground GLB)..."
+notify_slack "Launching mesh pipeline (GLB aerial + quality-gated ground GLB)..."
 bash /mnt/splatwalk/scripts/run_pipeline.sh
 
 notify_slack "Demo assets complete! View at: https://splatwalk.austindevs.com/?manifest=__SPACES_ENDPOINT__/__SPACES_BUCKET__/demo/aukerman/manifest.json" "success"
@@ -466,10 +427,10 @@ echo ""
 echo "The droplet will:"
 echo "  1. Attach Volume + download aukerman dataset"
 echo "  2. ODM orthomosaic + DSM/DTM generation (~8 min)"
-echo "  3. MASt3R + InstantSplat 10K + Zoom Descent (~25 min)"
-echo "  4. Build ground-level scene GLB (PBR + vegetation) (~3 min)"
-echo "  5. Gemini quality loop on ground GLB (up to 3 iterations, ~10 min)"
-echo "  6. Compress splat + upload splat+GLBs+manifest, then self-destruct"
+echo "  3. Generate aerial GLB (orthophoto on DSM terrain mesh) (~1 min)"
+echo "  4. Build ground-level scene GLB (PBR terrain + vegetation) (~3 min)"
+echo "  5. Gemini quality loop on ground GLB (up to 3 iterations, ~5 min)"
+echo "  6. Upload GLBs + manifest to CDN, then self-destruct"
 echo ""
 echo "Monitor progress via Slack or check logs:"
 echo "  ${DO_SPACES_ENDPOINT}/${DO_SPACES_BUCKET}/jobs/${JOB_ID}/logs/cloud-init.log"
@@ -498,4 +459,4 @@ done
 
 echo ""
 echo "Launcher done. Droplet is running autonomously."
-echo "It will self-destruct when finished (~50 min total)."
+echo "It will self-destruct when finished (~18 min total)."
