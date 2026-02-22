@@ -1386,100 +1386,67 @@ def step_assets(seg_mask, manifest, terrain, intermediates_dir,
 # Step 6: Export GLB
 # ---------------------------------------------------------------------------
 
-def step_export(terrain, materials, assets, metadata, output_path, intermediates_dir):
+def step_export(terrain, materials, assets, metadata, output_path, intermediates_dir,
+                orthophoto_path=None):
     """Assemble scene and export as GLB with PBR materials."""
     import trimesh
+    from PIL import Image as PILImage
+    from trimesh.visual import TextureVisuals
+    from trimesh.visual.material import PBRMaterial
 
     print("Step 6: Exporting GLB...")
 
     scene = trimesh.Scene()
 
-    # --- Terrain mesh with materials ---
+    # --- Terrain mesh with orthophoto texture ---
     vertices = terrain["vertices"]
     faces = terrain["faces"]
     uvs = terrain["uvs"]
 
-    if materials:
-        # Split terrain faces by material class based on segment mask
-        # For now, create a single textured terrain mesh using the super-res orthophoto
-        # (per-segment PBR is applied as sub-meshes)
+    terrain_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
 
-        # Create base terrain mesh with orthophoto texture
-        terrain_mesh = trimesh.Trimesh(
-            vertices=vertices,
-            faces=faces,
+    # Use the orthophoto as the base terrain texture (same UV mapping as aerial GLB).
+    # This gives the ground scene a photorealistic base that matches the aerial view.
+    # The super-res version is preferred if available.
+    texture_img = None
+    superres_path = os.path.join(intermediates_dir, "orthophoto_4x.jpg")
+    tex_source = None
+
+    if os.path.exists(superres_path):
+        tex_source = superres_path
+    elif orthophoto_path and os.path.exists(orthophoto_path):
+        tex_source = orthophoto_path
+
+    if tex_source:
+        try:
+            img = cv2.imread(tex_source)
+            if img is not None:
+                # Resize to max 4096 for GLB texture size
+                h, w = img.shape[:2]
+                max_tex = 4096
+                if max(w, h) > max_tex:
+                    scale = max_tex / max(w, h)
+                    img = cv2.resize(img, (int(w * scale), int(h * scale)),
+                                     interpolation=cv2.INTER_LANCZOS4)
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                texture_img = PILImage.fromarray(img_rgb)
+                print(f"  Terrain texture: {tex_source} ({texture_img.size[0]}x{texture_img.size[1]})")
+        except Exception as e:
+            print(f"  WARNING: Failed to load orthophoto texture: {e}")
+
+    if texture_img is not None:
+        material = PBRMaterial(
+            name="terrain_orthophoto",
+            baseColorTexture=texture_img,
+            metallicFactor=0.0,
+            roughnessFactor=0.9,
         )
-
-        # Find the albedo from the first material or use a default
-        # Use the full orthophoto as the terrain texture
-        first_mat = next(iter(materials.values()), None)
-        if first_mat and first_mat["albedo"] is not None:
-            # For a single terrain mesh, we use the orthophoto directly as texture
-            # The UV mapping handles the correspondence
-            pass
-
-        # Build per-face material assignment from segmentation
-        grid_shape = terrain["grid_shape"]
-        rows, cols = grid_shape
-
-        # Create material objects for each unique class
-        mat_objects = {}
-        for seg_id, mat_info in materials.items():
-            cls = mat_info["material_class"]
-            if cls in mat_objects:
-                continue
-
-            albedo_img = mat_info["albedo"]
-            # Convert BGR → RGB for trimesh
-            if albedo_img is not None and len(albedo_img.shape) == 3:
-                albedo_rgb = cv2.cvtColor(albedo_img, cv2.COLOR_BGR2RGB)
-            else:
-                albedo_rgb = np.full((256, 256, 3), 128, dtype=np.uint8)
-
-            from PIL import Image as PILImage
-
-            pbr_kwargs = {
-                "baseColorTexture": PILImage.fromarray(albedo_rgb),
-                "metallicFactor": 0.0,
-                "roughnessFactor": 0.8,
-            }
-
-            if mat_info["normal"] is not None:
-                normal_rgb = cv2.cvtColor(mat_info["normal"], cv2.COLOR_BGR2RGB)
-                pbr_kwargs["normalTexture"] = PILImage.fromarray(normal_rgb)
-
-            if mat_info["roughness"] is not None:
-                # Pack roughness into metallic-roughness texture (G=roughness, B=metallic=0)
-                rough = mat_info["roughness"]
-                if len(rough.shape) == 2:
-                    mr_tex = np.zeros((*rough.shape, 3), dtype=np.uint8)
-                    mr_tex[:, :, 1] = rough  # green = roughness
-                    pbr_kwargs["metallicRoughnessTexture"] = PILImage.fromarray(mr_tex)
-
-            mat_obj = trimesh.visual.material.PBRMaterial(name=cls, **pbr_kwargs)
-            mat_objects[cls] = mat_obj
-
-        # For simplicity, assign the most common material to the terrain
-        # (Individual sub-meshes per material would be ideal but complex)
-        from collections import Counter
-        class_counts = Counter(m["material_class"] for m in materials.values())
-        dominant_class = class_counts.most_common(1)[0][0] if class_counts else "grass"
-
-        if dominant_class in mat_objects:
-            from trimesh.visual import TextureVisuals
-            terrain_mesh.visual = TextureVisuals(
-                uv=uvs,
-                material=mat_objects[dominant_class],
-            )
-        else:
-            terrain_mesh.visual = trimesh.visual.TextureVisuals(uv=uvs)
-
-        scene.add_geometry(terrain_mesh, node_name="terrain")
+        terrain_mesh.visual = TextureVisuals(uv=uvs, material=material)
     else:
-        # No materials — plain mesh
-        terrain_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-        terrain_mesh.visual = trimesh.visual.TextureVisuals(uv=uvs)
-        scene.add_geometry(terrain_mesh, node_name="terrain")
+        print("  WARNING: No orthophoto texture available, using untextured mesh")
+        terrain_mesh.visual = TextureVisuals(uv=uvs)
+
+    scene.add_geometry(terrain_mesh, node_name="terrain")
 
     # --- Add procedural assets ---
     for i, tree in enumerate(assets.get("trees", [])):
@@ -1781,6 +1748,7 @@ def main():
                 step_export(
                     terrain, materials, assets_dict, lighting_metadata,
                     args.output, intermediates_dir,
+                    orthophoto_path=args.orthophoto,
                 )
 
             elif step_name == "lighting":

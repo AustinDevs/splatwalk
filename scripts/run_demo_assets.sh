@@ -318,7 +318,7 @@ echo "Fetching latest pipeline scripts from GitHub..."
 _CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
 [ -n "__GITHUB_TOKEN__" ] && _CURL_ARGS+=(-H "Authorization: token __GITHUB_TOKEN__")
 _BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/scripts/gpu"
-for _script in generate_viewer_assets.py build_game_scene.py generate_aerial_glb.py gemini_score_scene.py; do
+for _script in generate_viewer_assets.py build_game_scene.py generate_aerial_glb.py gemini_score_scene.py generate_ortho_tiles.py; do
     if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
         echo "  Updated $_script (from GitHub)"
     elif curl -fsSL "__SPACES_ENDPOINT__/__SPACES_BUCKET__/scripts/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
@@ -351,9 +351,19 @@ export PIPELINE_MODE="mesh"
 export JOB_ID="aukerman"
 
 notify_slack "Launching mesh pipeline (GLB aerial + quality-gated ground GLB)..."
-bash /mnt/splatwalk/scripts/run_pipeline.sh
+PIPELINE_LOG="/workspace/__JOB_ID__/pipeline.log"
+bash /mnt/splatwalk/scripts/run_pipeline.sh 2>&1 | tee "$PIPELINE_LOG"
+PIPELINE_EXIT=${PIPESTATUS[0]}
 
-notify_slack "Demo assets complete! View at: https://splatwalk.austindevs.com/?manifest=__SPACES_ENDPOINT__/__SPACES_BUCKET__/demo/aukerman/manifest.json" "success"
+# Upload pipeline log to S3 for debugging (before self-destruct)
+aws s3 cp "$PIPELINE_LOG" "s3://$SPACES_BUCKET/jobs/aukerman/logs/pipeline.log" \
+    --endpoint-url "$SPACES_ENDPOINT" --acl public-read --content-type "text/plain" 2>/dev/null || true
+
+if [ "$PIPELINE_EXIT" -ne 0 ]; then
+    notify_slack "Pipeline failed (exit $PIPELINE_EXIT). Log: __SPACES_ENDPOINT__/__SPACES_BUCKET__/jobs/aukerman/logs/pipeline.log" "error"
+else
+    notify_slack "Demo assets complete! View at: https://splatwalk.austindevs.com/?manifest=__SPACES_ENDPOINT__/__SPACES_BUCKET__/demo/aukerman/manifest.json" "success"
+fi
 
 echo "=== DEMO ASSET GENERATION COMPLETE ==="
 PIPELINE_SUCCESS=true
